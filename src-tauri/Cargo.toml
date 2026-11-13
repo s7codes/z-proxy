@@ -1,0 +1,53 @@
+[package]
+name = "chaosproxy"
+version = "0.1.0"
+description = "Local API resilience, fault injection and telemetry suite"
+edition = "2021"
+rust-version = "1.90"
+publish = false
+
+[lib]
+# Distinct lib name avoids the bin/lib name collision on Windows (cargo#8519).
+name = "chaosproxy_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+tauri = { version = "2.12", features = [] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.54", features = ["sync", "time", "macros"] }
+# No TLS backend: every outbound connection is loopback-only, and rustls/aws-lc-rs
+# would add a NASM/CMake toolchain requirement on Windows for no benefit.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+axum = "0.8"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.29", features = ["v4", "serde"] }
+# Same WHATWG parser reqwest uses internally; needed directly for `url::Host` matching.
+url = "2.5"
+
+[dev-dependencies]
+tokio = { version = "1.54", features = ["rt", "net", "macros"] }
+
+[lints.cargo]
+# axum is pinned now for the M2 reverse proxy listener (engine/proxy.rs). Drop this override
+# once that module lands so unused-dependency detection covers the whole manifest again.
+unused_dependencies = "allow"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true

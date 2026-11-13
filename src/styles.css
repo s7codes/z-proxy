@@ -1,0 +1,207 @@
+@import "tailwindcss";
+@import "@xyflow/react/dist/base.css";
+
+@theme {
+  --color-*: initial;
+
+  --color-bg: #090a0d;
+  --color-panel: #101217;
+  --color-active: #161920;
+  --color-line: #1f2430;
+  --color-line-strong: #2a3140;
+
+  --color-fg: #c9ced6;
+  --color-fg-dim: #8a93a3;
+  --color-fg-faint: #555e6e;
+  --color-fg-bright: #e6e9ee;
+
+  --color-ok: #10b981;
+  --color-warn: #f59e0b;
+  --color-fault: #ef4444;
+  --color-muted: #64748b;
+  --color-transparent: transparent;
+
+  --font-sans: "Geist Variable", "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "Geist Mono", ui-monospace, monospace;
+
+  --text-2xs: 10px;
+  --text-2xs--line-height: 14px;
+  --text-xs: 11px;
+  --text-xs--line-height: 16px;
+  --text-sm: 12px;
+  --text-sm--line-height: 18px;
+  --text-base: 13px;
+  --text-base--line-height: 20px;
+
+  --radius-xs: 2px;
+
+  --shadow-*: initial;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    line-height: 18px;
+    letter-spacing: -0.005em;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    user-select: none;
+    cursor: default;
+  }
+
+  input,
+  select,
+  button {
+    font: inherit;
+    color: inherit;
+  }
+
+  input,
+  textarea {
+    user-select: text;
+  }
+
+  :focus-visible {
+    outline: 1px solid var(--color-fg-dim);
+    outline-offset: -1px;
+  }
+
+  ::selection {
+    background: #2a3140;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-line);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-line-strong);
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+}
+
+@utility num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "zero" 1;
+  letter-spacing: 0;
+}
+
+@utility label-caps {
+  font-size: 10px;
+  line-height: 14px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-fg-dim);
+}
+
+/* Resize handles: 1px hairline with a wider invisible hit area. */
+[data-separator] {
+  position: relative;
+  background: var(--color-line);
+  flex: 0 0 1px;
+}
+[data-separator]::after {
+  content: "";
+  position: absolute;
+  inset: 0 -3px;
+}
+[data-separator][aria-orientation="horizontal"]::after {
+  inset: -3px 0;
+}
+[data-separator="hover"],
+[data-separator="active"],
+[data-separator="focus"] {
+  background: var(--color-fg-faint);
+  outline: none;
+}
+
+/* React Flow: surgical dark surface. */
+.react-flow {
+  --xy-background-color: var(--color-bg);
+  --xy-edge-stroke: var(--color-muted);
+  --xy-edge-stroke-width: 1;
+  --xy-connectionline-stroke: var(--color-fg-dim);
+  --xy-attribution-background-color: transparent;
+  --xy-controls-button-background-color: var(--color-panel);
+  --xy-controls-button-background-color-hover: var(--color-active);
+  --xy-controls-button-color: var(--color-fg-dim);
+  --xy-controls-button-color-hover: var(--color-fg);
+  --xy-controls-button-border-color: var(--color-line);
+  --xy-controls-box-shadow: none;
+}
+.react-flow__controls {
+  border: 1px solid var(--color-line);
+}
+.react-flow__controls-button {
+  width: 22px;
+  height: 22px;
+  padding: 4px;
+}
+.react-flow__controls-button svg {
+  fill: currentColor;
+}
+.react-flow__attribution {
+  font-size: 9px;
+  opacity: 0.35;
+}
+.react-flow__attribution a {
+  color: var(--color-fg-faint);
+}
+
+input[type="range"] {
+  appearance: none;
+  height: 16px;
+  background: transparent;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 1px;
+  background: var(--color-line-strong);
+}
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 7px;
+  height: 11px;
+  margin-top: -5px;
+  border: 1px solid var(--color-fg-dim);
+  background: var(--color-panel);
+  border-radius: 0;
+}
+input[type="range"]:hover::-webkit-slider-thumb {
+  border-color: var(--color-fg);
+}
+input[type="range"]:disabled::-webkit-slider-thumb {
+  border-color: var(--color-fg-faint);
+}
+.react-flow__handle {
+  width: 5px;
+  height: 5px;
+  min-width: 0;
+  min-height: 0;
+  border-radius: 0;
+  border: 1px solid var(--color-line-strong);
+  background: var(--color-bg);
+}
+.react-flow__edge-text {
+  font-family: var(--font-mono);
+  font-size: 10px;
+}

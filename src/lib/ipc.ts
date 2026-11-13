@@ -1,0 +1,93 @@
+import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
+import type {
+  EngineError,
+  EngineErrorCode,
+  EngineStatus,
+  TelemetryEvent,
+  ValidatedTarget,
+} from "./types";
+
+export type IpcResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: EngineError | TransportError };
+
+/** Failure outside the engine's domain: no Tauri runtime, IPC serialization, unknown command. */
+export interface TransportError {
+  code: "IPC_UNAVAILABLE" | "IPC_FAILURE";
+  message: string;
+}
+
+const ENGINE_CODES: ReadonlySet<string> = new Set<EngineErrorCode>([
+  "NON_LOOPBACK_TARGET_REJECTED",
+  "INVALID_TARGET",
+  "UNSUPPORTED_SCHEME",
+  "CLIENT_BUILD_FAILED",
+]);
+
+export function isEngineError(value: unknown): value is EngineError {
+  if (typeof value !== "object" || value === null) return false;
+  const code: unknown = Reflect.get(value, "code");
+  const message: unknown = Reflect.get(value, "message");
+  return typeof code === "string" && ENGINE_CODES.has(code) && typeof message === "string";
+}
+
+export function isTransportError(error: EngineError | TransportError): error is TransportError {
+  return error.code === "IPC_UNAVAILABLE" || error.code === "IPC_FAILURE";
+}
+
+export const ipcAvailable = isTauri();
+
+async function call<T>(command: string, args?: Record<string, unknown>): Promise<IpcResult<T>> {
+  if (!ipcAvailable) {
+    return {
+      ok: false,
+      error: { code: "IPC_UNAVAILABLE", message: "Tauri runtime not detected" },
+    };
+  }
+  try {
+    const value = await invoke<T>(command, args);
+    return { ok: true, value };
+  } catch (raw: unknown) {
+    if (isEngineError(raw)) return { ok: false, error: raw };
+    return {
+      ok: false,
+      error: { code: "IPC_FAILURE", message: raw instanceof Error ? raw.message : String(raw) },
+    };
+  }
+}
+
+export function validateTarget(input: string): Promise<IpcResult<ValidatedTarget>> {
+  return call<ValidatedTarget>("validate_target", { input });
+}
+
+export function getEngineStatus(): Promise<IpcResult<EngineStatus>> {
+  return call<EngineStatus>("get_engine_status");
+}
+
+export interface TelemetrySubscription {
+  close(): void;
+}
+
+export function subscribeTelemetry(
+  onEvent: (event: TelemetryEvent) => void,
+): TelemetrySubscription {
+  if (!ipcAvailable) return { close: () => undefined };
+
+  const channel = new Channel<TelemetryEvent>();
+  channel.onmessage = onEvent;
+  const pending = call<number>("subscribe_telemetry", { onEvent: channel });
+  let closed = false;
+
+  return {
+    close() {
+      if (closed) return;
+      closed = true;
+      channel.onmessage = () => undefined;
+      void pending.then((result) => {
+        if (result.ok) {
+          void call<boolean>("unsubscribe_telemetry", { subscriptionId: result.value });
+        }
+      });
+    },
+  };
+}
