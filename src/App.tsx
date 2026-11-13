@@ -6,7 +6,9 @@ import {
   PanelLeft,
   PanelRight,
   Pause,
+  Power,
   RotateCcw,
+  Square,
   Trash2,
 } from "lucide-react";
 import { ChaosControls, DEFAULT_FAULT_PROFILE } from "./components/chaos/ChaosControls";
@@ -17,10 +19,15 @@ import { StatusBar } from "./components/shell/StatusBar";
 import { Workspace } from "./components/shell/Workspace";
 import { TelemetryTable } from "./components/telemetry/TelemetryTable";
 import { TopologyCanvas } from "./components/topology/TopologyCanvas";
+import { useBurst } from "./hooks/useBurst";
 import { useEngineStatus } from "./hooks/useEngineStatus";
 import { useGuardValidator } from "./hooks/useGuardValidator";
+import { sameProfile, useProxy } from "./hooks/useProxy";
 import { useTelemetry } from "./hooks/useTelemetry";
 import type { FaultProfile } from "./lib/types";
+
+// Slider drags emit a value per pixel; one IPC round trip per settled position is enough.
+const PROFILE_PUSH_MS = 150;
 
 export function App() {
   const [targetInput, setTargetInput] = useState("http://127.0.0.1:3000");
@@ -28,8 +35,27 @@ export function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
 
   const telemetry = useTelemetry();
-  const link = useEngineStatus(telemetry.latestHeartbeat);
+  const link = useEngineStatus(telemetry.latestHeartbeat, telemetry.latestProxyState);
   const guard = useGuardValidator(targetInput);
+  const proxy = useProxy(telemetry.latestProxyState);
+  const burst = useBurst();
+
+  const { status: proxyStatus, applyFaults, stop: stopProxy } = proxy;
+
+  // Adopt the engine profile once so a webview reload does not replace an armed profile
+  // with the frontend defaults.
+  const adoptedProfile = useRef(false);
+  useEffect(() => {
+    if (adoptedProfile.current || proxyStatus === null) return;
+    adoptedProfile.current = true;
+    setFaultProfile(proxyStatus.profile);
+  }, [proxyStatus]);
+
+  useEffect(() => {
+    if (proxyStatus === null || !proxyStatus.armed || sameProfile(proxyStatus.profile, faultProfile)) return;
+    const timer = window.setTimeout(() => applyFaults(true, faultProfile), PROFILE_PUSH_MS);
+    return () => window.clearTimeout(timer);
+  }, [faultProfile, proxyStatus, applyFaults]);
 
   const targetRef = useRef<HTMLInputElement>(null);
   const inspectorRef = useRef<PanelImperativeHandle | null>(null);
@@ -69,11 +95,25 @@ export function App() {
       { id: "pause", group: "Telemetry", label: paused ? "Resume stream" : "Pause stream", icon: Pause, run: () => setPaused(!paused) },
       { id: "clear", group: "Telemetry", label: "Clear buffer", icon: Trash2, run: clear },
       { id: "reset-fault", group: "Fault Injection", label: "Reset fault profile", icon: RotateCcw, run: () => setFaultProfile(DEFAULT_FAULT_PROFILE) },
+      ...(proxyStatus === null
+        ? []
+        : [
+            {
+              id: "toggle-arm",
+              group: "Fault Injection",
+              label: proxyStatus.armed ? "Disarm faults" : "Arm faults",
+              icon: Power,
+              run: () => applyFaults(!proxyStatus.armed, faultProfile),
+            },
+          ]),
+      ...(proxyStatus?.running === true
+        ? [{ id: "stop-proxy", group: "Fault Injection", label: "Stop proxy listener", icon: Square, run: stopProxy }]
+        : []),
       { id: "toggle-inspector", group: "Layout", label: "Toggle inspector panel", icon: PanelLeft, run: toggle(inspectorRef) },
-      { id: "toggle-chaos", group: "Layout", label: "Toggle fault injection panel", icon: PanelRight, run: toggle(chaosRef) },
+      { id: "toggle-chaos", group: "Layout", label: "Toggle chaos panel", icon: PanelRight, run: toggle(chaosRef) },
       { id: "toggle-telemetry", group: "Layout", label: "Toggle telemetry panel", icon: PanelBottom, run: toggle(telemetryRef) },
     ];
-  }, [paused, setPaused, clear]);
+  }, [paused, setPaused, clear, proxyStatus, applyFaults, stopProxy, faultProfile]);
 
   return (
     <div className="flex h-full flex-col bg-bg text-fg">
@@ -100,8 +140,10 @@ export function App() {
         inspector={
           <TargetInspector input={targetInput} onInput={setTargetInput} guard={guard} link={link} inputRef={targetRef} />
         }
-        topology={<TopologyCanvas link={link} guard={guard} />}
-        chaos={<ChaosControls profile={faultProfile} onChange={setFaultProfile} link={link} />}
+        topology={<TopologyCanvas link={link} guard={guard} proxy={proxyStatus} />}
+        chaos={
+          <ChaosControls profile={faultProfile} onChange={setFaultProfile} link={link} guard={guard} proxy={proxy} burst={burst} />
+        }
         telemetry={<TelemetryTable store={telemetry} />}
       />
 

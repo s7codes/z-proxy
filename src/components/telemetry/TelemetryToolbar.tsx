@@ -3,13 +3,23 @@ import { formatCount } from "../../lib/format";
 import type { TelemetryKind } from "../../lib/types";
 import { ToolButton } from "../shell/PanelHeader";
 
-export type KindFilter = "all" | TelemetryKind;
+export type KindFilter = "all" | "proxy" | "burst" | "guard" | "probe" | "heartbeat";
+
+export const FILTER_KINDS: Record<Exclude<KindFilter, "all">, ReadonlySet<TelemetryKind>> = {
+  proxy: new Set<TelemetryKind>(["proxyExchange", "proxyStateChanged"]),
+  burst: new Set<TelemetryKind>(["burstStarted", "burstSample", "burstCompleted"]),
+  guard: new Set<TelemetryKind>(["guardDecision"]),
+  probe: new Set<TelemetryKind>(["probeCompleted"]),
+  heartbeat: new Set<TelemetryKind>(["engineHeartbeat"]),
+};
 
 const FILTERS: ReadonlyArray<{ id: KindFilter; label: string }> = [
   { id: "all", label: "All" },
-  { id: "guardDecision", label: "Guard" },
-  { id: "probeCompleted", label: "Probe" },
-  { id: "engineHeartbeat", label: "Heartbeat" },
+  { id: "proxy", label: "Proxy" },
+  { id: "burst", label: "Burst" },
+  { id: "guard", label: "Guard" },
+  { id: "probe", label: "Probe" },
+  { id: "heartbeat", label: "Heartbeat" },
 ];
 
 interface TelemetryToolbarProps {

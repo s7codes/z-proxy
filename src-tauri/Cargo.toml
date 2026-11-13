@@ -18,11 +18,19 @@ tauri-build = { version = "2.7", features = [] }
 tauri = { version = "2.12", features = [] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.54", features = ["sync", "time", "macros"] }
+tokio = { version = "1.54", features = ["sync", "time", "macros", "net", "rt"] }
 # No TLS backend: every outbound connection is loopback-only, and rustls/aws-lc-rs
 # would add a NASM/CMake toolchain requirement on Windows for no benefit.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 axum = "0.8"
+# The proxy drives hyper connections directly instead of `axum::serve` so a fault can abort
+# one TCP connection with RST; axum still provides routing and request extraction.
+hyper = { version = "1.8", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1.19", features = ["tokio"] }
+http-body-util = "0.1"
+tower = { version = "0.5", default-features = false, features = ["util"] }
+# Seedable PRNG without OS entropy plumbing; fault decisions are reproducible in tests.
+fastrand = "2.3"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -31,12 +39,7 @@ uuid = { version = "1.29", features = ["v4", "serde"] }
 url = "2.5"
 
 [dev-dependencies]
-tokio = { version = "1.54", features = ["rt", "net", "macros"] }
-
-[lints.cargo]
-# axum is pinned now for the M2 reverse proxy listener (engine/proxy.rs). Drop this override
-# once that module lands so unused-dependency detection covers the whole manifest again.
-unused_dependencies = "allow"
+tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "net", "macros"] }
 
 [lints.rust]
 unsafe_code = "forbid"

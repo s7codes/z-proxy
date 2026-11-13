@@ -1,25 +1,37 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { subscribeTelemetry } from "../lib/ipc";
-import type { TelemetryEvent } from "../lib/types";
+import type { TelemetryEvent, TelemetryEventOf, TelemetryKind } from "../lib/types";
 
 export const TELEMETRY_CAPACITY = 5_000;
-// Event rate will be unbounded once the proxy streams requests; flushing on a fixed tick
-// caps React reconciliation at 10 Hz regardless of how fast the engine produces.
+// Proxied traffic makes the event rate unbounded; flushing on a fixed tick caps React
+// reconciliation at 10 Hz regardless of how fast the engine produces.
 const FLUSH_MS = 100;
 
 export interface TelemetryStore {
   events: readonly TelemetryEvent[];
-  latestHeartbeat: Extract<TelemetryEvent, { kind: "engineHeartbeat" }> | null;
+  latestHeartbeat: TelemetryEventOf<"engineHeartbeat"> | null;
+  latestProxyState: TelemetryEventOf<"proxyStateChanged"> | null;
   paused: boolean;
   setPaused: (paused: boolean) => void;
   clear: () => void;
   totalReceived: number;
 }
 
+function findLast<K extends TelemetryKind>(
+  batch: readonly TelemetryEvent[],
+  kind: K,
+): TelemetryEventOf<K> | null {
+  for (let i = batch.length - 1; i >= 0; i--) {
+    const event = batch[i];
+    if (event?.kind === kind) return event as TelemetryEventOf<K>;
+  }
+  return null;
+}
+
 export function useTelemetry(): TelemetryStore {
   const [events, setEvents] = useState<readonly TelemetryEvent[]>([]);
-  const [latestHeartbeat, setLatestHeartbeat] =
-    useState<TelemetryStore["latestHeartbeat"]>(null);
+  const [latestHeartbeat, setLatestHeartbeat] = useState<TelemetryStore["latestHeartbeat"]>(null);
+  const [latestProxyState, setLatestProxyState] = useState<TelemetryStore["latestProxyState"]>(null);
   const [paused, setPaused] = useState(false);
   const [totalReceived, setTotalReceived] = useState(0);
 
@@ -38,13 +50,13 @@ export function useTelemetry(): TelemetryStore {
       pending.current = [];
 
       setTotalReceived((n) => n + batch.length);
-      for (let i = batch.length - 1; i >= 0; i--) {
-        const event = batch[i];
-        if (event?.kind === "engineHeartbeat") {
-          setLatestHeartbeat(event);
-          break;
-        }
-      }
+      const heartbeat = findLast(batch, "engineHeartbeat");
+      if (heartbeat !== null) setLatestHeartbeat(heartbeat);
+      // State events are applied even while the table is paused: they drive controls,
+      // not just the log.
+      const proxyState = findLast(batch, "proxyStateChanged");
+      if (proxyState !== null) setLatestProxyState(proxyState);
+
       if (pausedRef.current) return;
       setEvents((prev) => {
         const next = prev.concat(batch);
@@ -63,5 +75,5 @@ export function useTelemetry(): TelemetryStore {
     setEvents([]);
   }, []);
 
-  return { events, latestHeartbeat, paused, setPaused, clear, totalReceived };
+  return { events, latestHeartbeat, latestProxyState, paused, setPaused, clear, totalReceived };
 }

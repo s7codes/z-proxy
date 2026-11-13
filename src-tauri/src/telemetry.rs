@@ -52,6 +52,11 @@ impl TelemetryHub {
         let _ = self.tx.send(event);
     }
 
+    #[cfg(test)]
+    pub fn subscribe(&self) -> broadcast::Receiver<TelemetryEvent> {
+        self.tx.subscribe()
+    }
+
     pub fn subscriber_count(&self) -> u32 {
         u32::try_from(self.lock().len()).unwrap_or(u32::MAX)
     }

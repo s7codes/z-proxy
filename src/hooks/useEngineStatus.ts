@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { getEngineStatus, ipcAvailable } from "../lib/ipc";
-import type { EngineStatus, TelemetryEvent } from "../lib/types";
+import type { EngineStatus, TelemetryEventOf } from "../lib/types";
 
 export type EngineLink =
   | { state: "connecting" }
@@ -9,10 +9,12 @@ export type EngineLink =
 
 /**
  * Fetches the static engine descriptor once, then advances the live fields from the
- * heartbeat stream. No polling: the heartbeat is the clock.
+ * telemetry stream. No polling: the heartbeat is the clock and proxy state changes are
+ * pushed by the engine.
  */
 export function useEngineStatus(
-  heartbeat: Extract<TelemetryEvent, { kind: "engineHeartbeat" }> | null,
+  heartbeat: TelemetryEventOf<"engineHeartbeat"> | null,
+  proxyState: TelemetryEventOf<"proxyStateChanged"> | null,
 ): EngineLink {
   const [link, setLink] = useState<EngineLink>(
     ipcAvailable
@@ -36,13 +38,15 @@ export function useEngineStatus(
     };
   }, []);
 
-  if (link.state !== "online" || heartbeat === null) return link;
+  if (link.state !== "online") return link;
   return {
     state: "online",
     status: {
       ...link.status,
-      uptimeMs: heartbeat.uptimeMs,
-      telemetrySubscribers: heartbeat.subscribers,
+      ...(heartbeat === null
+        ? {}
+        : { uptimeMs: heartbeat.uptimeMs, telemetrySubscribers: heartbeat.subscribers }),
+      ...(proxyState === null ? {} : { proxyListener: proxyState.status.listener }),
     },
   };
 }

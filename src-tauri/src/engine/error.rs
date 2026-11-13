@@ -15,8 +15,26 @@ pub enum EngineError {
     #[error("unsupported scheme `{scheme}`; expected http, https, ws or wss")]
     UnsupportedScheme { scheme: String },
 
+    #[error("scheme `{scheme}` requires TLS, which the engine does not link; use http")]
+    PlaintextOnly { scheme: String },
+
     #[error("http client construction failed: {0}")]
     ClientBuild(String),
+
+    #[error("proxy listener is already running on {listener}")]
+    ProxyAlreadyRunning { listener: String },
+
+    #[error("cannot bind proxy listener on {addr}: {reason}")]
+    ListenerBind { addr: String, reason: String },
+
+    #[error("upstream {addr} is the proxy listener itself; requests would loop")]
+    ProxyLoop { addr: String },
+
+    #[error("invalid fault profile field `{field}`: {reason}")]
+    InvalidFaultProfile { field: &'static str, reason: String },
+
+    #[error("invalid burst spec field `{field}`: {reason}")]
+    InvalidBurstSpec { field: &'static str, reason: String },
 }
 
 impl EngineError {
@@ -25,7 +43,13 @@ impl EngineError {
             Self::NonLoopbackTargetRejected { .. } => "NON_LOOPBACK_TARGET_REJECTED",
             Self::InvalidTarget { .. } => "INVALID_TARGET",
             Self::UnsupportedScheme { .. } => "UNSUPPORTED_SCHEME",
+            Self::PlaintextOnly { .. } => "PLAINTEXT_ONLY",
             Self::ClientBuild(_) => "CLIENT_BUILD_FAILED",
+            Self::ProxyAlreadyRunning { .. } => "PROXY_ALREADY_RUNNING",
+            Self::ListenerBind { .. } => "LISTENER_BIND_FAILED",
+            Self::ProxyLoop { .. } => "PROXY_LOOP",
+            Self::InvalidFaultProfile { .. } => "INVALID_FAULT_PROFILE",
+            Self::InvalidBurstSpec { .. } => "INVALID_BURST_SPEC",
         }
     }
 }
@@ -38,7 +62,16 @@ impl Serialize for EngineError {
         match self {
             Self::NonLoopbackTargetRejected { host } => s.serialize_field("host", host)?,
             Self::InvalidTarget { input, .. } => s.serialize_field("input", input)?,
-            Self::UnsupportedScheme { scheme } => s.serialize_field("scheme", scheme)?,
+            Self::UnsupportedScheme { scheme } | Self::PlaintextOnly { scheme } => {
+                s.serialize_field("scheme", scheme)?
+            }
+            Self::ProxyAlreadyRunning { listener } => s.serialize_field("listener", listener)?,
+            Self::ListenerBind { addr, .. } | Self::ProxyLoop { addr } => {
+                s.serialize_field("addr", addr)?
+            }
+            Self::InvalidFaultProfile { field, .. } | Self::InvalidBurstSpec { field, .. } => {
+                s.serialize_field("field", field)?
+            }
             Self::ClientBuild(_) => {}
         }
         s.end()

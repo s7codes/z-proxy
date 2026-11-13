@@ -2,10 +2,15 @@ use tauri::ipc::Channel;
 use tauri::{State, Webview};
 use uuid::Uuid;
 
+use crate::engine::concurrency;
 use crate::engine::error::EngineError;
+use crate::engine::fault::FaultProfile;
 use crate::engine::guard;
 use crate::engine::net;
-use crate::engine::types::{EngineStatus, ProbeResult, TelemetryEvent, ValidatedTarget, Verdict};
+use crate::engine::types::{
+    BurstReport, BurstSpec, EngineStatus, ProbeResult, ProxyConfig, ProxyStatus, TelemetryEvent,
+    ValidatedTarget, Verdict,
+};
 use crate::state::AppState;
 use crate::telemetry::{now_us, uptime_ms};
 
@@ -48,11 +53,13 @@ pub async fn validate_target(
         code: None,
     });
 
-    let probe = net::probe(&state.client, &target).await;
+    let probe = net::probe(&state.probe_client, &target).await;
     tracing::debug!(url = %target.url, ?probe, "guard accepted target");
     let (status, latency_us, error) = match &probe {
         ProbeResult::Reachable { status, latency_us } => (Some(*status), *latency_us, None),
-        ProbeResult::Unreachable { reason, latency_us } => (None, *latency_us, Some(reason.clone())),
+        ProbeResult::Unreachable { reason, latency_us } => {
+            (None, *latency_us, Some(reason.clone()))
+        }
     };
     hub.publish(TelemetryEvent::ProbeCompleted {
         seq: hub.next_seq(),
@@ -76,15 +83,53 @@ pub async fn validate_target(
 }
 
 #[tauri::command]
-pub fn get_engine_status(state: State<'_, AppState>) -> EngineStatus {
-    EngineStatus {
+pub async fn get_engine_status(state: State<'_, AppState>) -> Result<EngineStatus, EngineError> {
+    Ok(EngineStatus {
         version: env!("CARGO_PKG_VERSION"),
         uptime_ms: uptime_ms(state.started_at),
         telemetry_subscribers: state.hub.subscriber_count(),
         guard_mode: "strict",
         allowlist: guard::ALLOWLIST,
-        proxy_listener: None,
-    }
+        proxy_listener: state.proxy.status().await.listener,
+    })
+}
+
+// Tauri requires async commands that borrow `State` to return `Result`, hence the
+// infallible `Result` wrappers below.
+
+#[tauri::command]
+pub async fn start_proxy(
+    state: State<'_, AppState>,
+    config: ProxyConfig,
+) -> Result<ProxyStatus, EngineError> {
+    state.proxy.start(config).await
+}
+
+#[tauri::command]
+pub async fn stop_proxy(state: State<'_, AppState>) -> Result<ProxyStatus, EngineError> {
+    Ok(state.proxy.stop().await)
+}
+
+#[tauri::command]
+pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<ProxyStatus, EngineError> {
+    Ok(state.proxy.status().await)
+}
+
+#[tauri::command]
+pub async fn set_fault_profile(
+    state: State<'_, AppState>,
+    armed: bool,
+    profile: FaultProfile,
+) -> Result<ProxyStatus, EngineError> {
+    state.proxy.set_faults(armed, profile).await
+}
+
+#[tauri::command]
+pub async fn run_concurrency_burst(
+    state: State<'_, AppState>,
+    spec: BurstSpec,
+) -> Result<BurstReport, EngineError> {
+    concurrency::run(spec, &state.hub).await
 }
 
 #[tauri::command]

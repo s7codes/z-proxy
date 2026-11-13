@@ -2,11 +2,11 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { TelemetryStore } from "../../hooks/useTelemetry";
 import { TELEMETRY_CAPACITY } from "../../hooks/useTelemetry";
-import { formatLatency, formatTimestamp, formatUptime } from "../../lib/format";
+import { formatBytes, formatLatency, formatTimestamp, formatUptime } from "../../lib/format";
 import { ipcAvailable } from "../../lib/ipc";
 import { httpStatusTone, TONE_TEXT, type Tone } from "../../lib/tone";
-import type { TelemetryEvent } from "../../lib/types";
-import { TelemetryToolbar, type KindFilter } from "./TelemetryToolbar";
+import type { FaultProfile, TelemetryEvent } from "../../lib/types";
+import { FILTER_KINDS, TelemetryToolbar, type KindFilter } from "./TelemetryToolbar";
 
 const ROW_HEIGHT = 22;
 const GRID = "grid grid-cols-[72px_118px_92px_minmax(160px,1.4fr)_84px_88px_minmax(160px,1fr)]";
@@ -30,7 +30,8 @@ export function TelemetryTable({ store }: { store: TelemetryStore }) {
   const stickToBottom = useRef(true);
 
   const rows = useMemo(() => {
-    const source = filter === "all" ? store.events : store.events.filter((e) => e.kind === filter);
+    const kinds = filter === "all" ? null : FILTER_KINDS[filter];
+    const source = kinds === null ? store.events : store.events.filter((e) => kinds.has(e.kind));
     return source.map(toRow);
   }, [store.events, filter]);
 
@@ -161,5 +162,92 @@ function toRow(event: TelemetryEvent): Row {
         latency: formatLatency(event.latencyUs),
         detail: event.error ?? "",
       };
+    case "proxyStateChanged": {
+      const { status } = event;
+      return {
+        ...base,
+        kind: "PROXY",
+        kindTone: "muted",
+        target: status.listener ?? "listener",
+        result: status.running ? "LISTEN" : "STOPPED",
+        resultTone: status.running ? "ok" : "muted",
+        latency: "-",
+        detail: [status.upstream === null ? null : `-> ${status.upstream}`, describeFaults(status.armed, status.profile)]
+          .filter((part) => part !== null)
+          .join("  "),
+      };
+    }
+    case "proxyExchange":
+      return {
+        ...base,
+        kind: "PROXY",
+        kindTone: event.fault === null ? "muted" : "warn",
+        target: `${event.method} ${event.path}`,
+        result: event.status === null ? "RST" : String(event.status),
+        resultTone: event.status === null ? "fault" : httpStatusTone(event.status),
+        latency: formatLatency(event.latencyUs),
+        detail: [
+          event.fault === "statusMutation" ? "injected status" : null,
+          event.fault === "connectionDrop" ? "injected reset" : null,
+          event.injectedDelayUs > 0 ? `+${formatLatency(event.injectedDelayUs)} delay` : null,
+          event.upstreamLatencyUs === null ? null : `upstream ${formatLatency(event.upstreamLatencyUs)}`,
+          `req ${formatBytes(event.requestBytes)}`,
+          `res ${formatBytes(event.responseBytes)}`,
+          event.error,
+        ]
+          .filter((part) => part !== null)
+          .join("  "),
+      };
+    case "burstStarted":
+      return {
+        ...base,
+        kind: "BURST",
+        kindTone: "muted",
+        target: event.target,
+        result: `${event.method} x${event.workers}`,
+        resultTone: "muted",
+        latency: "-",
+        detail: `run ${event.id.slice(0, 8)}  barrier armed`,
+      };
+    case "burstSample": {
+      const { sample } = event;
+      return {
+        ...base,
+        kind: "BURST",
+        kindTone: "muted",
+        target: `worker ${sample.worker}`,
+        result: sample.status === null ? "ERR" : String(sample.status),
+        resultTone: sample.status === null ? "fault" : httpStatusTone(sample.status),
+        latency: formatLatency(sample.latencyUs),
+        detail:
+          sample.error ??
+          [
+            sample.dispatchOffsetUs === null ? null : `dispatch +${formatLatency(sample.dispatchOffsetUs)}`,
+            formatBytes(sample.bytes),
+            sample.bodyHash === null ? null : `#${sample.bodyHash.slice(0, 8)}`,
+          ]
+            .filter((part) => part !== null)
+            .join("  "),
+      };
+    }
+    case "burstCompleted":
+      return {
+        ...base,
+        kind: "BURST",
+        kindTone: event.anomalies > 0 ? "fault" : "ok",
+        target: `run ${event.id.slice(0, 8)}`,
+        result: event.anomalies > 0 ? `${event.anomalies} ANOMALY` : "UNIFORM",
+        resultTone: event.anomalies > 0 ? "fault" : "ok",
+        latency: formatLatency(event.wallUs),
+        detail: `spread ${event.dispatchSpreadUs === null ? "-" : formatLatency(event.dispatchSpreadUs)}  errors ${event.errors}`,
+      };
   }
+}
+
+function describeFaults(armed: boolean, profile: FaultProfile): string {
+  if (!armed) return "faults disarmed";
+  const parts = [`latency ${profile.latencyMs}±${profile.jitterMs} ms`];
+  if (profile.dropRate > 0) parts.push(`rst ${profile.dropRate}%`);
+  if (profile.statusMutation !== "none") parts.push(`${profile.statusMutation} @ ${profile.mutationRate}%`);
+  return `armed: ${parts.join(", ")}`;
 }

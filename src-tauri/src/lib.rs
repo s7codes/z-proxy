@@ -26,6 +26,11 @@ pub fn run() {
             commands::get_engine_status,
             commands::subscribe_telemetry,
             commands::unsubscribe_telemetry,
+            commands::start_proxy,
+            commands::stop_proxy,
+            commands::get_proxy_status,
+            commands::set_fault_profile,
+            commands::run_concurrency_burst,
         ])
         .run(tauri::generate_context!());
 

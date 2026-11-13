@@ -5,20 +5,24 @@ use reqwest::Client;
 
 use crate::engine::error::EngineResult;
 use crate::engine::net;
+use crate::engine::proxy::ProxyManager;
 use crate::telemetry::TelemetryHub;
 
 pub struct AppState {
     pub started_at: Instant,
     pub hub: Arc<TelemetryHub>,
-    pub client: Client,
+    pub probe_client: Client,
+    pub proxy: ProxyManager,
 }
 
 impl AppState {
     pub fn new() -> EngineResult<Self> {
+        let hub = Arc::new(TelemetryHub::new());
         Ok(Self {
             started_at: Instant::now(),
-            hub: Arc::new(TelemetryHub::new()),
-            client: net::guarded_client()?,
+            proxy: ProxyManager::new(Arc::clone(&hub))?,
+            hub,
+            probe_client: net::probe_client()?,
         })
     }
 }

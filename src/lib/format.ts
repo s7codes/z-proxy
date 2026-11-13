@@ -26,3 +26,13 @@ export function formatCount(n: number): string {
 function pad(n: number): string {
   return String(n).padStart(2, "0");
 }
+
+export function formatBytes(n: number): string {
+  if (n < 1_024) return `${n} B`;
+  if (n < 1_048_576) return `${(n / 1_024).toFixed(1)} KiB`;
+  return `${(n / 1_048_576).toFixed(2)} MiB`;
+}
+
+export function formatPercent(part: number, total: number): string {
+  return total === 0 ? "0.0%" : `${((part / total) * 100).toFixed(1)}%`;
+}

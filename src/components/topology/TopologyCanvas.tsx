@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import {
   Background,
   BackgroundVariant,
@@ -7,11 +7,14 @@ import {
   ReactFlow,
   useNodesState,
   type Edge,
+  type FitViewOptions,
+  type ReactFlowInstance,
 } from "@xyflow/react";
 import { Cpu, MonitorDot, Server, ShieldCheck } from "lucide-react";
 import type { EngineLink } from "../../hooks/useEngineStatus";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import { formatLatency } from "../../lib/format";
+import type { ProxyStatus } from "../../lib/types";
 import { guardTone, TONE_HEX, type Tone } from "../../lib/tone";
 import { PanelHeader } from "../shell/PanelHeader";
 import { nodeTypes, type TopoNode, type TopoNodeData } from "./nodes";
@@ -19,7 +22,10 @@ import { nodeTypes, type TopoNode, type TopoNodeData } from "./nodes";
 interface TopologyCanvasProps {
   link: EngineLink;
   guard: GuardState;
+  proxy: ProxyStatus | null;
 }
+
+const FIT_VIEW: FitViewOptions = { padding: 0.25, maxZoom: 1 };
 
 type NodeId = "client" | "engine" | "guard" | "upstream";
 
@@ -37,20 +43,43 @@ const INITIAL_NODES: TopoNode[] = (Object.keys(POSITIONS) as NodeId[]).map((id) 
   data: placeholderData(id),
 }));
 
-export function TopologyCanvas({ link, guard }: TopologyCanvasProps) {
+export function TopologyCanvas({ link, guard, proxy }: TopologyCanvasProps) {
   const [nodes, , onNodesChange] = useNodesState<TopoNode>(INITIAL_NODES);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const flowRef = useRef<ReactFlowInstance<TopoNode, Edge> | null>(null);
 
-  const dataById = useMemo(() => buildNodeData(link, guard), [link, guard]);
+  // React Flow tracks its container size but keeps the old viewport, so a panel resize
+  // leaves the graph clipped or stranded in a corner. Refit once per frame at most.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (container === null) return;
+    let frame = 0;
+    const observer = new ResizeObserver((entries) => {
+      const rect = entries[entries.length - 1]?.contentRect;
+      if (rect === undefined || rect.width === 0 || rect.height === 0) return;
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        void flowRef.current?.fitView(FIT_VIEW);
+      });
+    });
+    observer.observe(container);
+    return () => {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, []);
+
+  const dataById = useMemo(() => buildNodeData(link, guard, proxy), [link, guard, proxy]);
   const displayNodes = useMemo(
     () => nodes.map((n) => ({ ...n, data: dataById[n.id as NodeId] })),
     [nodes, dataById],
   );
-  const edges = useMemo(() => buildEdges(link, guard), [link, guard]);
+  const edges = useMemo(() => buildEdges(link, guard, proxy), [link, guard, proxy]);
 
   return (
     <div className="flex h-full flex-col">
       <PanelHeader title="Topology" meta="4 nodes / 3 links" />
-      <div className="relative min-h-0 flex-1">
+      <div ref={containerRef} className="relative min-h-0 flex-1">
         <ReactFlow<TopoNode, Edge>
           nodes={displayNodes}
           edges={edges}
@@ -58,8 +87,11 @@ export function TopologyCanvas({ link, guard }: TopologyCanvasProps) {
           nodeTypes={nodeTypes}
           nodesConnectable={false}
           edgesFocusable={false}
+          onInit={(instance) => {
+            flowRef.current = instance;
+          }}
           fitView
-          fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
+          fitViewOptions={FIT_VIEW}
           minZoom={0.4}
           maxZoom={2}
           colorMode="dark"
@@ -73,7 +105,7 @@ export function TopologyCanvas({ link, guard }: TopologyCanvasProps) {
   );
 }
 
-function buildNodeData(link: EngineLink, guard: GuardState): Record<NodeId, TopoNodeData> {
+function buildNodeData(link: EngineLink, guard: GuardState, proxy: ProxyStatus | null): Record<NodeId, TopoNodeData> {
   const online = link.state === "online";
   const engineTone: Tone = online ? "ok" : link.state === "connecting" ? "muted" : "fault";
   const tone = guardTone(guard);
@@ -86,12 +118,13 @@ function buildNodeData(link: EngineLink, guard: GuardState): Record<NodeId, Topo
     },
     engine: {
       ...placeholderData("engine"),
-      tone: engineTone,
-      state: online ? "RUNNING" : link.state === "connecting" ? "CONNECTING" : "OFFLINE",
+      tone: online && proxy?.armed === true ? "warn" : engineTone,
+      state: online ? (proxy?.running === true ? "PROXYING" : "RUNNING") : link.state === "connecting" ? "CONNECTING" : "OFFLINE",
       lines: [
         ["version", online ? link.status.version : "-"],
         ["subscribers", online ? String(link.status.telemetrySubscribers) : "-"],
-        ["proxy", online && link.status.proxyListener !== null ? link.status.proxyListener : "offline"],
+        ["proxy", proxy?.listener ?? "offline"],
+        ["faults", proxy === null ? "-" : proxy.armed ? "armed" : "off"],
       ],
     },
     guard: {
@@ -120,14 +153,15 @@ function buildNodeData(link: EngineLink, guard: GuardState): Record<NodeId, Topo
   };
 }
 
-function buildEdges(link: EngineLink, guard: GuardState): Edge[] {
+function buildEdges(link: EngineLink, guard: GuardState, proxy: ProxyStatus | null): Edge[] {
   const online = link.state === "online";
+  const proxying = online && proxy?.running === true;
   const tone = guardTone(guard);
   const ipcTone: Tone = online ? "ok" : "muted";
 
   return [
     edge("client", "engine", ipcTone, online ? "invoke / channel" : undefined),
-    edge("engine", "guard", ipcTone, undefined),
+    edge("engine", "guard", ipcTone, proxying ? (proxy?.armed === true ? "proxy + faults" : "proxy") : undefined),
     edge("guard", "upstream", tone, upstreamEdgeLabel(guard), guard.phase === "rejected"),
   ];
 }

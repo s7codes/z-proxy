@@ -1,8 +1,13 @@
 import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import type {
+  BurstReport,
+  BurstSpec,
   EngineError,
   EngineErrorCode,
   EngineStatus,
+  FaultProfile,
+  ProxyConfig,
+  ProxyStatus,
   TelemetryEvent,
   ValidatedTarget,
 } from "./types";
@@ -21,7 +26,13 @@ const ENGINE_CODES: ReadonlySet<string> = new Set<EngineErrorCode>([
   "NON_LOOPBACK_TARGET_REJECTED",
   "INVALID_TARGET",
   "UNSUPPORTED_SCHEME",
+  "PLAINTEXT_ONLY",
   "CLIENT_BUILD_FAILED",
+  "PROXY_ALREADY_RUNNING",
+  "LISTENER_BIND_FAILED",
+  "PROXY_LOOP",
+  "INVALID_FAULT_PROFILE",
+  "INVALID_BURST_SPEC",
 ]);
 
 export function isEngineError(value: unknown): value is EngineError {
@@ -62,6 +73,26 @@ export function validateTarget(input: string): Promise<IpcResult<ValidatedTarget
 
 export function getEngineStatus(): Promise<IpcResult<EngineStatus>> {
   return call<EngineStatus>("get_engine_status");
+}
+
+export function startProxy(config: ProxyConfig): Promise<IpcResult<ProxyStatus>> {
+  return call<ProxyStatus>("start_proxy", { config });
+}
+
+export function stopProxy(): Promise<IpcResult<ProxyStatus>> {
+  return call<ProxyStatus>("stop_proxy");
+}
+
+export function getProxyStatus(): Promise<IpcResult<ProxyStatus>> {
+  return call<ProxyStatus>("get_proxy_status");
+}
+
+export function setFaultProfile(armed: boolean, profile: FaultProfile): Promise<IpcResult<ProxyStatus>> {
+  return call<ProxyStatus>("set_fault_profile", { armed, profile });
+}
+
+export function runConcurrencyBurst(spec: BurstSpec): Promise<IpcResult<BurstReport>> {
+  return call<BurstReport>("run_concurrency_burst", { spec });
 }
 
 export interface TelemetrySubscription {

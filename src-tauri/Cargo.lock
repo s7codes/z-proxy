@@ -382,6 +382,10 @@ name = "chaosproxy"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "fastrand",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "reqwest",
  "serde",
  "serde_json",
@@ -389,6 +393,7 @@ dependencies = [
  "tauri-build",
  "thiserror 2.0.21",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "url",
