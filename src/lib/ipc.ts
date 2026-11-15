@@ -16,6 +16,7 @@ import type {
   LabStatus,
   ProxyConfig,
   ProxyStatus,
+  ReportFormat,
   RouteScanReport,
   TelemetryEvent,
   ValidatedTarget,
@@ -47,6 +48,7 @@ const ENGINE_CODES: ReadonlySet<string> = new Set<EngineErrorCode>([
   "FUZZER_BUSY",
   "INVALID_SCAN_ROOT",
   "LAB_ALREADY_RUNNING",
+  "REPORT_EXPORT_FAILED",
   "INTERNAL_TASK_FAILED",
 ]);
 
@@ -162,6 +164,18 @@ export function getLabStatus(): Promise<IpcResult<LabStatus>> {
 /** Routes parsed from the lab's own OpenAPI document, shaped like a scan report. */
 export function getLabRoutes(): Promise<IpcResult<RouteScanReport>> {
   return call<RouteScanReport>("get_lab_routes");
+}
+
+/**
+ * Opens the native save dialog (from Rust, so the webview needs no fs or dialog capability)
+ * and writes `contents`. Resolves to the written path, or `null` when the operator cancels.
+ */
+export function saveAuditReport(
+  format: ReportFormat,
+  fileName: string,
+  contents: string,
+): Promise<IpcResult<string | null>> {
+  return call<string | null>("save_audit_report", { format, fileName, contents });
 }
 
 export interface TelemetrySubscription {

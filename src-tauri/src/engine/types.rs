@@ -489,6 +489,16 @@ pub struct LabStatus {
     pub counters: LabCounters,
 }
 
+// ---- audit report ---------------------------------------------------------------------
+
+/// Rendering of an audit report; decides the extension and the save-dialog filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReportFormat {
+    Markdown,
+    Json,
+}
+
 // ---- telemetry ------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]

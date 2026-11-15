@@ -51,6 +51,13 @@ pub enum EngineError {
     #[error("target lab is already running on {listener}")]
     LabAlreadyRunning { listener: String },
 
+    #[error("cannot export audit report: {reason}")]
+    ReportExport {
+        /// Destination chosen in the save dialog; `None` when the export failed before one.
+        path: Option<String>,
+        reason: String,
+    },
+
     #[error("engine task failed: {reason}")]
     InternalTask { reason: String },
 }
@@ -73,6 +80,7 @@ impl EngineError {
             Self::FuzzerBusy => "FUZZER_BUSY",
             Self::InvalidScanRoot { .. } => "INVALID_SCAN_ROOT",
             Self::LabAlreadyRunning { .. } => "LAB_ALREADY_RUNNING",
+            Self::ReportExport { .. } => "REPORT_EXPORT_FAILED",
             Self::InternalTask { .. } => "INTERNAL_TASK_FAILED",
         }
     }
@@ -100,6 +108,7 @@ impl Serialize for EngineError {
             | Self::InvalidFuzzSpec { field, .. } => s.serialize_field("field", field)?,
             Self::InvalidFaultRule { index, .. } => s.serialize_field("index", index)?,
             Self::InvalidScanRoot { path, .. } => s.serialize_field("path", path)?,
+            Self::ReportExport { path, .. } => s.serialize_field("path", path)?,
             Self::ClientBuild(_) | Self::InternalTask { .. } | Self::FuzzerBusy => {}
         }
         s.end()

@@ -345,6 +345,10 @@ export interface LabStatus {
   counters: LabCounters;
 }
 
+// ---- audit report ---------------------------------------------------------------------
+
+export type ReportFormat = "markdown" | "json";
+
 // ---- telemetry ------------------------------------------------------------------------
 
 export type TelemetryEvent =
@@ -508,6 +512,7 @@ export type EngineErrorCode =
   | "FUZZER_BUSY"
   | "INVALID_SCAN_ROOT"
   | "LAB_ALREADY_RUNNING"
+  | "REPORT_EXPORT_FAILED"
   | "INTERNAL_TASK_FAILED";
 
 export type EngineError =
@@ -526,4 +531,5 @@ export type EngineError =
   | { code: "FUZZER_BUSY"; message: string }
   | { code: "INVALID_SCAN_ROOT"; message: string; path: string }
   | { code: "LAB_ALREADY_RUNNING"; message: string; listener: string }
+  | { code: "REPORT_EXPORT_FAILED"; message: string; path: string | null }
   | { code: "INTERNAL_TASK_FAILED"; message: string };

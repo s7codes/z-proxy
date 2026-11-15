@@ -1,5 +1,6 @@
 mod commands;
 mod engine;
+mod report;
 mod scanner;
 mod state;
 mod telemetry;
@@ -45,6 +46,7 @@ pub fn run() {
             commands::reset_lab_state,
             commands::get_lab_status,
             commands::get_lab_routes,
+            commands::save_audit_report,
         ])
         .run(tauri::generate_context!());
 

@@ -2,8 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PanelImperativeHandle } from "react-resizable-panels";
 import {
   CircleStop,
+  ClipboardCopy,
   Crosshair,
   FlaskConical,
+  FileDown,
   FolderOpen,
   PanelBottom,
   PanelLeft,
@@ -19,6 +21,7 @@ import {
   Waypoints,
 } from "lucide-react";
 import { ChaosControls, DEFAULT_FAULT_PROFILE, type ChaosTab } from "./components/chaos/ChaosControls";
+import type { LabRouting } from "./components/inspector/LabPanel";
 import { TargetInspector } from "./components/inspector/TargetInspector";
 import { CommandPalette, type PaletteCommand } from "./components/shell/CommandPalette";
 import { Kbd } from "./components/shell/PanelHeader";
@@ -26,6 +29,7 @@ import { StatusBar } from "./components/shell/StatusBar";
 import { Workspace } from "./components/shell/Workspace";
 import { TelemetryTable } from "./components/telemetry/TelemetryTable";
 import { TopologyCanvas } from "./components/topology/TopologyCanvas";
+import { useAuditExport } from "./hooks/useAuditExport";
 import { useBurst } from "./hooks/useBurst";
 import { useEngineStatus } from "./hooks/useEngineStatus";
 import { useFuzzer } from "./hooks/useFuzzer";
@@ -37,8 +41,8 @@ import { useTelemetry } from "./hooks/useTelemetry";
 import { originOf, type RequestOrigin } from "./lib/request";
 import { toBurstMethod, type RequestTarget } from "./lib/routes";
 import { DEFAULT_LISTEN_PORT } from "./lib/rules";
+import { TONE_TEXT } from "./lib/tone";
 import type { DiscoveredRoute, FaultProfile } from "./lib/types";
-import type { LabRouting } from "./components/inspector/LabPanel";
 
 // Slider drags emit a value per pixel; one IPC round trip per settled position is enough.
 const PROFILE_PUSH_MS = 150;
@@ -174,6 +178,19 @@ export function App() {
     busy: proxy.busy,
   };
 
+  const audit = useAuditExport({
+    engine: link.state === "online" ? link.status : null,
+    targetInput,
+    guard,
+    requestOrigin,
+    lab: lab.status,
+    labCounters: lab.counters,
+    proxy: proxyStatus,
+    burst: burst.report,
+    fuzz: fuzzer.report,
+  });
+  const { save: saveReport, copy: copyReport } = audit;
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
@@ -294,11 +311,16 @@ export function App() {
       ...(proxyStatus?.running === true
         ? [{ id: "stop-proxy", group: "Fault Injection", label: "Stop proxy listener", icon: Square, run: stopProxy }]
         : []),
+      { id: "export-md", group: "Report", label: "Export audit report (.md)", icon: FileDown, run: () => saveReport("markdown") },
+      { id: "export-json", group: "Report", label: "Export audit report (.json)", icon: FileDown, run: () => saveReport("json") },
+      { id: "copy-report", group: "Report", label: "Copy audit report as Markdown", icon: ClipboardCopy, run: copyReport },
       { id: "toggle-inspector", group: "Layout", label: "Toggle inspector panel", icon: PanelLeft, run: toggle(inspectorRef) },
       { id: "toggle-chaos", group: "Layout", label: "Toggle chaos panel", icon: PanelRight, run: toggle(chaosRef) },
       { id: "toggle-telemetry", group: "Layout", label: "Toggle telemetry panel", icon: PanelBottom, run: toggle(telemetryRef) },
     ];
   }, [
+    saveReport,
+    copyReport,
     paused,
     setPaused,
     clear,
@@ -343,10 +365,35 @@ export function App() {
         <span className="h-3.5 w-px bg-line" />
         <span className="text-xs text-fg-dim">workspace</span>
         <span className="num text-xs text-fg">local</span>
+        {audit.notice !== null && (
+          <span
+            className={`num ml-auto min-w-0 truncate text-2xs ${TONE_TEXT[audit.notice.tone]}`}
+            title={audit.notice.text}
+            role="status"
+          >
+            {audit.notice.text}
+          </span>
+        )}
+        <div
+          className={`flex h-5 shrink-0 items-center rounded-xs border border-line ${audit.notice === null ? "ml-auto" : ""}`}
+          role="group"
+          aria-label="Export audit report"
+        >
+          <span className="label-caps flex h-full items-center border-r border-line px-1.5 text-fg-faint">Report</span>
+          <ReportButton label=".md" title="Export audit report as Markdown" disabled={audit.busy} onClick={() => saveReport("markdown")}>
+            <FileDown size={11} strokeWidth={1.5} />
+          </ReportButton>
+          <ReportButton label=".json" title="Export audit report as JSON" disabled={audit.busy} onClick={() => saveReport("json")}>
+            <FileDown size={11} strokeWidth={1.5} />
+          </ReportButton>
+          <ReportButton label="Copy" title="Copy the Markdown report to the clipboard" onClick={copyReport}>
+            <ClipboardCopy size={11} strokeWidth={1.5} />
+          </ReportButton>
+        </div>
         <button
           type="button"
           onClick={() => setPaletteOpen(true)}
-          className="ml-auto flex h-5 w-64 items-center gap-2 rounded-xs border border-line bg-bg px-2 text-xs text-fg-faint hover:border-line-strong"
+          className="flex h-5 w-64 shrink-0 items-center gap-2 rounded-xs border border-line bg-bg px-2 text-xs text-fg-faint hover:border-line-strong"
         >
           <span>Search commands</span>
           <span className="ml-auto flex gap-0.5">
@@ -409,5 +456,32 @@ export function App() {
       <StatusBar link={link} />
       <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} commands={commands} />
     </div>
+  );
+}
+
+function ReportButton({
+  label,
+  title,
+  disabled = false,
+  onClick,
+  children,
+}: {
+  label: string;
+  title: string;
+  disabled?: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      disabled={disabled}
+      onClick={onClick}
+      className="num flex h-full items-center gap-1 border-r border-line px-1.5 text-2xs text-fg-dim last:border-r-0 hover:bg-active hover:text-fg disabled:cursor-not-allowed disabled:text-fg-faint"
+    >
+      {children}
+      {label}
+    </button>
   );
 }

@@ -366,6 +366,27 @@ upstream base path prefixed; a route template's own `{param}` segments stand for
 segment). The rule and the edge into the endpoint are drawn in the degraded tone while the
 listener runs armed, and the rule is marked inactive otherwise.
 
+## Audit report
+
+The header's Report group and the command palette export the session state as one report:
+guard verdict and probe, request origin (direct or via proxy), target lab mode and counters,
+proxy listener, global profile and route rules, the latest burst report (status histogram,
+TTFB and total latency percentiles, success quota, anomalies) and the latest fuzz report
+(vector summary, notes, findings with disclosures). The report is built in the UI
+(`src/lib/export.ts`) from state it already holds; nothing is re-run.
+
+| Action | Output                                                                                   |
+|--------|------------------------------------------------------------------------------------------|
+| `.md`  | Tabular Markdown; the first 200 findings, faults first                                    |
+| `.json`| `AuditReport` with `schema: "z-proxy.audit/1"`; burst samples and every finding included  |
+| Copy   | The Markdown rendering to the clipboard                                                   |
+
+`save_audit_report` opens the native save dialog from Rust (the webview has no `fs` or
+`dialog` capability), pre-filled with `z-proxy-audit-<yyyymmdd>-<hhmmss>.<ext>` reduced to a
+single file name component, and writes the file off the async runtime. Reports above 32 MiB
+and write failures return `REPORT_EXPORT_FAILED` with the destination `path` when one was
+chosen; cancelling resolves to `null`.
+
 ## IPC
 
 | Command                  | Arguments                                   | Returns            |
@@ -391,6 +412,7 @@ listener runs armed, and the rule is marked inactive otherwise.
 | `reset_lab_state`        | none                                        | `LabStatus`        |
 | `get_lab_status`         | none                                        | `LabStatus`        |
 | `get_lab_routes`         | none                                        | `RouteScanReport`  |
+| `save_audit_report`      | `format: "markdown" \| "json", fileName: string, contents: string` | `string \| null` |
 
 Telemetry is pushed over `tauri::ipc::Channel<TelemetryEvent>`; the UI does not poll.
 Event kinds: `engineHeartbeat` (1 Hz), `guardDecision`, `probeCompleted`,

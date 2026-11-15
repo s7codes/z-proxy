@@ -12,9 +12,10 @@ use crate::engine::lab;
 use crate::engine::net;
 use crate::engine::types::{
     BurstReport, BurstSpec, EngineStatus, FuzzCasePayload, FuzzCaseRef, FuzzReport, FuzzSpec,
-    LabConfig, LabMode, LabStatus, ProbeResult, ProxyConfig, ProxyStatus, RouteScanReport,
-    TelemetryEvent, ValidatedTarget, Verdict,
+    LabConfig, LabMode, LabStatus, ProbeResult, ProxyConfig, ProxyStatus, ReportFormat,
+    RouteScanReport, TelemetryEvent, ValidatedTarget, Verdict,
 };
+use crate::report;
 use crate::scanner::routes;
 use crate::state::AppState;
 use crate::telemetry::{now_us, uptime_ms};
@@ -264,6 +265,45 @@ pub async fn pick_project_root(window: WebviewWindow) -> Result<Option<String>, 
     Ok(picked
         .and_then(|path| path.into_path().ok())
         .map(|path| routes::display_path(&path)))
+}
+
+/// Native save dialog for an audit report the UI rendered; writes it and resolves to the
+/// written path, or `None` when the operator cancels.
+#[tauri::command]
+pub async fn save_audit_report(
+    window: WebviewWindow,
+    format: ReportFormat,
+    file_name: String,
+    contents: String,
+) -> Result<Option<String>, EngineError> {
+    report::check_size(&contents)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    window
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("Export audit report")
+        .set_file_name(report::file_name(format, &file_name))
+        .add_filter(format.filter_label(), &[format.extension()])
+        .save_file(move |picked| {
+            // The receiver is only gone if the command future was dropped; nothing to report.
+            let _ = tx.send(picked);
+        });
+    let picked = rx.await.map_err(|_| EngineError::InternalTask {
+        reason: "save dialog closed without a result".to_owned(),
+    })?;
+    let Some(path) = picked.and_then(|path| path.into_path().ok()) else {
+        return Ok(None);
+    };
+    let shown = routes::display_path(&path);
+    // Synchronous file I/O stays off the async runtime's worker threads.
+    tokio::task::spawn_blocking(move || report::write(&path, contents.as_bytes()))
+        .await
+        .map_err(|err| EngineError::InternalTask {
+            reason: err.to_string(),
+        })??;
+    tracing::info!(path = %shown, "audit report exported");
+    Ok(Some(shown))
 }
 
 #[tauri::command]
