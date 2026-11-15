@@ -8,19 +8,24 @@ is created.
 
 ## Status
 
-1.0.0: loopback reverse proxy with global and route-scoped fault injection,
-barrier-synchronized concurrency burst runner with TTFB/total latency split, success quota
-and anomaly detection, filesystem route scanner with in-file mount prefix resolution and
-OpenAPI request body synthesis, deterministic payload fuzzer (nine vectors including schema
-contract bounds and path parameter boundaries) with stack trace and database error detection
-and fuzz-to-burst replay, embedded target lab service with switchable defects that can be
-chained behind the proxy, passive audit of proxied traffic (N+1 fan-outs, unpaginated
-collections, header misconfiguration, disclosures), OpenAPI response contract drift checks in
-the proxy and the fuzzer, static audit of route handlers (unvalidated mutations, unbounded
-queries, floating async calls), Idempotency-Key replay bursts, Markdown/JSON audit report
+1.0.0: loopback reverse proxy with global and route-scoped fault injection (latency, RST,
+status mutation, mid-body truncation), barrier-synchronized concurrency burst runner
+(pre-connected or last-byte sync) with TTFB/total latency split, success quota, anomaly
+detection and contract drift under load, filesystem route scanner with in-file mount prefix
+resolution and OpenAPI request body synthesis, deterministic payload fuzzer (nine vectors
+including schema contract bounds and path parameter boundaries) with stack trace and
+database error detection and fuzz-to-burst replay, embedded target lab service with
+switchable defects that can be chained behind the proxy, passive audit of proxied traffic
+with gzip/deflate inflation (N+1 fan-outs, retry storms, latency regressions, unpaginated
+collections, header misconfiguration, disclosures), OpenAPI response contract checks
+(types, required fields, value constraints) in the proxy, the fuzzer and the burst runner,
+static audit of route handlers across relative imports (unvalidated mutations, unbounded
+queries, floating async calls, non-atomic multi-writes, interpolated SQL) with one-click
+targeting into Burst or Fuzzer, Idempotency-Key replay bursts, Markdown/JSON audit report
 export, CI on Linux and Windows.
 Not implemented yet: WebSocket proxying, TLS upstreams, query-string and header fuzzing,
-mount prefixes across files.
+mount prefixes across files, TypeScript path aliases in the handler audit, brotli and zstd
+inflation.
 
 ## Layout
 
@@ -39,12 +44,14 @@ src-tauri/
   src/engine/net.rs        Guarded reqwest clients, raw loopback connect
   src/engine/fault.rs      FaultProfile and the per-request fault decision
   src/engine/proxy.rs      Reverse proxy listener (hyper connections, axum routing)
-  src/engine/http1.rs      Guarded HTTP/1.1 request template, connect and exchange (TTFB stamp)
+  src/engine/http1.rs      Guarded HTTP/1.1 request template, connect and exchange (TTFB stamp),
+                           wire encoding and split connections for last-byte sync
   src/engine/pathparam.rs  {param} placeholder resolution and path slot rewriting
   src/engine/concurrency.rs  Burst runner and report analysis
   src/engine/fuzzer.rs     Mutation case generation, sequential runner, verdicts
   src/engine/disclosure.rs Stack trace and database error signatures in response bodies
-  src/engine/linter.rs     Passive audit of proxied exchanges, N+1 windows, JSON skimmer
+  src/engine/linter.rs     Passive audit of proxied exchanges: N+1, retry storm and latency
+                           windows, capped gzip/deflate inflation, JSON skimmer
   src/engine/contract.rs   Response contract checks, contract set matched by route template
   src/engine/lab.rs        Embedded target lab service (unprotected / hardened)
   src/engine/error.rs      EngineError, serialized as { code, message, ... }
@@ -53,7 +60,8 @@ src-tauri/
   src/scanner/lex.rs       Comment masking, string spans, bracket matching
   src/scanner/{next,node,axum,go,openapi}.rs  Per-framework extractors, mount prefixes
   src/scanner/schema.rs    OpenAPI request body samples and response contracts
-  src/scanner/audit.rs     Static handler audit: validation, query bounds, dropped async calls
+  src/scanner/audit.rs     Static handler audit: validation, query bounds, dropped async calls,
+                           unguarded multi-writes, interpolated SQL; relative import resolution
 ```
 
 ## Loopback guard
@@ -97,8 +105,20 @@ Fault profile, applied per request while armed, in this order:
 | `dropRate`       | 0-100 %      | Close the client connection with RST (`SO_LINGER=0`)      |
 | `statusMutation` | 429/5xx      | Synthetic JSON response; upstream is not contacted        |
 | `mutationRate`   | 0-100 %      | Probability of the status mutation                        |
+| `partialDropRate`| 0-100 %      | Forward the upstream head with its full `Content-Length` and the leading body bytes, then reset (`SO_LINGER=0`) |
+| `partialDropBytes` | 0-16 MiB   | Body bytes forwarded before the reset; `null` cuts at half the body |
+
+Precedence is reset, status mutation, partial drop; each roll draws from the seeded RNG only
+when its rate is non-zero, so seeded sequences do not change when a new field is added. A
+partial drop keeps at least one byte of a non-empty body back (an empty body is forwarded
+untouched) and waits 50 ms before the reset, because Windows discards received but unread
+data when the RST arrives; the client therefore reads a 200 head and a JSON document that
+stops mid-value, then a connection reset. `proxyExchange` reports `fault: partialBodyDrop`
+with `responseBytes` set to the bytes actually written; contract and passive checks still
+judge the full upstream body.
 
 Synthetic responses carry `x-zproxy-fault: status-<code>`; 429 adds `Retry-After: 1`.
+Truncated responses carry `x-zproxy-fault: partial-body-<bytes>`.
 Forwarded responses that were delayed carry `x-zproxy-injected-delay-us`. Upstream
 failures return 502, response timeouts 504, both with `x-zproxy-error`. The profile can be
 changed while the listener runs and survives listener restarts.
@@ -124,9 +144,11 @@ results as `findings: TrafficFinding[]` (`kind`, `severity`, `detail`, `evidence
 | Kind                     | Severity   | Condition                                                         |
 |--------------------------|------------|-------------------------------------------------------------------|
 | `nPlusOneBurst`          | warn       | 8 distinct GET paths of one route template within 250 ms of arrival |
-| `unboundedCollection`    | warn       | 2xx JSON with a top-level array, or a `data`/`items`/`results` array, above 250 items and no pagination key (`total`, `page`, `nextCursor`, `hasMore`, `meta`, `links`, ...) or header (`Link: rel="next"`, `X-Total-Count`, `Content-Range`, ...); JSON above 1 MiB |
-| `headerMisconfiguration` | warn/fault | JSON body without a JSON `Content-Type`, markup served as JSON; `Access-Control-Allow-Credentials: true` with origin `*` (warn) or `null` (fault); GET 2xx to a credentialed request, a cookie-setting response or an account/session route without `Cache-Control` or marked `public` |
+| `retryStorm`             | warn       | One exact request line (method, path and query) 10 times within 250 ms of arrival, any method |
+| `unboundedCollection`    | warn       | 2xx JSON with a top-level array, or a `data`/`items`/`results` array, above 250 items and no pagination key (`total`, `page`, `nextCursor`, `hasMore`, `meta`, `links`, ...) or header (`Link: rel="next"`, `X-Total-Count`, `Content-Range`, ...); JSON above 1 MiB, compressed or not |
+| `headerMisconfiguration` | warn/fault | JSON body without a JSON `Content-Type`, markup served as JSON; `Content-Encoding: gzip`/`deflate` on a body that is not a valid stream of it; `Access-Control-Allow-Credentials: true` with origin `*` (warn) or `null` (fault); GET 2xx to a credentialed request, a cookie-setting response or an account/session route without `Cache-Control` or marked `public` |
 | `passiveDisclosure`      | warn/fault | Disclosure signature (see the fuzzer) in the first 8 KiB of a textual body; fault on 5xx |
+| `latencyRegression`      | warn       | 2xx upstream latency at least 4x the median of the route template's previous responses (8 to 32 kept) and at least 250 ms |
 
 N+1 detection folds identifier segments (integers, UUIDs, hex keys of 12+ characters,
 prefixed keys such as `ord-000123`, opaque tokens of 16+ characters with digits) into `{id}`;
@@ -136,14 +158,26 @@ reaches the threshold, and the template stays quiet until a full window passes w
 path. Windows live in 16 shards behind short `std::sync::Mutex` sections (no await inside), at
 most 64 templates per shard.
 
-Response checks run on forwarded responses only, never on injected faults. They borrow the
-buffered body and header map; JSON is walked by a byte-level skimmer that counts items and reads
-top-level keys without building values or recursing. Bodies with a `Content-Encoding` other
-than `identity` get the header checks only, since the proxy client does not decompress.
+Retry storms use the same shape keyed by the exact request line, so `/cart?user=7` and
+`/cart?user=8` are different requests; a polling client below 10 per 250 ms is not reported.
+Latency regressions keep a fixed ring of the last 32 upstream latencies per method and route
+template (identifier segments folded as above) and judge a response against the median of the
+ones before it, once at least 8 exist. Upstream time excludes injected delay, so an armed
+latency profile never reads as a service regression; the 250 ms floor keeps scheduler jitter
+on millisecond loopback medians out. Both detectors shard like the N+1 windows and reuse an
+evicted slot's buffer, so a known key costs no allocation.
+
+Response checks run on forwarded responses only, never on injected faults. A `gzip`,
+`x-gzip` or `deflate` (zlib-wrapped or raw) `Content-Encoding` is undone first, last-applied
+coding first, into a buffer capped at 1 MiB: the inflater (`flate2`, pure-Rust `miniz_oxide`
+backend) is read through `take(cap + 1)`, so a decompression bomb stops at the cap. The
+client still receives the encoded bytes. `br` and `zstd` bodies get the header checks only.
+The checks borrow the decoded body and the header map; JSON is walked by a byte-level skimmer
+that counts items and reads top-level keys without building values or recursing.
 
 The UI folds findings and contract drift into counters that keep running while the telemetry
 table is paused (the last 1 000 records are kept for the report). The telemetry toolbar shows
-a `Findings` filter and one badge per category with findings; the Faults tab lists all five
+a `Findings` filter and one badge per category with findings; the Faults tab lists all seven
 counters, and each opens the matching exchanges in telemetry.
 
 ### Response contracts
@@ -164,6 +198,22 @@ handshakes its own HTTP/1.1 connection, then waits on a `tokio::sync::Barrier`; 
 the only remaining work is writing the request. Workers that fail to connect still join the
 barrier and report a transport error.
 
+`BurstSpec.syncMode` selects what the barrier releases (`null` is `preConnected`):
+
+| Mode           | Before the barrier                                     | On release                    |
+|----------------|--------------------------------------------------------|-------------------------------|
+| `preConnected` | TCP connect and HTTP/1.1 handshake                     | hyper writes the full request |
+| `lastByte`     | Connect, then every request byte but the last written and flushed on a `TCP_NODELAY` socket | each worker writes one byte from its own task |
+
+A server cannot finish parsing a request before its final byte, so `lastByte` aligns the
+requests at the server's parser instead of at the client's scheduler, and dispatch spread is
+one single-byte write per worker. The request is encoded once per worker
+(`http1::encode`: origin-form target, the template's headers, `content-length` for a
+non-empty body) and queued with hyper before the barrier; hyper parses the response from the
+read half while its own serialization of the request goes to a sink whose reads stay parked
+until hyper flushed it. A server that answers before the last byte (431, 413) keeps its
+response even when the final write fails. `burstStarted` and the report echo `syncMode`.
+
 Each worker records two monotonic intervals from the instant it writes its request: `ttfbUs`
 to the parsed response head (hyper resolves `send_request` once the status line and headers
 are read) and `latencyUs` to the last body frame. The report carries min/mean/p50/p95/p99/max
@@ -178,6 +228,15 @@ release), and anomalies:
 | `bodyDivergence`   | warn       | Differing bodies within one status                              |
 | `transportErrors`  | warn/fault | Workers without a response (fault when all failed)              |
 | `idempotencyViolation` | fault  | Idempotency mode: 2xx responses with more than one body fingerprint |
+| `contractDrift`    | warn/fault | Responses that broke `BurstSpec.contract`; fault when any is 2xx |
+
+`BurstSpec.contract` (the selected OpenAPI route's contract, sent while the panel targets that
+operation) checks every response. Workers keep up to 64 KiB of the body (a longer body is
+checked by status only, bounding a 100-worker burst at 6.4 MiB); the check runs on the
+collector after the timed section, so parsing never delays another worker's I/O. Violations
+are attached to each `WorkerSample` and streamed with `burstSample`; `contractViolations`
+counts drifted responses, and the anomaly names the most widespread violation with the
+values that broke it (`/remainingUses: expected >= 0, got -1, -2`).
 
 `BurstSpec.expectedMaxSuccesses` sets the quota: the number of 2xx the operation may
 legitimately produce (1 for a single-use coupon or an idempotent charge, `0` for a resource
@@ -193,7 +252,8 @@ are then expected replays, so the race analysis is replaced by a body comparison
 deduplicating handler answers every request with the stored response of the first, and more
 than one 2xx fingerprint means the operation ran again (`idempotencyViolation`). 409 responses
 to in-flight duplicates are accepted. 2xx body divergence is reported only through that
-anomaly. The Burst panel's "Idempotency-Key replay" switch sets the mode.
+anomaly. The Burst panel's "Idempotency-Key replay" switch sets the mode; its "Sync" selector
+sets `syncMode`.
 
 ## Route scanner
 
@@ -254,16 +314,26 @@ status codes, range keys (`4XX`), `default`, and for the 200 (else 201) JSON bod
 fields). `$ref` responses and schemas are followed, `allOf` parts merged, `oneOf`/`anyOf`
 become type unions (an unconstrained branch accepts anything), 3.0 `nullable` and 3.1
 `type: [.., "null"]` admit `null`, `writeOnly` properties are skipped. Swagger 2.0 response
-`schema` is read the same way. `engine/contract.rs` checks a response against it:
+`schema` is read the same way. Each field also carries the value constraints declared on its
+own schema as `constraints: ValueConstraints | null`: `minimum`/`maximum` with exclusivity
+(3.0 boolean flag or 3.1 number form), `minLength`/`maxLength`, an all-scalar `enum` (at most
+64 members) or `const`, and the `uuid`, `email`, `date-time` and `date` formats; composed
+schemas contribute none. `engine/contract.rs` checks a response against it:
 
 | Violation              | Condition                                                          |
 |------------------------|--------------------------------------------------------------------|
 | `undocumentedStatus`   | 2xx or 4xx status not listed, not covered by a range, no `default`  |
 | `missingRequiredField` | Required property absent while its parent object is present        |
 | `responseTypeMismatch` | Value type outside the documented types; an integer satisfies `number` |
+| `constraintViolation`  | Correctly typed value outside its bounds, length, enum or format (`>= 0 <- -1`, `format uuid <- "order-1"`) |
 
-5xx statuses are faults wherever they appear and are not judged as drift. Bodies above 1 MiB
-get the status check only; at most 16 violations are reported per response.
+Integer bounds compare exactly across the `i64`/`u64` range, enum members compare
+numerically (`1` equals `1.0`), string length counts Unicode scalar values, and a `null`
+value is never judged against constraints. Formats follow RFC 3339 (`date-time` requires an
+offset, month lengths and leap years are checked); `email` only rejects values that cannot be
+an address. `pattern` is not evaluated. 5xx statuses are faults wherever they appear and are
+not judged as drift. Bodies above 1 MiB get the status check only; at most 16 violations are
+reported per response.
 
 ### Static handler audit
 
@@ -271,18 +341,45 @@ Each route extracted from source (`scanner/audit.rs`; OpenAPI routes have no han
 the region of its handler: the declaration up to the next route or top-level declaration (at
 most 160 lines), plus the bodies of up to three handlers it names that are defined in the same
 file (`post(create_item)`, `app.post("/x", validate(schema), create)`,
-`mux.HandleFunc("POST /x", createItem)`). Checks run on the comment-masked text and need
-positive evidence, so a handler the pass cannot resolve reports nothing:
+`router.post("/x", asyncHandler(create))`, `mux.HandleFunc("POST /x", createItem)`).
+
+A JavaScript or TypeScript handler that the file imports from a relative module is audited
+in that module. Bindings come from `import x from`, `import { a, b as c } from`,
+`import * as ns from`, `const x = require(..)`, `const { a, b: c } = require(..)` and
+`require(..).a`; type-only imports are ignored. `create` resolves to the binding's export,
+`ns.create` to the named export `create`. The specifier is tried as written, with each JS/TS
+extension, as a directory `index`, and a `.js` specifier also as the `.ts` source beside it.
+The canonical path must stay inside the scan root, at most 16 modules are read per file
+(each once, 1 MiB cap), and the export is located as a named declaration, `exports.x =`,
+`module.exports.x =`, `export default` or `module.exports =`. Evidence found there carries
+the module's path in `file`.
+
+Checks run on the comment-masked text of every region and need positive evidence, so a
+handler the pass cannot resolve reports nothing:
 
 | Risk                   | Evidence                                                              |
 |------------------------|-----------------------------------------------------------------------|
 | `unvalidatedMutation`  | POST/PUT/PATCH/DELETE reads the body (`req.body`, `request.json()`, `Json<..>`, `r.Body`) and the region has no validator: zod, valibot, joi, yup, ajv, superstruct, TypeBox, Fastify `schema:`, `validate*`/`*Validator`, `X.parse(` / `safeParse(` on anything but `JSON`, `Date`, `URL`, `qs`; typed axum `Json<T>`/`Form<T>` or `from_slice::<T>` (`Value`/`HashMap` do not count); gin `Bind*`, typed `Decode(&..)`, `json.Unmarshal` |
 | `unboundedQuery`       | `findMany(` / `findAll(` / `find({..})` / GORM `Find(&..)` without `take`/`limit`/`first`/`last` in the arguments or the chain; a `SELECT .. FROM` string literal without `LIMIT`, `TOP`, `FETCH FIRST`, an aggregate or an `id =` lookup |
-| `floatingAsync`        | JS: a persistence call (`save`, `create`, `update`, `delete`, `insert*`, `execute`, `query`, `publish`, `sendMail`, `commit`, ... on a model chain or a db/queue receiver) or `fetch(` as a statement, neither awaited, returned nor chained to `.then`/`.catch`; an async Express handler that awaits without `try`, `next(err)` or `.catch(next)`, unless wrapped (`asyncHandler`, `catchAsync`) or `express-async-errors` is loaded. Go: `Exec`/`Commit`/`Create`/`Save`/`Delete`/`Update` as a statement, error dropped. Rust is skipped: unused futures and `Result`s are compiler warnings |
+| `floatingAsync`        | JS: a persistence call (`save`, `create`, `update`, `delete`, `insert*`, `execute`, `query`, `publish`, `sendMail`, `commit`, ... on a model chain or a db/queue receiver) or `fetch(` as a statement, neither awaited, returned nor chained to `.then`/`.catch`; an async Express handler that awaits without `try`, `next(err)` or `.catch(next)`, unless wrapped (`asyncHandler`, `catchAsync`), `express-async-errors` is loaded, or the nearest `package.json` declares Express 5 (`^5`, `~5`, `>=5`, `npm:express@5`), which forwards rejections natively. Go: `Exec`/`Commit`/`Create`/`Save`/`Delete`/`Update` as a statement, error dropped. Rust is skipped: unused futures and `Result`s are compiler warnings |
+| `nonAtomicMultiWrite`  | Two or more writes across the handler's regions, one per statement: ORM `create`/`update`/`upsert`/`delete`/`insert*`/`save`/`destroy` on a client root (`db`, `prisma`, `knex`, `repo`, `tx`, ...), a model chain or a capitalized model, `await x.save()`; `execute`/`Exec`/`ExecContext` unless the statement selects; `INSERT INTO`, `UPDATE .. SET`, `DELETE FROM` literals (a literal inside a write call, or in the same statement, is that call's write). No transaction marker in any region: `$transaction`, `.transaction(`, `withTransaction(`, `startTransaction(`, GORM `Transaction(`, `Begin()`/`BeginTx(`, sqlx `begin()`, a `tx.`/`trx.` handle, `@Transactional`, or `BEGIN`/`START TRANSACTION` literals. Receivers through request, response or in-memory state (`searchParams`, `session`, `cache`, `headers`, ...) and Go file packages (`os.Create`) never count |
+| `unsafeSqlInterpolation` | A literal shaped like SQL (`SELECT .. FROM`, `INSERT INTO`, `UPDATE .. SET`, `DELETE FROM`, `WHERE col =`/`LIKE`/`IN`) built from values: an untagged template literal with `${..}` (tagged templates such as `` sql`..` `` and `` Prisma.sql`..` `` pass values as parameters and stay clean), a quoted literal followed by `+ expr`, the format string of `format!` with a placeholder, or of `fmt.Sprintf` with a verb |
 
-Risks carry `kind`, `line`, the trimmed evidence line and a `detail`. The route list shows a
-badge per risk, filters by `at risk` or one kind, and lists the evidence of the selected
-route.
+Risks carry `kind`, `line`, the trimmed evidence line, a `detail`, and `file` when the
+evidence is in an imported module. The route list shows a badge per risk, filters by
+`at risk` or one kind, and lists the evidence of the selected route.
+
+A risk badge (or the `burst` / `fuzz` button next to the selected route's evidence)
+auto-targets the finding: it selects the route, loads its method, path, sample body and
+contract, and opens the tab that exercises the failure mode with a fresh setup:
+
+| Risk                     | Opens  | Preset                                                        |
+|--------------------------|--------|---------------------------------------------------------------|
+| `unvalidatedMutation`    | Fuzzer | `nullInjection`, `boundaryNumbers`, `typeConfusion`, `missingFields`, `schemaContractBounds` |
+| `unsafeSqlInterpolation` | Fuzzer | `emptyStrings`, `typeConfusion`, `oversizedField`, `pathParamValidation` |
+| `floatingAsync`          | Fuzzer | `nullInjection`, `typeConfusion`, `malformedJson`             |
+| `nonAtomicMultiWrite`    | Burst  | 32 workers, `lastByte` sync                                   |
+| `unboundedQuery`         | Burst  | 32 workers, `lastByte` sync                                   |
 
 Selecting a route loads its method and path into the Burst and Fuzzer panels, loads its
 `sampleBody` (if any) into both payload fields, and adds an endpoint node to the topology.
@@ -390,7 +487,7 @@ same state.
 
 | Route                           | `unprotected`                                             | `hardened`                                   |
 |---------------------------------|-----------------------------------------------------------|----------------------------------------------|
-| `POST /api/v1/coupons/redeem`   | Reads the coupon's use count, waits 60 ms (provider call), writes back `read + 1`; the 200 body names the discount `discount` instead of `discountCents`; no code is 400 | Check and increment under one lock, then the provider call; no code is 422 |
+| `POST /api/v1/coupons/redeem`   | Reads the coupon's use count, waits 60 ms (provider call), writes back `read + 1`; the 200 body names the discount `discount` instead of `discountCents`, and `remainingUses` drops below 0 for every extra winner; no code is 400 | Check and increment under one lock, then the provider call; `remainingUses` is 0; no code is 422 |
 | `POST /api/v1/orders/checkout`  | Unvalidated input reaches failing code; the failure is serialized into the response; `Idempotency-Key` ignored | Every invalid input: 422 `{ error, violations[] }`; `Idempotency-Key` deduplicated |
 | `GET /api/v1/orders/{orderId}`  | `Number(orderId)` used as an index and passed raw to SQL  | `orderId` must be an integer 1-999 999, else 422 |
 | `GET /api/v1/health`            | `{ status, mode }`                                        | same                                         |
@@ -420,6 +517,12 @@ write (409), which the burst analyzer reports as `raceWindow`. The written count
 200 and the rest 409. The window is wider than Windows' 15.6 ms timer resolution, so the
 outcome does not depend on timer precision; with 17 or more workers at least one conflict is
 guaranteed.
+
+Redemptions report `remainingUses` (documented `integer`, `format: int32`, `minimum: 0`),
+derived from the grant count. A burst with the route's contract therefore reports
+`raceWindow` and `contractDrift` together in `unprotected` mode: every extra winner returns
+`-1`, `-2`, ..., a 2xx body below its documented minimum, next to the missing
+`discountCents`. `hardened` returns 0 to its single winner and stays clean.
 
 Unprotected checkout failures, by input:
 
@@ -488,18 +591,20 @@ listener runs armed, and the rule is marked inactive otherwise.
 
 The header's Report group and the command palette export the session state as one report:
 guard verdict and probe, request origin (direct or via proxy), target lab mode and counters,
-proxy listener, global profile and route rules, the latest burst report (status histogram,
-TTFB and total latency percentiles, success quota, idempotency key, anomalies) and the latest
-fuzz report (vector summary, notes, findings with disclosures and contract drift). Four
-further sections summarize the passive traffic audit (counters and retained findings, faults
-first), contract drift (proxied violations and drifting fuzz requests), the static route audit
-of the route list in view, and the idempotency replay outcome. The report is built in the UI
-(`src/lib/export.ts`) from state it already holds; nothing is re-run.
+proxy listener, global profile (mid-body drop included) and route rules, the latest burst
+report (barrier sync mode, status histogram, TTFB and total latency percentiles, success
+quota, idempotency key, contract drift count, anomalies) and the latest fuzz report (vector
+summary, notes, findings with disclosures and contract drift). Four further sections
+summarize the passive traffic audit (all seven counters and retained findings, faults
+first), contract drift (proxied violations, drifting fuzz requests and drifting burst
+workers), the static route audit of the route list in view (evidence location, with the
+declaring file when the handler is imported), and the idempotency replay outcome. The report
+is built in the UI (`src/lib/export.ts`) from state it already holds; nothing is re-run.
 
 | Action | Output                                                                                   |
 |--------|------------------------------------------------------------------------------------------|
 | `.md`  | Tabular Markdown; the first 200 findings, faults first                                    |
-| `.json`| `AuditReport` with `schema: "z-proxy.audit/2"`; burst samples and every finding included  |
+| `.json`| `AuditReport` with `schema: "z-proxy.audit/3"`; burst samples and every finding included  |
 | Copy   | The Markdown rendering to the clipboard                                                   |
 
 `save_audit_report` opens the native save dialog from Rust (the webview has no `fs` or
@@ -549,7 +654,7 @@ Every value the engine writes onto the wire, so upstream logs can attribute test
 | Origin       | Field                          | Value                                    |
 |--------------|--------------------------------|------------------------------------------|
 | Proxy        | `Via`                          | `1.1 z-proxy`                            |
-| Proxy        | `x-zproxy-fault`               | `status-<code>` on synthetic responses   |
+| Proxy        | `x-zproxy-fault`               | `status-<code>` on synthetic responses, `partial-body-<bytes>` on truncated ones |
 | Proxy        | `x-zproxy-injected-delay-us`   | Applied delay on forwarded responses     |
 | Proxy        | `x-zproxy-error`               | Upstream failure class on 502/504        |
 | Proxy        | JSON body `source`             | `z-proxy` on synthetic and error bodies  |
