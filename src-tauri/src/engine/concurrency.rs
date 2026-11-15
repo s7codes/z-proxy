@@ -6,22 +6,20 @@
 //! what makes narrow race windows reproducible.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{DefaultHasher, Hasher};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::http::header::{self, HeaderMap, HeaderName, HeaderValue};
-use axum::http::{Method, Request, Uri};
-use http_body_util::{BodyExt, Full};
-use hyper::client::conn::http1::{self, SendRequest};
-use hyper_util::rt::TokioIo;
+use axum::http::header::{self, HeaderName, HeaderValue};
+use axum::http::Request;
+use http_body_util::Full;
+use hyper::client::conn::http1::SendRequest;
 use tokio::sync::Barrier;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use super::error::{EngineError, EngineResult};
-use super::guard::{self, GuardedTarget};
+use super::http1::{self, RequestTemplate, CONNECT_TIMEOUT};
 use super::net;
 use super::types::{
     Anomaly, AnomalyKind, BurstMethod, BurstReport, BurstSpec, LatencyStats, Severity, SizeStats,
@@ -31,42 +29,22 @@ use crate::telemetry::{now_us, TelemetryHub};
 
 pub const MAX_WORKERS: u16 = 100;
 const MAX_TIMEOUT_MS: u32 = 60_000;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const USER_AGENT: &str = concat!("chaosproxy-burst/", env!("CARGO_PKG_VERSION"));
 const WORKER_HEADER: &str = "x-chaosproxy-burst-worker";
 
 /// Statuses that mean a request lost a uniqueness, precondition or idempotency check.
 const CONFLICT_STATUSES: [u16; 6] = [409, 412, 422, 423, 425, 429];
 
-/// Framing headers are owned by the engine; a user override would desynchronize the
-/// pre-built request from the connection it is written to.
-static RESERVED_HEADERS: [HeaderName; 5] = [
-    header::HOST,
-    header::CONTENT_LENGTH,
-    header::TRANSFER_ENCODING,
-    header::CONNECTION,
-    header::UPGRADE,
-];
-
 struct Prepared {
-    target: GuardedTarget,
-    label: String,
-    method: Method,
-    uri: Uri,
-    host: HeaderValue,
-    headers: HeaderMap,
+    template: RequestTemplate,
     body: Bytes,
     timeout: Duration,
 }
 
 impl Prepared {
     fn request(&self, worker: u16) -> Request<Full<Bytes>> {
-        let mut request = Request::new(Full::new(self.body.clone()));
-        *request.method_mut() = self.method.clone();
-        *request.uri_mut() = self.uri.clone();
+        let mut request = self.template.request(self.body.clone());
         let headers = request.headers_mut();
-        headers.clone_from(&self.headers);
-        headers.insert(header::HOST, self.host.clone());
         headers
             .entry(header::USER_AGENT)
             .or_insert(HeaderValue::from_static(USER_AGENT));
@@ -87,11 +65,11 @@ pub async fn run(spec: BurstSpec, hub: &TelemetryHub) -> EngineResult<BurstRepor
         seq: hub.next_seq(),
         id,
         ts_us: now_us(),
-        target: prepared.label.clone(),
+        target: prepared.template.label.clone(),
         method: spec.method,
         workers,
     });
-    tracing::info!(%id, target = %prepared.label, workers, "concurrency burst started");
+    tracing::info!(%id, target = %prepared.template.label, workers, "concurrency burst started");
 
     let barrier = Arc::new(Barrier::new(usize::from(workers)));
     let release = Arc::new(OnceLock::new());
@@ -126,7 +104,7 @@ pub async fn run(spec: BurstSpec, hub: &TelemetryHub) -> EngineResult<BurstRepor
     let report = analyze(
         ReportMeta {
             id,
-            target: prepared.label.clone(),
+            target: prepared.template.label.clone(),
             method: spec.method,
             workers,
             wall_us: net::elapsed_us(started),
@@ -168,62 +146,8 @@ fn prepare(spec: &BurstSpec) -> EngineResult<Prepared> {
         ));
     }
 
-    let target = guard::validate_url(&spec.target)?;
-    net::require_plaintext(&target)?;
-
-    let origin_form = match target.url.query() {
-        Some(query) => format!("{}?{query}", target.url.path()),
-        None => target.url.path().to_owned(),
-    };
-    let uri = origin_form
-        .parse::<Uri>()
-        .map_err(|err| invalid("target", err.to_string()))?;
-    let host_str = target.url.host_str().unwrap_or_default();
-    let authority = match target.url.port() {
-        Some(port) => format!("{host_str}:{port}"),
-        None => host_str.to_owned(),
-    };
-    let host =
-        HeaderValue::try_from(authority).map_err(|err| invalid("target", err.to_string()))?;
-
-    let mut headers = HeaderMap::new();
-    for pair in &spec.headers {
-        let name = HeaderName::from_bytes(pair.name.trim().as_bytes()).map_err(|_| {
-            invalid(
-                "headers",
-                format!("`{}` is not a valid header name", pair.name),
-            )
-        })?;
-        if RESERVED_HEADERS.contains(&name) {
-            return Err(invalid(
-                "headers",
-                format!("`{name}` is managed by the engine"),
-            ));
-        }
-        let value = HeaderValue::from_str(&pair.value).map_err(|_| {
-            invalid(
-                "headers",
-                format!("value for `{name}` contains invalid characters"),
-            )
-        })?;
-        headers.append(name, value);
-    }
-
-    let method = match spec.method {
-        BurstMethod::Get => Method::GET,
-        BurstMethod::Post => Method::POST,
-        BurstMethod::Put => Method::PUT,
-        BurstMethod::Patch => Method::PATCH,
-        BurstMethod::Delete => Method::DELETE,
-    };
-
     Ok(Prepared {
-        label: target.url.to_string(),
-        target,
-        method,
-        uri,
-        host,
-        headers,
+        template: RequestTemplate::new(&spec.target, spec.method, &spec.headers, invalid)?,
         body: spec.body.clone().map(Bytes::from).unwrap_or_default(),
         timeout: Duration::from_millis(u64::from(spec.timeout_ms)),
     })
@@ -235,14 +159,17 @@ async fn run_worker(
     barrier: Arc<Barrier>,
     release: Arc<OnceLock<Instant>>,
 ) -> WorkerSample {
-    let connection = tokio::time::timeout(CONNECT_TIMEOUT, open(&prepared))
+    let connection = tokio::time::timeout(CONNECT_TIMEOUT, http1::open(&prepared.template.target))
         .await
-        .unwrap_or_else(|_| {
-            Err(format!(
-                "connect timed out after {} ms",
-                CONNECT_TIMEOUT.as_millis()
-            ))
-        });
+        .map_or_else(
+            |_| {
+                Err(format!(
+                    "connect timed out after {} ms",
+                    CONNECT_TIMEOUT.as_millis()
+                ))
+            },
+            |opened| opened.map_err(|err| err.to_string()),
+        );
     let request = prepared.request(worker);
 
     // Workers whose connect failed still wait here; skipping the barrier would leave every
@@ -280,58 +207,13 @@ async fn run_worker(
     }
 }
 
-async fn open(prepared: &Prepared) -> Result<SendRequest<Full<Bytes>>, String> {
-    let stream = net::connect_loopback(&prepared.target, CONNECT_TIMEOUT)
-        .await
-        .map_err(|err| err.to_string())?;
-    let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
-        .await
-        .map_err(|err| format!("handshake failed: {err}"))?;
-    tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            tracing::debug!(error = %err, "burst connection closed with error");
-        }
-    });
-    sender
-        .ready()
-        .await
-        .map_err(|err| format!("connection not ready: {err}"))?;
-    Ok(sender)
-}
-
-struct Received {
-    status: u16,
-    bytes: u64,
-    hash: String,
-}
-
 async fn exchange(
     sender: &mut SendRequest<Full<Bytes>>,
     request: Request<Full<Bytes>>,
-) -> Result<Received, String> {
-    let response = sender
-        .send_request(request)
+) -> Result<http1::Received, String> {
+    http1::exchange(sender, request)
         .await
-        .map_err(|err| err.to_string())?;
-    let status = response.status().as_u16();
-
-    // Streamed into the hasher so fingerprinting large bodies costs no buffer.
-    let mut body = response.into_body();
-    let mut hasher = DefaultHasher::new();
-    let mut bytes = 0u64;
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|err| format!("body read failed: {err}"))?;
-        if let Some(data) = frame.data_ref() {
-            bytes = bytes.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
-            hasher.write(data);
-        }
-    }
-
-    Ok(Received {
-        status,
-        bytes,
-        hash: format!("{:016x}", hasher.finish()),
-    })
+        .map_err(|err| err.to_string())
 }
 
 fn failed(
