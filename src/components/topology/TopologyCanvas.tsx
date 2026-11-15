@@ -15,7 +15,7 @@ import type { EngineLink } from "../../hooks/useEngineStatus";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import { formatLatency } from "../../lib/format";
 import { fileLabel, SOURCE_LABEL } from "../../lib/routes";
-import type { DiscoveredRoute, ProxyStatus } from "../../lib/types";
+import type { DiscoveredRoute, FuzzReport, ProxyStatus } from "../../lib/types";
 import { guardTone, TONE_HEX, type Tone } from "../../lib/tone";
 import { PanelHeader } from "../shell/PanelHeader";
 import { nodeTypes, type TopoNode, type TopoNodeData } from "./nodes";
@@ -25,6 +25,8 @@ interface TopologyCanvasProps {
   guard: GuardState;
   proxy: ProxyStatus | null;
   route: DiscoveredRoute | null;
+  /** Last fuzz report for the targeted path, if any. */
+  fuzz: FuzzReport | null;
 }
 
 const FIT_VIEW: FitViewOptions = { padding: 0.25, maxZoom: 1 };
@@ -46,7 +48,7 @@ const INITIAL_NODES: TopoNode[] = (Object.keys(POSITIONS) as NodeId[]).map((id) 
   data: placeholderData(id),
 }));
 
-export function TopologyCanvas({ link, guard, proxy, route }: TopologyCanvasProps) {
+export function TopologyCanvas({ link, guard, proxy, route, fuzz }: TopologyCanvasProps) {
   const [nodes, , onNodesChange] = useNodesState<TopoNode>(INITIAL_NODES);
   const containerRef = useRef<HTMLDivElement>(null);
   const flowRef = useRef<ReactFlowInstance<TopoNode, Edge> | null>(null);
@@ -82,7 +84,10 @@ export function TopologyCanvas({ link, guard, proxy, route }: TopologyCanvasProp
     return () => cancelAnimationFrame(frame);
   }, [hasRoute]);
 
-  const dataById = useMemo(() => buildNodeData(link, guard, proxy, route), [link, guard, proxy, route]);
+  const dataById = useMemo(
+    () => buildNodeData(link, guard, proxy, route, fuzz),
+    [link, guard, proxy, route, fuzz],
+  );
   const displayNodes = useMemo(
     () => nodes.map((n) => ({ ...n, hidden: n.id === "endpoint" && !hasRoute, data: dataById[n.id as NodeId] })),
     [nodes, dataById, hasRoute],
@@ -123,6 +128,7 @@ function buildNodeData(
   guard: GuardState,
   proxy: ProxyStatus | null,
   route: DiscoveredRoute | null,
+  fuzz: FuzzReport | null,
 ): Record<NodeId, TopoNodeData> {
   const online = link.state === "online";
   const engineTone: Tone = online ? "ok" : link.state === "connecting" ? "muted" : "fault";
@@ -175,12 +181,13 @@ function buildNodeData(
         : {
             ...placeholderData("endpoint"),
             title: route.path,
-            tone: guard.phase === "accepted" ? "ok" : "muted",
+            tone: endpointTone(guard, fuzz),
             state: route.method,
             lines: [
               ["source", SOURCE_LABEL[route.source]],
               ["file", fileLabel(route.file, route.line)],
               ["params", route.params.length === 0 ? "-" : route.params.join(", ")],
+              ["fuzz", fuzz === null ? "-" : `${fuzz.faults} fault / ${fuzz.cases.length}`],
             ],
           },
   };
@@ -219,6 +226,12 @@ function edge(source: NodeId, target: NodeId, tone: Tone, label: string | undefi
     labelBgBorderRadius: 0,
   };
   return label === undefined ? base : { ...base, label };
+}
+
+function endpointTone(guard: GuardState, fuzz: FuzzReport | null): Tone {
+  if (fuzz !== null && fuzz.faults > 0) return "fault";
+  if (fuzz !== null && fuzz.warnings > 0) return "warn";
+  return guard.phase === "accepted" ? "ok" : "muted";
 }
 
 function upstreamEdgeLabel(guard: GuardState): string | undefined {

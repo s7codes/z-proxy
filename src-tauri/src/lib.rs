@@ -33,6 +33,8 @@ pub fn run() {
             commands::get_proxy_status,
             commands::set_fault_profile,
             commands::run_concurrency_burst,
+            commands::run_fuzzer_suite,
+            commands::cancel_fuzzer_suite,
             commands::scan_project_routes,
             commands::pick_project_root,
         ])

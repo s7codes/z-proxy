@@ -4,6 +4,7 @@ use std::time::Instant;
 use reqwest::Client;
 
 use crate::engine::error::EngineResult;
+use crate::engine::fuzzer::FuzzerSlot;
 use crate::engine::net;
 use crate::engine::proxy::ProxyManager;
 use crate::telemetry::TelemetryHub;
@@ -13,6 +14,7 @@ pub struct AppState {
     pub hub: Arc<TelemetryHub>,
     pub probe_client: Client,
     pub proxy: ProxyManager,
+    pub fuzzer: FuzzerSlot,
 }
 
 impl AppState {
@@ -23,6 +25,7 @@ impl AppState {
             proxy: ProxyManager::new(Arc::clone(&hub))?,
             hub,
             probe_client: net::probe_client()?,
+            fuzzer: FuzzerSlot::default(),
         })
     }
 }

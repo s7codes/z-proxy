@@ -36,6 +36,12 @@ pub enum EngineError {
     #[error("invalid burst spec field `{field}`: {reason}")]
     InvalidBurstSpec { field: &'static str, reason: String },
 
+    #[error("invalid fuzz spec field `{field}`: {reason}")]
+    InvalidFuzzSpec { field: &'static str, reason: String },
+
+    #[error("a fuzzer suite is already running")]
+    FuzzerBusy,
+
     #[error("cannot scan `{path}`: {reason}")]
     InvalidScanRoot { path: String, reason: String },
 
@@ -56,6 +62,8 @@ impl EngineError {
             Self::ProxyLoop { .. } => "PROXY_LOOP",
             Self::InvalidFaultProfile { .. } => "INVALID_FAULT_PROFILE",
             Self::InvalidBurstSpec { .. } => "INVALID_BURST_SPEC",
+            Self::InvalidFuzzSpec { .. } => "INVALID_FUZZ_SPEC",
+            Self::FuzzerBusy => "FUZZER_BUSY",
             Self::InvalidScanRoot { .. } => "INVALID_SCAN_ROOT",
             Self::InternalTask { .. } => "INTERNAL_TASK_FAILED",
         }
@@ -77,11 +85,11 @@ impl Serialize for EngineError {
             Self::ListenerBind { addr, .. } | Self::ProxyLoop { addr } => {
                 s.serialize_field("addr", addr)?
             }
-            Self::InvalidFaultProfile { field, .. } | Self::InvalidBurstSpec { field, .. } => {
-                s.serialize_field("field", field)?
-            }
+            Self::InvalidFaultProfile { field, .. }
+            | Self::InvalidBurstSpec { field, .. }
+            | Self::InvalidFuzzSpec { field, .. } => s.serialize_field("field", field)?,
             Self::InvalidScanRoot { path, .. } => s.serialize_field("path", path)?,
-            Self::ClientBuild(_) | Self::InternalTask { .. } => {}
+            Self::ClientBuild(_) | Self::InternalTask { .. } | Self::FuzzerBusy => {}
         }
         s.end()
     }

@@ -130,6 +130,72 @@ export interface BurstReport {
   samples: WorkerSample[];
 }
 
+// ---- fuzzer ---------------------------------------------------------------------------
+
+/** Declaration order is execution order. */
+export type MutationClass =
+  | "nullInjection"
+  | "emptyStrings"
+  | "boundaryNumbers"
+  | "typeConfusion"
+  | "oversizedField"
+  | "malformedJson"
+  | "missingFields";
+
+export interface FuzzSpec {
+  target: string;
+  method: BurstMethod;
+  headers: HeaderPair[];
+  /** JSON object to mutate; `null` or blank uses the built-in template. */
+  baseBody: string | null;
+  /** Empty selects every class. */
+  classes: MutationClass[];
+  timeoutMs: number;
+}
+
+export type FuzzVerdict = "rejected" | "accepted" | "serverError" | "transportFailure" | "unreachable" | "skipped";
+
+export interface FuzzCaseResult {
+  index: number;
+  /** `null` for the unmutated baseline request. */
+  class: MutationClass | null;
+  label: string;
+  /** RFC 6901 pointer of the mutated field; `null` for whole-body mutations. */
+  pointer: string | null;
+  requestBytes: number;
+  status: number | null;
+  latencyUs: number;
+  responseBytes: number;
+  responsePreview: string | null;
+  verdict: FuzzVerdict;
+  severity: Severity | null;
+  error: string | null;
+}
+
+export interface ClassSummary {
+  class: MutationClass;
+  cases: number;
+  rejected: number;
+  accepted: number;
+  faults: number;
+  unreached: number;
+}
+
+export interface FuzzReport {
+  id: string;
+  target: string;
+  method: BurstMethod;
+  fields: number;
+  wallUs: number;
+  baseline: FuzzCaseResult;
+  cases: FuzzCaseResult[];
+  summary: ClassSummary[];
+  faults: number;
+  warnings: number;
+  aborted: string | null;
+  notes: string[];
+}
+
 // ---- route scanner --------------------------------------------------------------------
 
 export type RouteMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "ANY";
@@ -260,6 +326,34 @@ export type TelemetryEvent =
       filesVisited: number;
       elapsedUs: number;
       truncated: boolean;
+    }
+  | {
+      kind: "fuzzerStarted";
+      seq: number;
+      id: string;
+      tsUs: number;
+      target: string;
+      method: BurstMethod;
+      /** Mutation cases, excluding the baseline. */
+      cases: number;
+    }
+  | {
+      kind: "fuzzerCaseCompleted";
+      seq: number;
+      id: string;
+      tsUs: number;
+      result: FuzzCaseResult;
+    }
+  | {
+      kind: "fuzzerCompleted";
+      seq: number;
+      id: string;
+      tsUs: number;
+      wallUs: number;
+      cases: number;
+      faults: number;
+      warnings: number;
+      aborted: string | null;
     };
 
 export type TelemetryKind = TelemetryEvent["kind"];
@@ -279,6 +373,8 @@ export type EngineErrorCode =
   | "PROXY_LOOP"
   | "INVALID_FAULT_PROFILE"
   | "INVALID_BURST_SPEC"
+  | "INVALID_FUZZ_SPEC"
+  | "FUZZER_BUSY"
   | "INVALID_SCAN_ROOT"
   | "INTERNAL_TASK_FAILED";
 
@@ -293,5 +389,7 @@ export type EngineError =
   | { code: "PROXY_LOOP"; message: string; addr: string }
   | { code: "INVALID_FAULT_PROFILE"; message: string; field: string }
   | { code: "INVALID_BURST_SPEC"; message: string; field: string }
+  | { code: "INVALID_FUZZ_SPEC"; message: string; field: string }
+  | { code: "FUZZER_BUSY"; message: string }
   | { code: "INVALID_SCAN_ROOT"; message: string; path: string }
   | { code: "INTERNAL_TASK_FAILED"; message: string };

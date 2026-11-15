@@ -6,11 +6,12 @@ use uuid::Uuid;
 use crate::engine::concurrency;
 use crate::engine::error::EngineError;
 use crate::engine::fault::FaultProfile;
+use crate::engine::fuzzer;
 use crate::engine::guard;
 use crate::engine::net;
 use crate::engine::types::{
-    BurstReport, BurstSpec, EngineStatus, ProbeResult, ProxyConfig, ProxyStatus, RouteScanReport,
-    TelemetryEvent, ValidatedTarget, Verdict,
+    BurstReport, BurstSpec, EngineStatus, FuzzReport, FuzzSpec, ProbeResult, ProxyConfig,
+    ProxyStatus, RouteScanReport, TelemetryEvent, ValidatedTarget, Verdict,
 };
 use crate::scanner::routes;
 use crate::state::AppState;
@@ -132,6 +133,20 @@ pub async fn run_concurrency_burst(
     spec: BurstSpec,
 ) -> Result<BurstReport, EngineError> {
     concurrency::run(spec, &state.hub).await
+}
+
+#[tauri::command]
+pub async fn run_fuzzer_suite(
+    state: State<'_, AppState>,
+    spec: FuzzSpec,
+) -> Result<FuzzReport, EngineError> {
+    fuzzer::run(spec, &state.hub, &state.fuzzer).await
+}
+
+/// Resolves `true` when a running suite was asked to stop; it ends after the in-flight case.
+#[tauri::command]
+pub async fn cancel_fuzzer_suite(state: State<'_, AppState>) -> Result<bool, EngineError> {
+    Ok(state.fuzzer.cancel())
 }
 
 #[tauri::command]

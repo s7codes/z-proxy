@@ -6,8 +6,10 @@
 //! `net::connect_loopback`, which re-validates the socket address before connect and the
 //! peer after.
 
+use std::error::Error as _;
 use std::fmt;
 use std::hash::{DefaultHasher, Hasher};
+use std::io;
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -105,6 +107,10 @@ impl RequestTemplate {
         })
     }
 
+    pub fn has_header(&self, name: &HeaderName) -> bool {
+        self.headers.contains_key(name)
+    }
+
     pub fn request(&self, body: Bytes) -> Request<Full<Bytes>> {
         let mut request = Request::new(Full::new(body));
         *request.method_mut() = self.method.clone();
@@ -165,12 +171,41 @@ pub struct Received {
     pub bytes: u64,
     /// 64-bit SipHash of the full body as 16 hex digits.
     pub hash: String,
+    /// Leading body bytes, up to the limit passed to `exchange`.
+    pub preview: Vec<u8>,
 }
 
 #[derive(Debug)]
 pub enum ExchangeError {
     Send(hyper::Error),
     Body(hyper::Error),
+}
+
+impl ExchangeError {
+    /// The peer aborted the connection (RST, or EOF before a complete response), as opposed
+    /// to a protocol error on a live connection.
+    pub fn is_connection_abort(&self) -> bool {
+        let err = match self {
+            Self::Send(err) | Self::Body(err) => err,
+        };
+        if err.is_incomplete_message() || err.is_closed() || err.is_canceled() {
+            return true;
+        }
+        let mut source = err.source();
+        while let Some(cause) = source {
+            if let Some(io) = cause.downcast_ref::<io::Error>() {
+                return matches!(
+                    io.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::UnexpectedEof
+                );
+            }
+            source = cause.source();
+        }
+        false
+    }
 }
 
 impl fmt::Display for ExchangeError {
@@ -183,10 +218,11 @@ impl fmt::Display for ExchangeError {
 }
 
 /// Sends one request and drains the response, streaming the body into the fingerprint so a
-/// large body costs no buffer.
+/// large body costs no buffer beyond the preview.
 pub async fn exchange(
     sender: &mut SendRequest<Full<Bytes>>,
     request: Request<Full<Bytes>>,
+    preview_limit: usize,
 ) -> Result<Received, ExchangeError> {
     let response = sender
         .send_request(request)
@@ -197,11 +233,14 @@ pub async fn exchange(
     let mut body = response.into_body();
     let mut hasher = DefaultHasher::new();
     let mut bytes = 0u64;
+    let mut preview = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(ExchangeError::Body)?;
         if let Some(data) = frame.data_ref() {
             bytes = bytes.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
             hasher.write(data);
+            let room = preview_limit.saturating_sub(preview.len());
+            preview.extend_from_slice(&data[..room.min(data.len())]);
         }
     }
 
@@ -209,5 +248,6 @@ pub async fn exchange(
         status,
         bytes,
         hash: format!("{:016x}", hasher.finish()),
+        preview,
     })
 }

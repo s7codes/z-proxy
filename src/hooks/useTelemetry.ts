@@ -7,10 +7,21 @@ export const TELEMETRY_CAPACITY = 5_000;
 // reconciliation at 10 Hz regardless of how fast the engine produces.
 const FLUSH_MS = 100;
 
+/** Progress of the most recent fuzzer run, folded from its telemetry events. */
+export interface FuzzerProgress {
+  id: string;
+  total: number;
+  /** Mutation cases finished; the baseline is not counted. */
+  completed: number;
+  faults: number;
+  finished: boolean;
+}
+
 export interface TelemetryStore {
   events: readonly TelemetryEvent[];
   latestHeartbeat: TelemetryEventOf<"engineHeartbeat"> | null;
   latestProxyState: TelemetryEventOf<"proxyStateChanged"> | null;
+  fuzzerProgress: FuzzerProgress | null;
   paused: boolean;
   setPaused: (paused: boolean) => void;
   clear: () => void;
@@ -28,10 +39,29 @@ function findLast<K extends TelemetryKind>(
   return null;
 }
 
+function foldFuzzer(progress: FuzzerProgress | null, batch: readonly TelemetryEvent[]): FuzzerProgress | null {
+  let next = progress;
+  for (const event of batch) {
+    if (event.kind === "fuzzerStarted") {
+      next = { id: event.id, total: event.cases, completed: 0, faults: 0, finished: false };
+    } else if (event.kind === "fuzzerCaseCompleted" && next?.id === event.id && event.result.class !== null) {
+      next = {
+        ...next,
+        completed: next.completed + 1,
+        faults: next.faults + (event.result.severity === "fault" ? 1 : 0),
+      };
+    } else if (event.kind === "fuzzerCompleted" && next?.id === event.id) {
+      next = { ...next, faults: event.faults, finished: true };
+    }
+  }
+  return next;
+}
+
 export function useTelemetry(): TelemetryStore {
   const [events, setEvents] = useState<readonly TelemetryEvent[]>([]);
   const [latestHeartbeat, setLatestHeartbeat] = useState<TelemetryStore["latestHeartbeat"]>(null);
   const [latestProxyState, setLatestProxyState] = useState<TelemetryStore["latestProxyState"]>(null);
+  const [fuzzerProgress, setFuzzerProgress] = useState<FuzzerProgress | null>(null);
   const [paused, setPaused] = useState(false);
   const [totalReceived, setTotalReceived] = useState(0);
 
@@ -56,6 +86,9 @@ export function useTelemetry(): TelemetryStore {
       // not just the log.
       const proxyState = findLast(batch, "proxyStateChanged");
       if (proxyState !== null) setLatestProxyState(proxyState);
+      if (batch.some((event) => event.kind.startsWith("fuzzer"))) {
+        setFuzzerProgress((progress) => foldFuzzer(progress, batch));
+      }
 
       if (pausedRef.current) return;
       setEvents((prev) => {
@@ -75,5 +108,5 @@ export function useTelemetry(): TelemetryStore {
     setEvents([]);
   }, []);
 
-  return { events, latestHeartbeat, latestProxyState, paused, setPaused, clear, totalReceived };
+  return { events, latestHeartbeat, latestProxyState, fuzzerProgress, paused, setPaused, clear, totalReceived };
 }

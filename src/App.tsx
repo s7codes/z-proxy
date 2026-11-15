@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PanelImperativeHandle } from "react-resizable-panels";
 import {
+  CircleStop,
   Crosshair,
+  FlaskConical,
   FolderOpen,
   PanelBottom,
   PanelLeft,
@@ -13,7 +15,7 @@ import {
   Square,
   Trash2,
 } from "lucide-react";
-import { ChaosControls, DEFAULT_FAULT_PROFILE } from "./components/chaos/ChaosControls";
+import { ChaosControls, DEFAULT_FAULT_PROFILE, type ChaosTab } from "./components/chaos/ChaosControls";
 import { TargetInspector } from "./components/inspector/TargetInspector";
 import { CommandPalette, type PaletteCommand } from "./components/shell/CommandPalette";
 import { Kbd } from "./components/shell/PanelHeader";
@@ -23,6 +25,7 @@ import { TelemetryTable } from "./components/telemetry/TelemetryTable";
 import { TopologyCanvas } from "./components/topology/TopologyCanvas";
 import { useBurst } from "./hooks/useBurst";
 import { useEngineStatus } from "./hooks/useEngineStatus";
+import { useFuzzer } from "./hooks/useFuzzer";
 import { useGuardValidator } from "./hooks/useGuardValidator";
 import { sameProfile, useProxy } from "./hooks/useProxy";
 import { useRouteScan } from "./hooks/useRouteScan";
@@ -43,7 +46,9 @@ export function App() {
   const guard = useGuardValidator(targetInput);
   const proxy = useProxy(telemetry.latestProxyState);
   const burst = useBurst();
+  const fuzzer = useFuzzer();
   const routeScan = useRouteScan();
+  const [chaosTab, setChaosTab] = useState<ChaosTab>("faults");
   const [selectedRoute, setSelectedRoute] = useState<DiscoveredRoute | null>(null);
   const [requestTarget, setRequestTarget] = useState<RequestTarget>({ method: "POST", path: "/" });
 
@@ -87,6 +92,7 @@ export function App() {
 
   const { setPaused, paused, clear } = telemetry;
   const { scan: scanRoutes, browse: browseRoot, root: scanRoot } = routeScan;
+  const { running: fuzzing, cancel: cancelFuzzer } = fuzzer;
   const commands = useMemo<PaletteCommand[]>(() => {
     const toggle = (ref: React.RefObject<PanelImperativeHandle | null>) => () => {
       const panel = ref.current;
@@ -118,6 +124,19 @@ export function App() {
       ...(scanRoot.trim() === ""
         ? []
         : [{ id: "scan-routes", group: "Routes", label: "Rescan project routes", icon: RefreshCw, run: () => scanRoutes() }]),
+      {
+        id: "open-fuzzer",
+        group: "Fuzzer",
+        label: "Open fuzzer panel",
+        icon: FlaskConical,
+        run: () => {
+          chaosRef.current?.expand();
+          setChaosTab("fuzzer");
+        },
+      },
+      ...(fuzzing
+        ? [{ id: "cancel-fuzzer", group: "Fuzzer", label: "Cancel fuzzer suite", icon: CircleStop, run: cancelFuzzer }]
+        : []),
       { id: "pause", group: "Telemetry", label: paused ? "Resume stream" : "Pause stream", icon: Pause, run: () => setPaused(!paused) },
       { id: "clear", group: "Telemetry", label: "Clear buffer", icon: Trash2, run: clear },
       { id: "reset-fault", group: "Fault Injection", label: "Reset fault profile", icon: RotateCcw, run: () => setFaultProfile(DEFAULT_FAULT_PROFILE) },
@@ -139,7 +158,32 @@ export function App() {
       { id: "toggle-chaos", group: "Layout", label: "Toggle chaos panel", icon: PanelRight, run: toggle(chaosRef) },
       { id: "toggle-telemetry", group: "Layout", label: "Toggle telemetry panel", icon: PanelBottom, run: toggle(telemetryRef) },
     ];
-  }, [paused, setPaused, clear, proxyStatus, applyFaults, stopProxy, faultProfile, scanRoot, scanRoutes, browseRoot]);
+  }, [
+    paused,
+    setPaused,
+    clear,
+    proxyStatus,
+    applyFaults,
+    stopProxy,
+    faultProfile,
+    scanRoot,
+    scanRoutes,
+    browseRoot,
+    fuzzing,
+    cancelFuzzer,
+  ]);
+
+  // The endpoint node reflects the last fuzz report only while it still describes the
+  // request path the panels target.
+  const endpointFuzz = useMemo(() => {
+    const report = fuzzer.report;
+    if (report === null) return null;
+    try {
+      return new URL(report.target).pathname === requestTarget.path ? report : null;
+    } catch {
+      return null;
+    }
+  }, [fuzzer.report, requestTarget.path]);
 
   return (
     <div className="flex h-full flex-col bg-bg text-fg">
@@ -175,15 +219,21 @@ export function App() {
             onSelectRoute={selectRoute}
           />
         }
-        topology={<TopologyCanvas link={link} guard={guard} proxy={proxyStatus} route={selectedRoute} />}
+        topology={
+          <TopologyCanvas link={link} guard={guard} proxy={proxyStatus} route={selectedRoute} fuzz={endpointFuzz} />
+        }
         chaos={
           <ChaosControls
+            tab={chaosTab}
+            onTab={setChaosTab}
             profile={faultProfile}
             onChange={setFaultProfile}
             link={link}
             guard={guard}
             proxy={proxy}
             burst={burst}
+            fuzzer={fuzzer}
+            fuzzerProgress={telemetry.fuzzerProgress}
             target={requestTarget}
             onTarget={setRequestTarget}
           />

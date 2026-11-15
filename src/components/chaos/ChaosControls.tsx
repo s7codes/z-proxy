@@ -2,13 +2,16 @@ import { useState } from "react";
 import { Play, Power, RotateCcw, Square } from "lucide-react";
 import type { BurstControl } from "../../hooks/useBurst";
 import type { EngineLink } from "../../hooks/useEngineStatus";
+import type { FuzzerControl } from "../../hooks/useFuzzer";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import type { ProxyControl } from "../../hooks/useProxy";
+import type { FuzzerProgress } from "../../hooks/useTelemetry";
 import type { RequestTarget } from "../../lib/routes";
 import type { FaultProfile, StatusMutation } from "../../lib/types";
 import { PanelHeader, Section, StatusSquare, ToolButton } from "../shell/PanelHeader";
 import { BurstPanel } from "./BurstPanel";
 import { ErrorLine } from "./ErrorLine";
+import { FuzzerPanel } from "./FuzzerPanel";
 import { Slider } from "./Slider";
 
 export const DEFAULT_FAULT_PROFILE: FaultProfile = {
@@ -22,32 +25,49 @@ export const DEFAULT_FAULT_PROFILE: FaultProfile = {
 const DEFAULT_LISTEN_PORT = 8787;
 const MUTATIONS: readonly StatusMutation[] = ["none", "429", "500", "502", "503", "504"];
 
-type ChaosTab = "faults" | "burst";
+export type ChaosTab = "faults" | "burst" | "fuzzer";
 
 interface ChaosControlsProps {
+  tab: ChaosTab;
+  onTab: (tab: ChaosTab) => void;
   profile: FaultProfile;
   onChange: (profile: FaultProfile) => void;
   link: EngineLink;
   guard: GuardState;
   proxy: ProxyControl;
   burst: BurstControl;
+  fuzzer: FuzzerControl;
+  fuzzerProgress: FuzzerProgress | null;
   target: RequestTarget;
   onTarget: (target: RequestTarget) => void;
 }
 
-export function ChaosControls({ profile, onChange, link, guard, proxy, burst, target, onTarget }: ChaosControlsProps) {
-  const [tab, setTab] = useState<ChaosTab>("faults");
+export function ChaosControls(props: ChaosControlsProps) {
+  const { tab, onTab, link, guard, target, onTarget } = props;
+  const online = link.state === "online";
 
   return (
     <div className="flex h-full flex-col bg-panel">
       <PanelHeader title="Chaos">
-        <ToolButton label="Faults" active={tab === "faults"} onClick={() => setTab("faults")} />
-        <ToolButton label="Burst" active={tab === "burst"} onClick={() => setTab("burst")} />
+        <ToolButton label="Faults" active={tab === "faults"} onClick={() => onTab("faults")} />
+        <ToolButton label="Burst" active={tab === "burst"} onClick={() => onTab("burst")} />
+        <ToolButton label="Fuzzer" active={tab === "fuzzer"} onClick={() => onTab("fuzzer")} />
       </PanelHeader>
-      {tab === "faults" ? (
-        <FaultsTab profile={profile} onChange={onChange} link={link} guard={guard} proxy={proxy} />
-      ) : (
-        <BurstPanel guard={guard} burst={burst} online={link.state === "online"} target={target} onTarget={onTarget} />
+      {tab === "faults" && (
+        <FaultsTab profile={props.profile} onChange={props.onChange} link={link} guard={guard} proxy={props.proxy} />
+      )}
+      {tab === "burst" && (
+        <BurstPanel guard={guard} burst={props.burst} online={online} target={target} onTarget={onTarget} />
+      )}
+      {tab === "fuzzer" && (
+        <FuzzerPanel
+          guard={guard}
+          fuzzer={props.fuzzer}
+          progress={props.fuzzerProgress}
+          online={online}
+          target={target}
+          onTarget={onTarget}
+        />
       )}
     </div>
   );

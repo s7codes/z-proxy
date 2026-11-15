@@ -5,7 +5,7 @@ import { TELEMETRY_CAPACITY } from "../../hooks/useTelemetry";
 import { formatBytes, formatLatency, formatTimestamp, formatUptime } from "../../lib/format";
 import { ipcAvailable } from "../../lib/ipc";
 import { httpStatusTone, TONE_TEXT, type Tone } from "../../lib/tone";
-import type { FaultProfile, TelemetryEvent } from "../../lib/types";
+import type { FaultProfile, FuzzVerdict, TelemetryEvent } from "../../lib/types";
 import { FILTER_KINDS, TelemetryToolbar, type KindFilter } from "./TelemetryToolbar";
 
 const ROW_HEIGHT = 22;
@@ -254,6 +254,55 @@ function toRow(event: TelemetryEvent): Row {
           .filter((part) => part !== null)
           .join("  "),
       };
+    case "fuzzerStarted":
+      return {
+        ...base,
+        kind: "FUZZ",
+        kindTone: "muted",
+        target: event.target,
+        result: `${event.method} x${event.cases}`,
+        resultTone: "muted",
+        latency: "-",
+        detail: `run ${event.id.slice(0, 8)}  baseline first`,
+      };
+    case "fuzzerCaseCompleted": {
+      const { result } = event;
+      const tone: Tone = result.severity === "fault" ? "fault" : result.severity === "warn" ? "warn" : "muted";
+      return {
+        ...base,
+        kind: "FUZZ",
+        kindTone: tone,
+        target: `#${result.index} ${result.label}`,
+        result: result.status === null ? fuzzVerdictLabel(result.verdict) : String(result.status),
+        resultTone: result.status === null ? (result.verdict === "unreachable" ? "warn" : "fault") : httpStatusTone(result.status),
+        latency: result.latencyUs === 0 ? "-" : formatLatency(result.latencyUs),
+        detail: result.error ?? `req ${formatBytes(result.requestBytes)}  res ${formatBytes(result.responseBytes)}`,
+      };
+    }
+    case "fuzzerCompleted":
+      return {
+        ...base,
+        kind: "FUZZ",
+        kindTone: event.faults > 0 ? "fault" : event.warnings > 0 ? "warn" : "ok",
+        target: `run ${event.id.slice(0, 8)}`,
+        result: event.faults > 0 ? `${event.faults} FAULT` : event.aborted !== null ? "ABORTED" : "CLEAN",
+        resultTone: event.faults > 0 ? "fault" : event.aborted !== null ? "warn" : "ok",
+        latency: formatLatency(event.wallUs),
+        detail: [`${event.cases} cases`, `${event.warnings} warn`, event.aborted].filter((part) => part !== null).join("  "),
+      };
+  }
+}
+
+function fuzzVerdictLabel(verdict: FuzzVerdict): string {
+  switch (verdict) {
+    case "transportFailure":
+      return "ABORT";
+    case "unreachable":
+      return "DOWN";
+    case "skipped":
+      return "SKIP";
+    default:
+      return "ERR";
   }
 }
 

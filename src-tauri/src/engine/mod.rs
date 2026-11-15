@@ -1,6 +1,7 @@
 pub mod concurrency;
 pub mod error;
 pub mod fault;
+pub mod fuzzer;
 pub mod guard;
 pub mod http1;
 pub mod net;

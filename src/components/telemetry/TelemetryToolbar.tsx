@@ -3,11 +3,12 @@ import { formatCount } from "../../lib/format";
 import type { TelemetryKind } from "../../lib/types";
 import { ToolButton } from "../shell/PanelHeader";
 
-export type KindFilter = "all" | "proxy" | "burst" | "scan" | "guard" | "probe" | "heartbeat";
+export type KindFilter = "all" | "proxy" | "burst" | "fuzzer" | "scan" | "guard" | "probe" | "heartbeat";
 
 export const FILTER_KINDS: Record<Exclude<KindFilter, "all">, ReadonlySet<TelemetryKind>> = {
   proxy: new Set<TelemetryKind>(["proxyExchange", "proxyStateChanged"]),
   burst: new Set<TelemetryKind>(["burstStarted", "burstSample", "burstCompleted"]),
+  fuzzer: new Set<TelemetryKind>(["fuzzerStarted", "fuzzerCaseCompleted", "fuzzerCompleted"]),
   scan: new Set<TelemetryKind>(["routeScanCompleted"]),
   guard: new Set<TelemetryKind>(["guardDecision"]),
   probe: new Set<TelemetryKind>(["probeCompleted"]),
@@ -18,6 +19,7 @@ const FILTERS: ReadonlyArray<{ id: KindFilter; label: string }> = [
   { id: "all", label: "All" },
   { id: "proxy", label: "Proxy" },
   { id: "burst", label: "Burst" },
+  { id: "fuzzer", label: "Fuzzer" },
   { id: "scan", label: "Scan" },
   { id: "guard", label: "Guard" },
   { id: "probe", label: "Probe" },

@@ -6,6 +6,8 @@ import type {
   EngineErrorCode,
   EngineStatus,
   FaultProfile,
+  FuzzReport,
+  FuzzSpec,
   ProxyConfig,
   ProxyStatus,
   RouteScanReport,
@@ -34,6 +36,8 @@ const ENGINE_CODES: ReadonlySet<string> = new Set<EngineErrorCode>([
   "PROXY_LOOP",
   "INVALID_FAULT_PROFILE",
   "INVALID_BURST_SPEC",
+  "INVALID_FUZZ_SPEC",
+  "FUZZER_BUSY",
   "INVALID_SCAN_ROOT",
   "INTERNAL_TASK_FAILED",
 ]);
@@ -96,6 +100,15 @@ export function setFaultProfile(armed: boolean, profile: FaultProfile): Promise<
 
 export function runConcurrencyBurst(spec: BurstSpec): Promise<IpcResult<BurstReport>> {
   return call<BurstReport>("run_concurrency_burst", { spec });
+}
+
+export function runFuzzerSuite(spec: FuzzSpec): Promise<IpcResult<FuzzReport>> {
+  return call<FuzzReport>("run_fuzzer_suite", { spec });
+}
+
+/** `true` when a running suite was asked to stop; it ends after the in-flight case. */
+export function cancelFuzzerSuite(): Promise<IpcResult<boolean>> {
+  return call<boolean>("cancel_fuzzer_suite");
 }
 
 export function scanProjectRoutes(root: string): Promise<IpcResult<RouteScanReport>> {

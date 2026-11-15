@@ -195,6 +195,104 @@ pub struct BurstReport {
     pub samples: Vec<WorkerSample>,
 }
 
+// ---- fuzzer ---------------------------------------------------------------------------
+
+/// Declaration order is execution order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MutationClass {
+    NullInjection,
+    EmptyStrings,
+    BoundaryNumbers,
+    TypeConfusion,
+    OversizedField,
+    MalformedJson,
+    MissingFields,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FuzzSpec {
+    pub target: String,
+    pub method: BurstMethod,
+    pub headers: Vec<HeaderPair>,
+    /// JSON object to mutate; `None` or blank uses the built-in template.
+    pub base_body: Option<String>,
+    /// Empty selects every class.
+    pub classes: Vec<MutationClass>,
+    pub timeout_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FuzzVerdict {
+    /// 4xx: the service refused the payload.
+    Rejected,
+    /// 1xx-3xx: the service took the payload.
+    Accepted,
+    /// 5xx.
+    ServerError,
+    /// Reset, closed before a full response, or timed out after connecting.
+    TransportFailure,
+    /// The connection could not be opened; not attributable to this case's payload.
+    Unreachable,
+    /// Not executed (cancelled, or the run aborted earlier).
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FuzzCaseResult {
+    pub index: u32,
+    /// `None` for the unmutated baseline request.
+    pub class: Option<MutationClass>,
+    pub label: String,
+    /// RFC 6901 pointer of the mutated field; `None` for whole-body mutations.
+    pub pointer: Option<String>,
+    pub request_bytes: u64,
+    pub status: Option<u16>,
+    pub latency_us: u64,
+    pub response_bytes: u64,
+    /// Leading response bytes, lossily decoded; stack traces leaked in 5xx bodies show here.
+    pub response_preview: Option<String>,
+    pub verdict: FuzzVerdict,
+    pub severity: Option<Severity>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassSummary {
+    pub class: MutationClass,
+    pub cases: u32,
+    pub rejected: u32,
+    pub accepted: u32,
+    /// Server errors and transport failures.
+    pub faults: u32,
+    /// Unreachable and skipped cases.
+    pub unreached: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FuzzReport {
+    pub id: Uuid,
+    pub target: String,
+    pub method: BurstMethod,
+    /// Fields of the base payload that received per-field mutations.
+    pub fields: u32,
+    pub wall_us: u64,
+    pub baseline: FuzzCaseResult,
+    pub cases: Vec<FuzzCaseResult>,
+    pub summary: Vec<ClassSummary>,
+    pub faults: u32,
+    pub warnings: u32,
+    /// Set when the run stopped early: target unreachable or operator cancel.
+    pub aborted: Option<String>,
+    /// Context that changes how results read, such as a baseline that was not accepted.
+    pub notes: Vec<String>,
+}
+
 // ---- route scanner --------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -347,5 +445,31 @@ pub enum TelemetryEvent {
         files_visited: u32,
         elapsed_us: u64,
         truncated: bool,
+    },
+    FuzzerStarted {
+        seq: u64,
+        id: Uuid,
+        ts_us: u64,
+        target: String,
+        method: BurstMethod,
+        /// Mutation cases, excluding the baseline.
+        cases: u32,
+    },
+    /// One per executed request, baseline included; skipped cases emit nothing.
+    FuzzerCaseCompleted {
+        seq: u64,
+        id: Uuid,
+        ts_us: u64,
+        result: FuzzCaseResult,
+    },
+    FuzzerCompleted {
+        seq: u64,
+        id: Uuid,
+        ts_us: u64,
+        wall_us: u64,
+        cases: u32,
+        faults: u32,
+        warnings: u32,
+        aborted: Option<String>,
     },
 }

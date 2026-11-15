@@ -17,7 +17,9 @@ tauri-build = { version = "2.7", features = [] }
 [dependencies]
 tauri = { version = "2.12", features = [] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# preserve_order: fuzz cases keep the operator's field order, so a mutated payload reads like
+# the base payload it came from and order-sensitive parsers see the original layout.
+serde_json = { version = "1.0", features = ["preserve_order"] }
 tokio = { version = "1.54", features = ["sync", "time", "macros", "net", "rt"] }
 # No TLS backend: every outbound connection is loopback-only, and rustls/aws-lc-rs
 # would add a NASM/CMake toolchain requirement on Windows for no benefit.
