@@ -6,7 +6,9 @@ import type { FuzzerControl } from "../../hooks/useFuzzer";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import type { ProxyControl } from "../../hooks/useProxy";
 import type { FuzzerProgress } from "../../hooks/useTelemetry";
+import type { RequestOrigin } from "../../lib/request";
 import { METHOD_BADGE, type RequestTarget } from "../../lib/routes";
+import { DEFAULT_LISTEN_PORT, summarizeProfile } from "../../lib/rules";
 import type { DiscoveredRoute, FaultProfile, FaultRule, RouteMethod, StatusMutation } from "../../lib/types";
 import { PanelHeader, Section, StatusSquare, ToolButton } from "../shell/PanelHeader";
 import { BurstPanel } from "./BurstPanel";
@@ -22,7 +24,6 @@ export const DEFAULT_FAULT_PROFILE: FaultProfile = {
   mutationRate: 0,
 };
 
-const DEFAULT_LISTEN_PORT = 8787;
 const MUTATIONS: readonly StatusMutation[] = ["none", "429", "500", "502", "503", "504"];
 
 export type ChaosTab = "faults" | "burst" | "fuzzer";
@@ -34,6 +35,8 @@ interface ChaosControlsProps {
   onChange: (profile: FaultProfile) => void;
   link: EngineLink;
   guard: GuardState;
+  /** Where Burst and Fuzzer send requests: the validated target or the proxy listener. */
+  requestOrigin: RequestOrigin | null;
   proxy: ProxyControl;
   burst: BurstControl;
   fuzzer: FuzzerControl;
@@ -81,7 +84,7 @@ export function ChaosControls(props: ChaosControlsProps) {
       )}
       {tab === "burst" && (
         <BurstPanel
-          guard={guard}
+          requestOrigin={props.requestOrigin}
           burst={props.burst}
           online={online}
           target={target}
@@ -94,7 +97,7 @@ export function ChaosControls(props: ChaosControlsProps) {
       )}
       {tab === "fuzzer" && (
         <FuzzerPanel
-          guard={guard}
+          requestOrigin={props.requestOrigin}
           fuzzer={props.fuzzer}
           progress={props.fuzzerProgress}
           online={online}
@@ -277,18 +280,6 @@ function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget }: Faults
       </div>
     </>
   );
-}
-
-export function summarizeProfile(profile: FaultProfile): string {
-  const parts: string[] = [];
-  if (profile.latencyMs > 0 || profile.jitterMs > 0) {
-    parts.push(profile.jitterMs > 0 ? `${profile.latencyMs}±${profile.jitterMs}ms` : `${profile.latencyMs}ms`);
-  }
-  if (profile.dropRate > 0) parts.push(`rst ${profile.dropRate}%`);
-  if (profile.statusMutation !== "none" && profile.mutationRate > 0) {
-    parts.push(`${profile.statusMutation}@${profile.mutationRate}%`);
-  }
-  return parts.length === 0 ? "passthrough" : parts.join(" ");
 }
 
 function sameRoute(rule: FaultRule, target: RuleTarget): boolean {

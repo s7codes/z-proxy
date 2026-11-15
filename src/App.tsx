@@ -16,6 +16,7 @@ import {
   ShieldCheck,
   Square,
   Trash2,
+  Waypoints,
 } from "lucide-react";
 import { ChaosControls, DEFAULT_FAULT_PROFILE, type ChaosTab } from "./components/chaos/ChaosControls";
 import { TargetInspector } from "./components/inspector/TargetInspector";
@@ -33,8 +34,11 @@ import { useLab } from "./hooks/useLab";
 import { sameProfile, useProxy } from "./hooks/useProxy";
 import { useRouteScan } from "./hooks/useRouteScan";
 import { useTelemetry } from "./hooks/useTelemetry";
+import { originOf, type RequestOrigin } from "./lib/request";
 import { toBurstMethod, type RequestTarget } from "./lib/routes";
+import { DEFAULT_LISTEN_PORT } from "./lib/rules";
 import type { DiscoveredRoute, FaultProfile } from "./lib/types";
+import type { LabRouting } from "./components/inspector/LabPanel";
 
 // Slider drags emit a value per pixel; one IPC round trip per settled position is enough.
 const PROFILE_PUSH_MS = 150;
@@ -131,6 +135,45 @@ export function App() {
     });
   }, [labBaseUrl, loadLabRoutes, adoptRoutes, selectRoute]);
 
+  // Burst and Fuzzer send to the proxy listener while it fronts the validated target, so a
+  // route rule bound in the Faults tab shapes the same traffic the lab reports. The inspector
+  // keeps the lab as the validated target, which keeps the proxy upstream and the topology
+  // pointing at the service rather than at the listener.
+  const [viaProxy, setViaProxy] = useState(false);
+  const { routeTo: routeProxyTo } = proxy;
+  const routeViaProxy = useCallback(() => {
+    if (labBaseUrl === null) return;
+    void routeProxyTo(labBaseUrl, DEFAULT_LISTEN_PORT).then((status) => {
+      if (status === null) return;
+      setViaProxy(true);
+      if (targetInput === labBaseUrl) {
+        chaosRef.current?.expand();
+      } else {
+        loadLabTarget();
+      }
+    });
+  }, [labBaseUrl, routeProxyTo, targetInput, loadLabTarget]);
+  const routeDirect = useCallback(() => setViaProxy(false), []);
+
+  const proxyListener = proxyStatus?.running === true ? proxyStatus.listener : null;
+  const validated = guard.phase === "accepted" ? guard.target.normalized.replace(/\/+$/, "") : null;
+  const fronted = proxyListener !== null && validated !== null && proxyStatus?.upstream === validated;
+  const requestOrigin = useMemo<RequestOrigin | null>(() => {
+    if (viaProxy && fronted && proxyListener !== null) {
+      return { url: `http://${proxyListener}`, via: validated };
+    }
+    const direct = validated === null ? null : originOf(validated);
+    return direct === null ? null : { url: direct, via: null };
+  }, [viaProxy, fronted, proxyListener, validated]);
+  const labRoutingActive = requestOrigin?.via != null && labBaseUrl !== null && requestOrigin.via === labBaseUrl;
+  const labRouting: LabRouting = {
+    active: labRoutingActive,
+    listener: proxyListener,
+    armed: proxyStatus?.armed ?? false,
+    rules: proxyStatus?.rules.length ?? 0,
+    busy: proxy.busy,
+  };
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
@@ -153,6 +196,21 @@ export function App() {
         : labStatus.running
           ? [
               { id: "load-lab", group: "Target Lab", label: "Load lab target", icon: Crosshair, run: loadLabTarget },
+              labRoutingActive
+                ? {
+                    id: "route-direct",
+                    group: "Target Lab",
+                    label: "Send burst and fuzzer traffic directly to the lab",
+                    icon: Waypoints,
+                    run: routeDirect,
+                  }
+                : {
+                    id: "route-proxy",
+                    group: "Target Lab",
+                    label: "Route lab traffic via proxy",
+                    icon: Waypoints,
+                    run: routeViaProxy,
+                  },
               {
                 id: "lab-mode",
                 group: "Target Lab",
@@ -259,6 +317,9 @@ export function App() {
     setLabMode,
     resetLab,
     loadLabTarget,
+    labRoutingActive,
+    routeDirect,
+    routeViaProxy,
   ]);
 
   // The endpoint node reflects the last fuzz report only while it still describes the
@@ -309,6 +370,9 @@ export function App() {
             onSelectRoute={selectRoute}
             lab={lab}
             onLoadLab={loadLabTarget}
+            labRouting={labRouting}
+            onRouteViaProxy={routeViaProxy}
+            onRouteDirect={routeDirect}
           />
         }
         topology={
@@ -322,6 +386,7 @@ export function App() {
             onChange={setFaultProfile}
             link={link}
             guard={guard}
+            requestOrigin={requestOrigin}
             proxy={proxy}
             burst={burst}
             fuzzer={fuzzer}

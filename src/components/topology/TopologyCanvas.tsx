@@ -15,6 +15,7 @@ import type { EngineLink } from "../../hooks/useEngineStatus";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import { formatLatency } from "../../lib/format";
 import { fileLabel, SOURCE_LABEL } from "../../lib/routes";
+import { matchingRule, summarizeProfile, type RuleMatch } from "../../lib/rules";
 import type { DiscoveredRoute, FuzzReport, ProxyStatus } from "../../lib/types";
 import { guardTone, TONE_HEX, type Tone } from "../../lib/tone";
 import { PanelHeader } from "../shell/PanelHeader";
@@ -133,6 +134,7 @@ function buildNodeData(
   const online = link.state === "online";
   const engineTone: Tone = online ? "ok" : link.state === "connecting" ? "muted" : "fault";
   const tone = guardTone(guard);
+  const rule = endpointRule(proxy, route);
 
   return {
     client: {
@@ -184,13 +186,20 @@ function buildNodeData(
         : {
             ...placeholderData("endpoint"),
             title: route.path,
-            tone: endpointTone(guard, fuzz),
+            tone: endpointTone(guard, fuzz, rule),
             state: route.method,
             lines: [
               ["source", SOURCE_LABEL[route.source]],
               ["file", fileLabel(route.file, route.line)],
               ["params", route.params.length === 0 ? "-" : route.params.join(", ")],
               ["fuzz", fuzz === null ? "-" : `${fuzz.faults} fault / ${fuzz.cases.length}`],
+              rule === null
+                ? ["rule", "-"]
+                : [
+                    "rule",
+                    `#${rule.index + 1} ${summarizeProfile(rule.rule.profile)}${rule.active ? "" : " (inactive)"}`,
+                    rule.active ? "warn" : "muted",
+                  ],
             ],
           },
   };
@@ -208,9 +217,23 @@ function buildEdges(link: EngineLink, guard: GuardState, proxy: ProxyStatus | nu
     edge("guard", "upstream", tone, upstreamEdgeLabel(guard), guard.phase === "rejected"),
   ];
   if (route !== null) {
-    edges.push(edge("upstream", "endpoint", guard.phase === "accepted" ? "ok" : "muted", route.method));
+    const rule = endpointRule(proxy, route);
+    const routeTone: Tone = rule?.active === true ? "warn" : guard.phase === "accepted" ? "ok" : "muted";
+    const label = rule?.active === true ? `${route.method}  rule #${rule.index + 1}` : route.method;
+    edges.push(edge("upstream", "endpoint", routeTone, label));
   }
   return edges;
+}
+
+interface EndpointRule extends RuleMatch {
+  /** The proxy is listening and armed, so requests to the route receive the rule's profile. */
+  active: boolean;
+}
+
+function endpointRule(proxy: ProxyStatus | null, route: DiscoveredRoute | null): EndpointRule | null {
+  if (proxy === null || route === null) return null;
+  const match = matchingRule(proxy, route.method, route.path);
+  return match === null ? null : { ...match, active: proxy.running && proxy.armed };
 }
 
 function edge(source: NodeId, target: NodeId, tone: Tone, label: string | undefined, dashed = false): Edge {
@@ -231,9 +254,10 @@ function edge(source: NodeId, target: NodeId, tone: Tone, label: string | undefi
   return label === undefined ? base : { ...base, label };
 }
 
-function endpointTone(guard: GuardState, fuzz: FuzzReport | null): Tone {
+function endpointTone(guard: GuardState, fuzz: FuzzReport | null, rule: EndpointRule | null): Tone {
   if (fuzz !== null && fuzz.faults > 0) return "fault";
   if (fuzz !== null && fuzz.warnings > 0) return "warn";
+  if (rule?.active === true) return "warn";
   return guard.phase === "accepted" ? "ok" : "muted";
 }
 

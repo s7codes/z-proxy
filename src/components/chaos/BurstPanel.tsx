@@ -1,9 +1,8 @@
 import { useMemo, useState } from "react";
 import { Zap } from "lucide-react";
 import type { BurstControl } from "../../hooks/useBurst";
-import type { GuardState } from "../../hooks/useGuardValidator";
 import { formatBytes, formatLatency, formatPercent } from "../../lib/format";
-import { joinTarget, originOf, parseHeaders } from "../../lib/request";
+import { joinTarget, parseHeaders, type RequestOrigin } from "../../lib/request";
 import { pathParams, type RequestTarget } from "../../lib/routes";
 import { httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
 import type { Anomaly, AnomalyKind, BurstReport, LatencyStats } from "../../lib/types";
@@ -23,7 +22,8 @@ const ANOMALY_LABEL: Record<AnomalyKind, string> = {
 };
 
 interface BurstPanelProps {
-  guard: GuardState;
+  /** Validated target, or the proxy listener in front of it. */
+  requestOrigin: RequestOrigin | null;
   burst: BurstControl;
   online: boolean;
   target: RequestTarget;
@@ -36,7 +36,7 @@ interface BurstPanelProps {
 }
 
 export function BurstPanel({
-  guard,
+  requestOrigin,
   burst,
   online,
   target: request,
@@ -53,10 +53,9 @@ export function BurstPanel({
   const [maxSuccesses, setMaxSuccesses] = useState(0);
   const [headerText, setHeaderText] = useState("");
 
-  const origin = guard.phase === "accepted" ? originOf(guard.target.normalized) : null;
   const parsed = useMemo(() => parseHeaders(headerText), [headerText]);
   const params = pathParams(path);
-  const target = origin === null ? null : joinTarget(origin, path);
+  const target = requestOrigin === null ? null : joinTarget(requestOrigin.url, path);
   const canFire = online && target !== null && parsed.error === null && !burst.running;
 
   const fire = () => {
@@ -74,7 +73,7 @@ export function BurstPanel({
 
   return (
     <>
-      <OriginRow origin={origin} />
+      <OriginRow origin={requestOrigin} />
       {burst.error !== null && <ErrorLine error={burst.error} />}
 
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -139,7 +138,6 @@ export function BurstPanel({
     </>
   );
 }
-
 
 function ReportView({ report }: { report: BurstReport }) {
   const total = report.samples.length;

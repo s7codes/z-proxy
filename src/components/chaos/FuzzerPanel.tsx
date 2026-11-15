@@ -1,12 +1,11 @@
 import { useMemo, useState } from "react";
 import { FileInput, FlaskConical, Square, X, Zap } from "lucide-react";
 import type { FuzzerControl } from "../../hooks/useFuzzer";
-import type { GuardState } from "../../hooks/useGuardValidator";
 import type { FuzzerProgress } from "../../hooks/useTelemetry";
 import { DISCLOSURE_LABEL } from "../../lib/disclosure";
 import { formatBytes, formatLatency } from "../../lib/format";
 import { materializeFuzzCase } from "../../lib/ipc";
-import { joinTarget, originOf, parseHeaders } from "../../lib/request";
+import { joinTarget, parseHeaders, type RequestOrigin } from "../../lib/request";
 import { pathParams, type RequestTarget } from "../../lib/routes";
 import { httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
 import type { FuzzCaseResult, FuzzReport, FuzzVerdict, MutationClass } from "../../lib/types";
@@ -66,7 +65,8 @@ const VERDICT_LABEL: Record<FuzzVerdict, string> = {
 };
 
 interface FuzzerPanelProps {
-  guard: GuardState;
+  /** Validated target, or the proxy listener in front of it. */
+  requestOrigin: RequestOrigin | null;
   fuzzer: FuzzerControl;
   progress: FuzzerProgress | null;
   online: boolean;
@@ -80,7 +80,7 @@ interface FuzzerPanelProps {
 }
 
 export function FuzzerPanel({
-  guard,
+  requestOrigin,
   fuzzer,
   progress,
   online,
@@ -96,11 +96,10 @@ export function FuzzerPanel({
   const [selected, setSelected] = useState<ReadonlySet<MutationClass>>(() => new Set(CLASSES.map((c) => c.id)));
   const [timeoutMs, setTimeoutMs] = useState(5_000);
 
-  const origin = guard.phase === "accepted" ? originOf(guard.target.normalized) : null;
   const parsed = useMemo(() => parseHeaders(headerText), [headerText]);
   const payloadError = useMemo(() => validatePayload(payload), [payload]);
   const params = pathParams(path);
-  const target = origin === null ? null : joinTarget(origin, path);
+  const target = requestOrigin === null ? null : joinTarget(requestOrigin.url, path);
   const canRun =
     online &&
     target !== null &&
@@ -133,7 +132,7 @@ export function FuzzerPanel({
 
   return (
     <>
-      <OriginRow origin={origin} />
+      <OriginRow origin={requestOrigin} />
       {fuzzer.error !== null && <ErrorLine error={fuzzer.error} />}
 
       <div className="min-h-0 flex-1 overflow-y-auto">

@@ -1,17 +1,25 @@
 import type { ReactNode } from "react";
+import type { RequestOrigin } from "../../lib/request";
 import { DEFAULT_PATH_VALUE } from "../../lib/routes";
 import { TONE_TEXT, type Tone } from "../../lib/tone";
 import type { BurstMethod } from "../../lib/types";
 
 const METHODS: readonly BurstMethod[] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
 
-export function OriginRow({ origin }: { origin: string | null }) {
+export function OriginRow({ origin }: { origin: RequestOrigin | null }) {
+  const title = origin === null ? undefined : origin.via === null ? origin.url : `${origin.url} -> ${origin.via}`;
   return (
     <div className="flex h-6 shrink-0 items-center gap-2 border-b border-line px-2.5 text-2xs">
       <span className="label-caps text-fg-faint">Origin</span>
-      <span className="num truncate text-fg" title={origin ?? undefined}>
-        {origin ?? "no validated target"}
+      <span className="num min-w-0 truncate text-fg" title={title}>
+        {origin?.url ?? "no validated target"}
       </span>
+      {origin?.via != null && (
+        <span className="num ml-auto flex min-w-0 shrink items-center gap-1 text-warn">
+          <span className="shrink-0">via proxy</span>
+          <span className="truncate text-fg-faint">{`-> ${origin.via}`}</span>
+        </span>
+      )}
     </div>
   );
 }

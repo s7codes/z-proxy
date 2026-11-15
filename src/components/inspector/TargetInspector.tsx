@@ -7,7 +7,7 @@ import { TONE_TEXT } from "../../lib/tone";
 import type { DiscoveredRoute } from "../../lib/types";
 import { PanelHeader, Section } from "../shell/PanelHeader";
 import { GuardValidator } from "./GuardValidator";
-import { LAB_MODE_TONE, LabPanel } from "./LabPanel";
+import { LAB_MODE_TONE, LabPanel, type LabRouting } from "./LabPanel";
 import { RouteList } from "./RouteList";
 
 const FALLBACK_ALLOWLIST = ["127.0.0.1", "::1", "localhost"] as const;
@@ -23,6 +23,9 @@ interface TargetInspectorProps {
   onSelectRoute: (route: DiscoveredRoute) => void;
   lab: LabControl;
   onLoadLab: () => void;
+  labRouting: LabRouting;
+  onRouteViaProxy: () => void;
+  onRouteDirect: () => void;
 }
 
 export function TargetInspector({
@@ -36,6 +39,9 @@ export function TargetInspector({
   onSelectRoute,
   lab,
   onLoadLab,
+  labRouting,
+  onRouteViaProxy,
+  onRouteDirect,
 }: TargetInspectorProps) {
   const labMode = lab.status?.mode ?? null;
   const online = link.state === "online";
@@ -71,7 +77,14 @@ export function TargetInspector({
             )
           }
         >
-          <LabPanel lab={lab} online={online} onLoadTarget={onLoadLab} />
+          <LabPanel
+            lab={lab}
+            online={online}
+            onLoadTarget={onLoadLab}
+            routing={labRouting}
+            onRouteViaProxy={onRouteViaProxy}
+            onRouteDirect={onRouteDirect}
+          />
         </Section>
       </div>
 

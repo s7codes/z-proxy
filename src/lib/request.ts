@@ -1,5 +1,12 @@
 import type { HeaderPair } from "./types";
 
+/** Where Burst and Fuzzer requests go: the validated target, or the proxy in front of it. */
+export interface RequestOrigin {
+  url: string;
+  /** Upstream the proxy forwards to, while requests are routed through the listener. */
+  via: string | null;
+}
+
 export function originOf(normalized: string): string | null {
   try {
     return new URL(normalized).origin;

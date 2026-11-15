@@ -9,7 +9,8 @@ export type TopoNodeData = {
   icon: LucideIcon;
   tone: Tone;
   state: string;
-  lines: ReadonlyArray<readonly [string, string]>;
+  /** Key, value, and an optional semantic tone for the value. */
+  lines: ReadonlyArray<readonly [string, string, Tone?]>;
   inbound: boolean;
   outbound: boolean;
 };
@@ -33,10 +34,12 @@ export function TopoNodeView({ data, selected }: NodeProps<TopoNode>) {
       <div className="px-2 py-1.5">
         <div className="label-caps mb-1 text-fg-faint">{data.role}</div>
         <dl className="grid grid-cols-[auto_1fr] gap-x-2">
-          {data.lines.map(([k, v]) => (
+          {data.lines.map(([k, v, tone]) => (
             <div key={k} className="contents">
               <dt className="text-fg-faint">{k}</dt>
-              <dd className="num truncate text-right text-fg">{v}</dd>
+              <dd className={`num truncate text-right ${tone === undefined ? "text-fg" : TONE_TEXT[tone]}`} title={v}>
+                {v}
+              </dd>
             </div>
           ))}
         </dl>

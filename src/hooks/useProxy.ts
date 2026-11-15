@@ -17,6 +17,12 @@ export interface ProxyControl {
   busy: boolean;
   error: EngineError | TransportError | null;
   start: (upstream: string, listenPort: number) => void;
+  /**
+   * Ensures the listener forwards to `upstream`: reuses a running listener that already
+   * does, restarts one pointed elsewhere on `listenPort`, or starts one. Fault profile and
+   * route rules survive the restart. Resolves to the resulting status, `null` on failure.
+   */
+  routeTo: (upstream: string, listenPort: number) => Promise<ProxyStatus | null>;
   stop: () => void;
   applyFaults: (armed: boolean, profile: FaultProfile) => void;
   applyRules: (rules: FaultRule[]) => void;
@@ -65,6 +71,33 @@ export function useProxy(latest: TelemetryEventOf<"proxyStateChanged"> | null): 
     void stopProxy().then(settle);
   }, [settle]);
 
+  const routeTo = useCallback(
+    async (upstream: string, listenPort: number): Promise<ProxyStatus | null> => {
+      setBusy(true);
+      const fail = (result: IpcResult<ProxyStatus>): null => {
+        settle(result);
+        return null;
+      };
+      // Read the engine's state rather than the rendered one: a start from another surface
+      // may not have reached this hook yet.
+      const current = await getProxyStatus();
+      if (!current.ok) return fail(current);
+      const wanted = upstream.replace(/\/+$/, "");
+      if (current.value.running && current.value.upstream === wanted) {
+        settle(current);
+        return current.value;
+      }
+      if (current.value.running) {
+        const stopped = await stopProxy();
+        if (!stopped.ok) return fail(stopped);
+      }
+      const started = await startProxy({ upstream, listenPort });
+      settle(started);
+      return started.ok ? started.value : null;
+    },
+    [settle],
+  );
+
   const adopt = useCallback((result: IpcResult<ProxyStatus>) => {
     if (result.ok) {
       setStatus(result.value);
@@ -90,7 +123,7 @@ export function useProxy(latest: TelemetryEventOf<"proxyStateChanged"> | null): 
     [adopt],
   );
 
-  return { status, busy, error, start, stop, applyFaults, applyRules };
+  return { status, busy, error, start, routeTo, stop, applyFaults, applyRules };
 }
 
 export function sameProfile(a: FaultProfile, b: FaultProfile): boolean {

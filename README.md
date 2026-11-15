@@ -349,6 +349,23 @@ body synthesis as a scanned project), preselects the redeem route with its sampl
 opens the Burst tab. Every request the lab serves is reported as a `labExchange` event with
 the handler outcome and live counters.
 
+"Route via Proxy" (inspector and command palette) chains the proxy in front of the lab in one
+step: it reuses a listener that already forwards to the lab, restarts one that forwards
+elsewhere, or starts one on port 8787, then sends Burst and Fuzzer traffic to the listener.
+The fault profile and route rules survive the restart. The inspector keeps the lab as the
+validated target, so the proxy upstream and the topology still point at the service; the
+Burst and Fuzzer origin rows show `via proxy -> <upstream>`. Requests fall back to the lab
+directly whenever the listener stops or stops fronting the validated target, and the same
+control switches back explicitly. With the redeem route bound to a rule (for example `503`
+at 30 %), a burst through the listener shows how the rule interleaves with the lab's
+conflicts, and both `proxyExchange` and `labExchange` events describe each request.
+
+The topology's endpoint node lists the first proxy rule that applies to the selected route,
+using the engine's matching rules (template segments, `{*rest}`, collapsed empty segments,
+upstream base path prefixed; a route template's own `{param}` segments stand for any one
+segment). The rule and the edge into the endpoint are drawn in the degraded tone while the
+listener runs armed, and the rule is marked inactive otherwise.
+
 ## IPC
 
 | Command                  | Arguments                                   | Returns            |
