@@ -243,7 +243,7 @@ keywords, and accept JSON-escaped (`\n`) traces:
 | `goPanic`          | `goroutine N [state]:`, `panic: runtime error:`                            |
 | `jvmStackTrace`    | `at pkg.Class.method(File.java:N)` (also `.kt`, `.scala`)                  |
 | `dotNetStackTrace` | `at Ns.Type.Method(..) in path:line N`                                     |
-| `sqlError`         | MySQL syntax error, PostgreSQL `syntax error at or near` / `invalid input syntax` / missing relation, `SQLSTATE[..]`, `ORA-NNNNN`, SQLite, psycopg2, MSSQL unclosed quotation |
+| `sqlError`         | MySQL syntax error, PostgreSQL `syntax error at or near` / `invalid input syntax` / `out of range for type` / missing relation, `SQLSTATE[..]`, `ORA-NNNNN`, SQLite, psycopg2, MSSQL unclosed quotation |
 
 Runtime traces take precedence over database errors found in the same body. The report counts
 affected mutation cases in `disclosures`; a disclosing baseline is reported as a note.
