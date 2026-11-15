@@ -1412,6 +1412,7 @@ mod tests {
     use crate::engine::fuzzer::{self, FuzzerSlot};
     use crate::engine::types::{
         AnomalyKind, BurstMethod, BurstSpec, DisclosureKind, FuzzSpec, FuzzVerdict, HeaderPair,
+        MutationClass,
     };
 
     const CHECKOUT_SAMPLE: &str = r#"{"sku":"LAB-KB-01","quantity":2,"customer":{"email":"operator@lab.local","name":"Lab Operator"},"note":"leave at loading dock","giftWrap":false}"#;
@@ -1933,6 +1934,111 @@ mod tests {
             .cases
             .iter()
             .all(|c| matches!(c.status, Some(201) | Some(422))));
+        lab.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fuzzing_schema_contract_on_checkout() {
+        let (hub, lab, base) = started(LabMode::Unprotected).await;
+        let slot = FuzzerSlot::default();
+        let spec = || FuzzSpec {
+            classes: vec![MutationClass::SchemaContractBounds],
+            ..checkout_fuzz(&base)
+        };
+
+        // Unprotected either accepts the contract violation or crashes on it.
+        let report = fuzzer::run(spec(), &hub, &slot).await.unwrap();
+        assert_eq!(report.baseline.status, Some(201));
+        let outcome = |label: &str| {
+            let case = report.cases.iter().find(|c| c.label == label).unwrap();
+            (case.status, case.severity)
+        };
+        let warn = Some(crate::engine::types::Severity::Warn);
+        let fault = Some(crate::engine::types::Severity::Fault);
+        assert_eq!(outcome("duplicate /note = \"\""), (Some(201), warn));
+        assert_eq!(outcome("duplicate /quantity = -1"), (Some(500), fault));
+        assert_eq!(
+            outcome("+/zproxyNest = 64 nested objects"),
+            (Some(201), warn)
+        );
+        assert_eq!(
+            outcome("+/zproxyNest = 1024 nested objects"),
+            (Some(500), fault)
+        );
+        assert_eq!(outcome("+/isAdmin = true"), (Some(201), warn));
+        assert_eq!(
+            outcome("+/customer/zproxyExtra = \"unexpected\""),
+            (Some(201), warn)
+        );
+        assert_eq!(outcome("/quantity = 1e309"), (Some(500), fault));
+        assert!(report
+            .cases
+            .iter()
+            .all(|c| matches!(c.status, Some(201) | Some(500))));
+
+        lab.set_mode(LabMode::Hardened).await;
+        let report = fuzzer::run(spec(), &hub, &slot).await.unwrap();
+        assert_eq!(
+            (report.faults, report.warnings, report.disclosures),
+            (0, 0, 0)
+        );
+        assert!(report.cases.iter().all(|c| c.status == Some(422)));
+        lab.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fuzzing_order_lookup_path_parameters() {
+        let (hub, lab, base) = started(LabMode::Unprotected).await;
+        let slot = FuzzerSlot::default();
+        let spec = || FuzzSpec {
+            target: format!("{base}/api/v1/orders/{{orderId}}"),
+            method: BurstMethod::Get,
+            headers: Vec::new(),
+            base_body: None,
+            classes: vec![MutationClass::PathParamValidation],
+            timeout_ms: 5_000,
+        };
+
+        let report = fuzzer::run(spec(), &hub, &slot).await.unwrap();
+        assert_eq!(report.target, format!("{base}/api/v1/orders/1"));
+        assert_eq!(report.baseline.status, Some(200));
+        assert_eq!(
+            report.path_template.as_deref(),
+            Some("/api/v1/orders/{orderId}")
+        );
+        assert_eq!(report.cases.len(), 7);
+        assert_eq!((report.faults, report.disclosures), (7, 7));
+        let kinds: Vec<(String, DisclosureKind)> = report
+            .cases
+            .iter()
+            .map(|c| (c.label.clone(), c.disclosure.as_ref().unwrap().kind))
+            .collect();
+        let node = DisclosureKind::NodeStackTrace;
+        let sql = DisclosureKind::SqlError;
+        assert_eq!(
+            kinds,
+            [
+                ("{orderId} = 0".to_owned(), node),
+                ("{orderId} = -1".to_owned(), node),
+                ("{orderId} = i64::MAX".to_owned(), sql),
+                ("{orderId} = i64::MAX+1".to_owned(), sql),
+                ("{orderId} = \"invalid-uuid\"".to_owned(), sql),
+                ("{orderId} = empty segment".to_owned(), node),
+                (
+                    "{orderId} = 4 KiB of digits".to_owned(),
+                    DisclosureKind::PythonTraceback
+                ),
+            ]
+        );
+
+        lab.set_mode(LabMode::Hardened).await;
+        let report = fuzzer::run(spec(), &hub, &slot).await.unwrap();
+        assert_eq!(report.baseline.status, Some(200));
+        assert_eq!(
+            (report.faults, report.warnings, report.disclosures),
+            (0, 0, 0)
+        );
+        assert!(report.cases.iter().all(|c| c.status == Some(422)));
         lab.stop().await;
     }
 

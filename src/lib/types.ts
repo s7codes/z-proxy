@@ -78,6 +78,7 @@ export interface HeaderPair {
 }
 
 export interface BurstSpec {
+  /** May hold `{param}` placeholders in the path; each is sent as `1`. */
   target: string;
   method: BurstMethod;
   workers: number;
@@ -156,7 +157,7 @@ export interface BurstReport {
 
 // ---- fuzzer ---------------------------------------------------------------------------
 
-/** Declaration order is execution order. */
+/** Declaration order is execution order; new classes are appended so case indices hold. */
 export type MutationClass =
   | "nullInjection"
   | "emptyStrings"
@@ -164,9 +165,12 @@ export type MutationClass =
   | "typeConfusion"
   | "oversizedField"
   | "malformedJson"
-  | "missingFields";
+  | "missingFields"
+  | "schemaContractBounds"
+  | "pathParamValidation";
 
 export interface FuzzSpec {
+  /** May hold `{param}` placeholders in the path; path vectors vary each slot. */
   target: string;
   method: BurstMethod;
   headers: HeaderPair[];
@@ -238,16 +242,19 @@ export interface FuzzReport {
   disclosures: number;
   aborted: string | null;
   notes: string[];
-  /** Base payload exactly as sent in the baseline; with `classes` it reproduces any case. */
+  /** Base payload exactly as sent in the baseline; with `classes` and `pathTemplate` it reproduces any case. */
   baseBody: string;
   /** Classes in execution order. */
   classes: MutationClass[];
+  /** Origin-form target path with its `{param}` slots; `null` when it had none. */
+  pathTemplate: string | null;
 }
 
 /** Addresses one case of a finished suite for replay. */
 export interface FuzzCaseRef {
   baseBody: string;
   classes: MutationClass[];
+  pathTemplate: string | null;
   /** `0` is the baseline. */
   index: number;
 }
@@ -255,6 +262,8 @@ export interface FuzzCaseRef {
 export interface FuzzCasePayload {
   index: number;
   label: string;
+  /** Origin-form request target of a path case; `null` when the case used the suite target. */
+  path: string | null;
   body: string;
   /** Size of the body as sent by the fuzzer. */
   bytes: number;

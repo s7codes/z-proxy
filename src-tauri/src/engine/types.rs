@@ -106,6 +106,7 @@ pub struct HeaderPair {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BurstSpec {
+    /// May hold `{param}` placeholders in the path; each is sent as `1`.
     pub target: String,
     pub method: BurstMethod,
     pub workers: u16,
@@ -212,7 +213,8 @@ pub struct BurstReport {
 
 // ---- fuzzer ---------------------------------------------------------------------------
 
-/// Declaration order is execution order.
+/// Declaration order is execution order. Case indices are replay keys, so new classes are
+/// appended and never shift the indices of earlier ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MutationClass {
@@ -223,11 +225,18 @@ pub enum MutationClass {
     OversizedField,
     MalformedJson,
     MissingFields,
+    /// Valid-syntax bodies that break a strict schema: duplicate keys, deep nesting,
+    /// undeclared fields, numbers outside `f64` range.
+    SchemaContractBounds,
+    /// Boundary identifiers in each `{param}` slot of the target path; the body stays the base.
+    PathParamValidation,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FuzzSpec {
+    /// May hold `{param}` placeholders in the path: the baseline and body cases send
+    /// `1`, path cases vary one slot at a time.
     pub target: String,
     pub method: BurstMethod,
     pub headers: Vec<HeaderPair>,
@@ -332,10 +341,14 @@ pub struct FuzzReport {
     pub aborted: Option<String>,
     /// Context that changes how results read, such as a baseline that was not accepted.
     pub notes: Vec<String>,
-    /// Base payload exactly as sent in the baseline; with `classes` it reproduces any case.
+    /// Base payload exactly as sent in the baseline; with `classes` and `path_template` it
+    /// reproduces any case.
     pub base_body: String,
     /// Classes in execution order.
     pub classes: Vec<MutationClass>,
+    /// Origin-form path of the target with its `{param}` slots (`/orders/{id}`); `None` when
+    /// the target had none.
+    pub path_template: Option<String>,
 }
 
 /// Addresses one case of a finished suite for replay.
@@ -344,6 +357,7 @@ pub struct FuzzReport {
 pub struct FuzzCaseRef {
     pub base_body: String,
     pub classes: Vec<MutationClass>,
+    pub path_template: Option<String>,
     /// `0` is the baseline.
     pub index: u32,
 }
@@ -353,6 +367,8 @@ pub struct FuzzCaseRef {
 pub struct FuzzCasePayload {
     pub index: u32,
     pub label: String,
+    /// Origin-form request target of a path case; `None` when the case used the suite target.
+    pub path: Option<String>,
     pub body: String,
     /// Size of the body as sent by the fuzzer.
     pub bytes: u64,

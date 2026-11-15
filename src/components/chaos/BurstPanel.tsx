@@ -4,7 +4,7 @@ import type { BurstControl } from "../../hooks/useBurst";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import { formatBytes, formatLatency, formatPercent } from "../../lib/format";
 import { joinTarget, originOf, parseHeaders } from "../../lib/request";
-import { unresolvedParams, type RequestTarget } from "../../lib/routes";
+import { pathParams, type RequestTarget } from "../../lib/routes";
 import { httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
 import type { Anomaly, AnomalyKind, BurstReport, LatencyStats } from "../../lib/types";
 import { Section, StatusSquare } from "../shell/PanelHeader";
@@ -55,9 +55,9 @@ export function BurstPanel({
 
   const origin = guard.phase === "accepted" ? originOf(guard.target.normalized) : null;
   const parsed = useMemo(() => parseHeaders(headerText), [headerText]);
-  const unresolved = unresolvedParams(path);
+  const params = pathParams(path);
   const target = origin === null ? null : joinTarget(origin, path);
-  const canFire = online && target !== null && parsed.error === null && unresolved.length === 0 && !burst.running;
+  const canFire = online && target !== null && parsed.error === null && !burst.running;
 
   const fire = () => {
     if (target === null || parsed.error !== null) return;
@@ -80,7 +80,7 @@ export function BurstPanel({
       <div className="min-h-0 flex-1 overflow-y-auto">
         <Section title="Request">
           <MethodPicker value={method} onChange={(m) => onTarget({ method: m, path })} />
-          <PathField value={path} onChange={(p) => onTarget({ method, path: p })} unresolved={unresolved} />
+          <PathField value={path} onChange={(p) => onTarget({ method, path: p })} params={params} />
           <Field label="Headers" error={parsed.error}>
             <textarea
               value={headerText}

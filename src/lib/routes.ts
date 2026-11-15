@@ -40,9 +40,15 @@ export function toBurstMethod(method: RouteMethod): BurstMethod | null {
   return isBurstMethod(method) ? method : null;
 }
 
-/** `{name}` and `{*name}` placeholders still present in a request path. */
-export function unresolvedParams(path: string): string[] {
-  return Array.from(path.matchAll(/\{\*?([^{}]+)\}/g), (match) => match[1] ?? "");
+/** Value the engine sends for every `{param}` placeholder (engine/pathparam.rs). */
+export const DEFAULT_PATH_VALUE = "1";
+
+/**
+ * `{name}` and `{*name}` placeholders in a request path, with the name syntax the engine
+ * recognizes; catch-alls keep their `*`.
+ */
+export function pathParams(path: string): string[] {
+  return Array.from(path.matchAll(/\{(\*?[A-Za-z0-9_.-]+)\}/g), (match) => match[1] ?? "");
 }
 
 export function fileLabel(file: string, line: number): string {

@@ -7,7 +7,7 @@ import { DISCLOSURE_LABEL } from "../../lib/disclosure";
 import { formatBytes, formatLatency } from "../../lib/format";
 import { materializeFuzzCase } from "../../lib/ipc";
 import { joinTarget, originOf, parseHeaders } from "../../lib/request";
-import { unresolvedParams, type RequestTarget } from "../../lib/routes";
+import { pathParams, type RequestTarget } from "../../lib/routes";
 import { httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
 import type { FuzzCaseResult, FuzzReport, FuzzVerdict, MutationClass } from "../../lib/types";
 import { Section, StatusSquare } from "../shell/PanelHeader";
@@ -23,7 +23,19 @@ const CLASSES: ReadonlyArray<{ id: MutationClass; label: string; short: string }
   { id: "oversizedField", label: "Oversized 64 KiB", short: "oversize" },
   { id: "malformedJson", label: "Malformed JSON", short: "malformed" },
   { id: "missingFields", label: "Missing fields", short: "missing" },
+  { id: "schemaContractBounds", label: "Schema contract", short: "contract" },
+  { id: "pathParamValidation", label: "Path parameters", short: "path" },
 ];
+
+/** Classes whose case bodies cannot seed a base payload, which must be a plain JSON object. */
+const UNSEEDABLE: ReadonlySet<MutationClass> = new Set<MutationClass>([
+  // Not an object at all.
+  "malformedJson",
+  // A duplicate key or a 1e309 literal would be lost or refused when the engine re-parses it.
+  "schemaContractBounds",
+  // The body is the unmodified base.
+  "pathParamValidation",
+]);
 
 const SHORT: Record<MutationClass, string> = Object.fromEntries(CLASSES.map((c) => [c.id, c.short])) as Record<
   MutationClass,
@@ -87,7 +99,7 @@ export function FuzzerPanel({
   const origin = guard.phase === "accepted" ? originOf(guard.target.normalized) : null;
   const parsed = useMemo(() => parseHeaders(headerText), [headerText]);
   const payloadError = useMemo(() => validatePayload(payload), [payload]);
-  const unresolved = unresolvedParams(path);
+  const params = pathParams(path);
   const target = origin === null ? null : joinTarget(origin, path);
   const canRun =
     online &&
@@ -95,7 +107,6 @@ export function FuzzerPanel({
     parsed.error === null &&
     payloadError === null &&
     selected.size > 0 &&
-    unresolved.length === 0 &&
     !fuzzer.running;
 
   const toggle = (id: MutationClass) =>
@@ -128,7 +139,7 @@ export function FuzzerPanel({
       <div className="min-h-0 flex-1 overflow-y-auto">
         <Section title="Request">
           <MethodPicker value={method} onChange={(m) => onTarget({ method: m, path })} />
-          <PathField value={path} onChange={(p) => onTarget({ method, path: p })} unresolved={unresolved} />
+          <PathField value={path} onChange={(p) => onTarget({ method, path: p })} params={params} varied />
           <Field label="Headers" error={parsed.error}>
             <textarea
               value={headerText}
@@ -188,11 +199,12 @@ export function FuzzerPanel({
           <div className="grid grid-cols-2 gap-px border border-line bg-line">
             {CLASSES.map((c) => {
               const on = selected.has(c.id);
+              const slotless = c.id === "pathParamValidation" && params.length === 0;
               return (
                 <button
                   key={c.id}
                   type="button"
-                  title={c.label}
+                  title={slotless ? `${c.label}: the path has no {param} slot, so this vector adds no cases` : c.label}
                   aria-pressed={on}
                   onClick={() => toggle(c.id)}
                   className={`flex h-6 items-center gap-1.5 px-1.5 text-left text-xs ${
@@ -201,9 +213,15 @@ export function FuzzerPanel({
                 >
                   <span className={`size-1.5 shrink-0 border ${on ? "border-fg-dim bg-fg-dim" : "border-line-strong"}`} />
                   <span className="truncate">{c.label}</span>
+                  {c.id === "pathParamValidation" && (
+                    <span className="num ml-auto shrink-0 text-2xs text-fg-faint">
+                      {slotless ? "no slots" : `${params.length}x7`}
+                    </span>
+                  )}
                 </button>
               );
             })}
+            {CLASSES.length % 2 === 1 && <span className="bg-bg" aria-hidden />}
           </div>
         </Section>
 
@@ -309,11 +327,17 @@ function FuzzReportView({
   const [notice, setNotice] = useState<ReplayNotice | null>(null);
   const executed = report.cases.filter((c) => c.verdict !== "skipped").length;
 
-  // Bodies are rebuilt by the engine from the report's base body and classes rather than
-  // kept per case: generation is deterministic, and oversize cases are 64 KiB each.
+  // Bodies (and paths of path cases) are rebuilt by the engine from the report's base body,
+  // classes and path template rather than kept per case: generation is deterministic, and
+  // oversize cases are 64 KiB each.
   const replay = (result: FuzzCaseResult, destination: "burst" | "fuzzer") => {
     setPending(result.index);
-    void materializeFuzzCase({ baseBody: report.baseBody, classes: report.classes, index: result.index }).then(
+    void materializeFuzzCase({
+      baseBody: report.baseBody,
+      classes: report.classes,
+      pathTemplate: report.pathTemplate,
+      index: result.index,
+    }).then(
       (outcome) => {
         setPending(null);
         if (!outcome.ok) {
@@ -330,7 +354,9 @@ function FuzzReportView({
           setNotice({ tone: "muted", text: `#${payload.index} ${payload.label} loaded as base payload` });
           return;
         }
-        const path = reportPath(report);
+        // A path case replays its exact path; a body case keeps the template, so the burst
+        // runner substitutes the same default identifier the suite used.
+        const path = payload.path ?? report.pathTemplate ?? reportPath(report);
         if (path === null) {
           setNotice({ tone: "fault", text: `cannot derive a path from ${report.target}` });
           return;
@@ -460,8 +486,7 @@ function FindingRow({
 }) {
   const tone = caseTone(result);
   const hasDetail = result.responsePreview !== null;
-  // A malformed body cannot become a base payload, which must be a JSON object.
-  const seedable = result.class !== "malformedJson";
+  const seedable = result.class === null || !UNSEEDABLE.has(result.class);
   return (
     <div className={`border-l pl-2 ${tone === "fault" ? "border-fault" : "border-warn"}`}>
       <button

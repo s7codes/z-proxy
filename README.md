@@ -33,7 +33,8 @@ src-tauri/
   src/engine/net.rs        Guarded reqwest clients, raw loopback connect
   src/engine/fault.rs      FaultProfile and the per-request fault decision
   src/engine/proxy.rs      Reverse proxy listener (hyper connections, axum routing)
-  src/engine/http1.rs      Guarded HTTP/1.1 request template, connect and exchange
+  src/engine/http1.rs      Guarded HTTP/1.1 request template, connect and exchange (TTFB stamp)
+  src/engine/pathparam.rs  {param} placeholder resolution and path slot rewriting
   src/engine/concurrency.rs  Burst runner and report analysis
   src/engine/fuzzer.rs     Mutation case generation, sequential runner, verdicts
   src/engine/disclosure.rs Stack trace and database error signatures in response bodies
@@ -189,7 +190,15 @@ string.
 
 Selecting a route loads its method and path into the Burst and Fuzzer panels, loads its
 `sampleBody` (if any) into both payload fields, and adds an endpoint node to the topology.
-Requests stay blocked while the path contains unresolved `{param}` segments.
+
+`{param}` and `{*param}` placeholders left in a Burst or Fuzzer target are resolved by the
+engine (`engine/pathparam.rs`): every slot is sent as `1`, and the fuzzer's
+`pathParamValidation` vector varies one slot at a time. Placeholders are replaced with
+alphanumeric markers before the target goes through the loopback guard, so the slots are read
+back from the normalized path (dot segments resolved, unsafe bytes percent-encoded) and a
+placeholder in the authority is rejected like any other non-loopback host. Placeholders in
+the query take the default and are not varied. A rewritten path changes only the request
+line; the request goes to the connection opened for the validated target.
 
 The folder picker (`pick_project_root`) is opened from Rust through `tauri-plugin-dialog`; the
 webview capability set remains `core:default`.
@@ -210,16 +219,24 @@ addressed by RFC 6901 pointer, nested objects to depth 3, at most 48 fields.
 | `oversizedField`  | Each string field set to 64 KiB; one extra 64 KiB field                      |
 | `malformedJson`   | Truncated at 50 %, missing closing brace, trailing comma, single quotes, unquoted keys, bare `NaN`, empty body, invalid UTF-8 (`C3 28`) |
 | `missingFields`   | Each field removed; empty object                                             |
+| `schemaContractBounds` | Valid JSON syntax that a strict schema refuses: each top-level key (at most 8) repeated with a conflicting value of the same type; an extra field nested 64 and 1 024 objects deep; undeclared fields (`zproxyExtra`, `isAdmin`, and one inside the first object field); each numeric field set to the literal `1e309` |
+| `pathParamValidation` | Each `{param}` slot of the target path (at most 8) set to `0`, `-1`, `9223372036854775807`, `9223372036854775808`, `invalid-uuid`, the empty segment, and 4 096 digits; other slots stay `1`, the body is the base |
 
-The default template yields 86 cases. An unmutated baseline request runs first. Cases run
-sequentially, one connection each, with `Connection: close` and
-`x-zproxy-fuzz-case: <index>`; `Content-Type: application/json` is added unless the operator
-sets one.
+Classes run in the order above; new classes are appended, so case indices of earlier classes
+never shift. Duplicate keys test parser differentials: a validator that keeps the first
+occurrence and a handler that keeps the last disagree about the same body. The two nesting
+depths sit inside common parser limits (serde_json 128, Python 1 000) and past them, where a
+recursive parser or sanitizer runs out of stack.
+
+The default template yields 100 cases (no path cases without a placeholder). An unmutated
+baseline request runs first. Cases run sequentially, one connection each, with
+`Connection: close` and `x-zproxy-fuzz-case: <index>`; `Content-Type: application/json` is
+added unless the operator sets one.
 
 | Response                                   | Verdict            | Severity               |
 |--------------------------------------------|--------------------|------------------------|
 | 4xx                                        | `rejected`         | none                   |
-| 1xx-3xx                                    | `accepted`         | warn for `malformedJson` |
+| 1xx-3xx                                    | `accepted`         | warn for `malformedJson`, `schemaContractBounds`, `pathParamValidation` |
 | 5xx                                        | `serverError`      | fault                  |
 | Reset, closed before a response, timeout   | `transportFailure` | fault                  |
 | Connect failure                            | `unreachable`      | none                   |
@@ -251,12 +268,15 @@ affected mutation cases in `disclosures`; a disclosing baseline is reported as a
 Each finding offers two escalations. "Send to burst" loads the case's exact body, the suite's
 method and its path into the Burst panel, so a payload that broke one request is fired from N
 pre-connected workers (a crash that only appears under contention, or a race on an error
-path). "Load payload" makes the body the fuzzer's base payload for a second suite around it;
-malformed bodies are not offered, since a base must be a JSON object. The report carries
-`baseBody` (the base as sent) and `classes`; `materialize_fuzz_case` regenerates case
-`index` from them instead of the report holding every payload (oversize cases are 64 KiB
-each). Bodies that were not valid UTF-8 come back with `lossy: true` and U+FFFD in place of the
-invalid bytes; the Burst panel shows the replayed case and that substitution.
+path). A path case is replayed with its exact path; a body case keeps the path template, so
+the burst runner sends the same default identifier. "Load payload" makes the body the
+fuzzer's base payload for a second suite around it; it is not offered for malformed and
+contract cases (a duplicate key or `1e309` does not survive re-parsing into a base object) or
+for path cases (the body is the base). The report carries `baseBody` (the base as sent),
+`classes` and `pathTemplate`; `materialize_fuzz_case` regenerates case `index` from them,
+returning `path` for path cases, instead of the report holding every payload (oversize cases
+are 64 KiB each). Bodies that were not valid UTF-8 come back with `lossy: true` and U+FFFD in
+place of the invalid bytes; the Burst panel shows the replayed case and that substitution.
 
 ## Target lab
 

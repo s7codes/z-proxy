@@ -262,12 +262,14 @@ export function App() {
   ]);
 
   // The endpoint node reflects the last fuzz report only while it still describes the
-  // request path the panels target.
+  // request path the panels target. A templated target is compared by its template, since
+  // the report's concrete target carries the substituted default identifier.
   const endpointFuzz = useMemo(() => {
     const report = fuzzer.report;
     if (report === null) return null;
     try {
-      return new URL(report.target).pathname === requestTarget.path ? report : null;
+      const reported = report.pathTemplate?.split("?")[0] ?? new URL(report.target).pathname;
+      return reported === requestTarget.path.split("?")[0] ? report : null;
     } catch {
       return null;
     }

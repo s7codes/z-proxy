@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { DEFAULT_PATH_VALUE } from "../../lib/routes";
 import { TONE_TEXT, type Tone } from "../../lib/tone";
 import type { BurstMethod } from "../../lib/types";
 
@@ -35,29 +36,32 @@ export function MethodPicker({ value, onChange }: { value: BurstMethod; onChange
   );
 }
 
+/** Path input; `{param}` placeholders are sent as the engine default, which the note states. */
 export function PathField({
   value,
   onChange,
-  unresolved,
+  params,
+  varied = false,
 }: {
   value: string;
   onChange: (path: string) => void;
-  unresolved: readonly string[];
+  params: readonly string[];
+  /** The fuzzer's path vectors rewrite each slot; say so next to the default. */
+  varied?: boolean;
 }) {
+  const slots = params.map((name) => `{${name}}`).join(" ");
+  const note =
+    params.length === 0
+      ? null
+      : `${slots} sent as ${DEFAULT_PATH_VALUE}${varied ? "; path vectors vary each slot" : ""}`;
   return (
-    <Field
-      label="Path"
-      errorTone="warn"
-      error={unresolved.length === 0 ? null : `unresolved ${unresolved.map((name) => `{${name}}`).join(" ")}`}
-    >
+    <Field label="Path" errorTone="muted" error={note}>
       <input
         value={value}
         onChange={(e) => onChange(e.target.value)}
         spellCheck={false}
         aria-label="Request path"
-        className={`num h-5 w-full min-w-0 rounded-xs border bg-bg px-1.5 text-xs text-fg-bright outline-none focus:border-fg-faint ${
-          unresolved.length === 0 ? "border-line" : "border-warn/50"
-        }`}
+        className="num h-5 w-full min-w-0 rounded-xs border border-line bg-bg px-1.5 text-xs text-fg-bright outline-none focus:border-fg-faint"
       />
     </Field>
   );

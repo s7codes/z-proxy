@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::http::header::{self, HeaderName, HeaderValue};
-use axum::http::Request;
+use axum::http::{Request, Uri};
 use http_body_util::Full;
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
@@ -21,6 +21,7 @@ use super::disclosure;
 use super::error::{EngineError, EngineResult};
 use super::http1::{self, OpenError, RequestTemplate, CONNECT_TIMEOUT};
 use super::net;
+use super::pathparam::{self, PathTemplate};
 use super::types::{
     BurstMethod, ClassSummary, FuzzCasePayload, FuzzCaseRef, FuzzCaseResult, FuzzReport, FuzzSpec,
     FuzzVerdict, MutationClass, Severity, TelemetryEvent,
@@ -30,9 +31,23 @@ use crate::telemetry::{now_us, TelemetryHub};
 pub const OVERSIZED_LEN: usize = 64 * 1024;
 const MAX_TIMEOUT_MS: u32 = 60_000;
 const MAX_BASE_BYTES: usize = 256 * 1024;
-/// A field yields at most 16 cases across all per-field classes, so 48 fields keep every
-/// suite below `MAX_CASES` without silently dropping mutations.
+/// A field yields at most 16 cases across all per-field classes (a number: null, empty,
+/// 8 boundaries, 4 confusions, omission, `1e309`). 48 fields, the whole-body cases, 8
+/// duplicate keys and 8 path slots of 7 values each keep every suite below `MAX_CASES`
+/// without silently dropping mutations.
 const MAX_FIELDS: usize = 48;
+const MAX_DUPLICATE_KEYS: usize = 8;
+const MAX_PATH_SLOTS: usize = 8;
+/// Nesting depths for `SchemaContractBounds`: inside common parser limits (serde_json 128,
+/// Python's recursion limit 1000), so the contract decides; and past them, so a recursive
+/// parser or sanitizer runs out of stack.
+const NEST_DEPTHS: [usize; 2] = [64, 1_024];
+const NEST_FIELD: &str = "zproxyNest";
+const EXTRA_FIELD: &str = "zproxyExtra";
+/// A plausible privileged field: accepting it unvalidated is a mass-assignment risk.
+const PRIVILEGE_FIELD: &str = "isAdmin";
+/// Decimal digits of the overlong identifier: past `u64`, `f64` and most column widths.
+const LONG_ID_DIGITS: usize = 4_096;
 const MAX_DEPTH: usize = 3;
 const MAX_CASES: usize = 1_024;
 /// Long enough to hold the exception line and the first frames of a leaked trace, which is
@@ -48,7 +63,7 @@ const UTF8_FIELD: &str = "zproxyUtf8";
 /// to emit (a bare `NaN`, invalid UTF-8).
 const MARKER: &str = "__zproxy_marker_7f3a__";
 
-const ALL_CLASSES: [MutationClass; 7] = [
+const ALL_CLASSES: [MutationClass; 9] = [
     MutationClass::NullInjection,
     MutationClass::EmptyStrings,
     MutationClass::BoundaryNumbers,
@@ -56,6 +71,8 @@ const ALL_CLASSES: [MutationClass; 7] = [
     MutationClass::OversizedField,
     MutationClass::MalformedJson,
     MutationClass::MissingFields,
+    MutationClass::SchemaContractBounds,
+    MutationClass::PathParamValidation,
 ];
 
 /// Single-flight guard and cancel flag for the fuzzer; lives in `AppState`.
@@ -99,6 +116,8 @@ pub struct Case {
     pub label: String,
     pub pointer: Option<String>,
     pub body: Bytes,
+    /// Origin-form target of a path case; `None` sends the suite target.
+    pub path: Option<Uri>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,7 +267,12 @@ fn confusions(own: Kind) -> Vec<(&'static str, Value)> {
 }
 
 /// Expands `base` into the ordered case list for `classes` (assumed sorted and unique).
-pub fn generate(base: &Map<String, Value>, classes: &[MutationClass]) -> Vec<Case> {
+/// `path` supplies the slots for `PathParamValidation`; without it that class is empty.
+pub fn generate(
+    base: &Map<String, Value>,
+    classes: &[MutationClass],
+    path: Option<&PathTemplate>,
+) -> Vec<Case> {
     let fields = collect_fields(base);
     let mut cases = Vec::new();
     let field_case = |class, field: &Field, label: &str, value: Option<Value>| Case {
@@ -259,6 +283,7 @@ pub fn generate(base: &Map<String, Value>, classes: &[MutationClass]) -> Vec<Cas
         },
         pointer: Some(field.pointer.clone()),
         body: Bytes::from(encode(&mutate(base, &field.path, value))),
+        path: None,
     };
 
     for &class in classes {
@@ -317,6 +342,12 @@ pub fn generate(base: &Map<String, Value>, classes: &[MutationClass]) -> Vec<Cas
                 }
                 cases.push(whole(class, "empty object", None, b"{}".to_vec()));
             }
+            MutationClass::SchemaContractBounds => cases.extend(contract_bounds(base, &fields)),
+            MutationClass::PathParamValidation => {
+                if let Some(path) = path {
+                    cases.extend(path_cases(base, path));
+                }
+            }
         }
     }
     cases.truncate(MAX_CASES);
@@ -329,7 +360,130 @@ fn whole(class: MutationClass, label: &str, pointer: Option<String>, body: Vec<u
         label: label.to_owned(),
         pointer,
         body: Bytes::from(body),
+        path: None,
     }
+}
+
+/// A value of the same JSON type that differs from `value`, so a duplicated key changes
+/// meaning depending on which occurrence a parser keeps.
+fn conflicting(value: &Value) -> Value {
+    match value {
+        Value::Null => json!(0),
+        Value::Bool(flag) => json!(!flag),
+        Value::Number(number) if number.as_i64() == Some(-1) => json!(0),
+        Value::Number(_) => json!(-1),
+        Value::String(text) if text.is_empty() => json!("1"),
+        Value::String(_) => json!(""),
+        Value::Array(items) if items.is_empty() => json!([null]),
+        Value::Array(_) => json!([]),
+        Value::Object(fields) if fields.is_empty() => json!({ EXTRA_FIELD: true }),
+        Value::Object(_) => json!({}),
+    }
+}
+
+/// Bodies that are valid JSON syntax but violate a strict schema. Raw splicing keeps what
+/// `Map` cannot hold (a second occurrence of a key, a number outside `f64`).
+fn contract_bounds(base: &Map<String, Value>, fields: &[Field]) -> Vec<Case> {
+    let class = MutationClass::SchemaContractBounds;
+    let encoded = encode(base);
+    let mut cases = Vec::new();
+
+    if let Some(open) = encoded.strip_suffix(b"}") {
+        for (key, value) in base.iter().take(MAX_DUPLICATE_KEYS) {
+            let conflict = conflicting(value);
+            let entry = format!(
+                ",{}:{}",
+                serde_json::to_string(key).unwrap_or_default(),
+                serde_json::to_string(&conflict).unwrap_or_default()
+            );
+            let path = [key.clone()];
+            cases.push(whole(
+                class,
+                &format!("duplicate {} = {conflict}", pointer(&path)),
+                Some(pointer(&path)),
+                [open, entry.as_bytes(), b"}".as_slice()].concat(),
+            ));
+        }
+    }
+
+    let nest_path = [NEST_FIELD.to_owned()];
+    for depth in NEST_DEPTHS {
+        let chain = format!(
+            "{}{{}}{}",
+            r#"{"d":"#.repeat(depth - 1),
+            "}".repeat(depth - 1)
+        );
+        cases.push(whole(
+            class,
+            &format!("+/{NEST_FIELD} = {depth} nested objects"),
+            Some(pointer(&nest_path)),
+            splice(base, &nest_path, chain.as_bytes()),
+        ));
+    }
+
+    let mut extra = |path: Vec<String>, value: Value| {
+        cases.push(whole(
+            class,
+            &format!("+{} = {value}", pointer(&path)),
+            Some(pointer(&path)),
+            encode(&mutate(base, &path, Some(value))),
+        ));
+    };
+    extra(vec![EXTRA_FIELD.to_owned()], json!("unexpected"));
+    if !base.contains_key(PRIVILEGE_FIELD) {
+        extra(vec![PRIVILEGE_FIELD.to_owned()], json!(true));
+    }
+    if let Some((key, _)) = base.iter().find(|(_, value)| value.is_object()) {
+        extra(
+            vec![key.clone(), EXTRA_FIELD.to_owned()],
+            json!("unexpected"),
+        );
+    }
+
+    for field in fields.iter().filter(|f| f.kind == Kind::Number) {
+        cases.push(whole(
+            class,
+            &format!("{} = 1e309", field.pointer),
+            Some(field.pointer.clone()),
+            splice(base, &field.path, b"1e309"),
+        ));
+    }
+    cases
+}
+
+/// Each slot in turn takes boundary identifiers while the others keep the default. The body
+/// is the base, so a difference from the baseline is attributable to the path alone.
+fn path_cases(base: &Map<String, Value>, path: &PathTemplate) -> Vec<Case> {
+    let body = Bytes::from(encode(base));
+    let long = "9".repeat(LONG_ID_DIGITS);
+    let values: [(&str, &str); 7] = [
+        ("0", "0"),
+        ("-1", "-1"),
+        ("i64::MAX", "9223372036854775807"),
+        ("i64::MAX+1", "9223372036854775808"),
+        ("\"invalid-uuid\"", "invalid-uuid"),
+        ("empty segment", ""),
+        ("4 KiB of digits", long.as_str()),
+    ];
+    let mut cases = Vec::with_capacity(values.len() * path.params().len());
+    for (slot, name) in path.params().iter().enumerate().take(MAX_PATH_SLOTS) {
+        for (label, value) in values {
+            // Literals come from a parsed URL and every value is unreserved ASCII, so this
+            // only fails on a template the guard would not have produced; such a case is
+            // left out rather than sent to the wrong path.
+            let Ok(uri) = path.origin_form(slot, value).parse::<Uri>() else {
+                continue;
+            };
+            cases.push(Case {
+                class: MutationClass::PathParamValidation,
+                label: format!("{{{name}}} = {label}"),
+                pointer: None,
+                body: body.clone(),
+                path: Some(uri),
+            });
+        }
+    }
+    cases
 }
 
 fn malformed(base: &Map<String, Value>) -> Vec<Case> {
@@ -413,6 +567,7 @@ fn malformed(base: &Map<String, Value>) -> Vec<Case> {
 
 struct Plan {
     template: RequestTemplate,
+    path_template: Option<PathTemplate>,
     content_type: bool,
     timeout: Duration,
     connect_timeout: Duration,
@@ -423,8 +578,11 @@ struct Plan {
 }
 
 impl Plan {
-    fn request(&self, index: u32, body: Bytes) -> Request<Full<Bytes>> {
-        let mut request = self.template.request(body);
+    fn request(&self, index: u32, body: Bytes, path: Option<&Uri>) -> Request<Full<Bytes>> {
+        let mut request = match path {
+            Some(uri) => self.template.request_at(uri, body),
+            None => self.template.request(body),
+        };
         let headers = request.headers_mut();
         if self.content_type {
             headers.insert(
@@ -451,7 +609,8 @@ fn prepare(spec: &FuzzSpec) -> EngineResult<Plan> {
             format!("must be between 1 and {MAX_TIMEOUT_MS}"),
         ));
     }
-    let template = RequestTemplate::new(&spec.target, spec.method, &spec.headers, invalid)?;
+    let resolved = pathparam::resolve(&spec.target)?;
+    let template = RequestTemplate::new(&resolved.target, spec.method, &spec.headers, invalid)?;
     let base = parse_base(spec.base_body.as_deref())?;
     let classes = normalize_classes(&spec.classes);
 
@@ -462,7 +621,8 @@ fn prepare(spec: &FuzzSpec) -> EngineResult<Plan> {
         connect_timeout: CONNECT_TIMEOUT,
         base: Bytes::from(encode(&base)),
         fields: count_u32(collect_fields(&base).len()),
-        cases: generate(&base, &classes),
+        cases: generate(&base, &classes, resolved.template.as_ref()),
+        path_template: resolved.template,
         classes,
     })
 }
@@ -503,17 +663,23 @@ fn normalize_classes(requested: &[MutationClass]) -> Vec<MutationClass> {
     classes
 }
 
-/// Rebuilds the exact request body of case `index` (0 is the baseline) from the base body
-/// and classes a report carries. Generation is deterministic, so this is the body that was
-/// sent, without the report having to hold every payload.
+/// Rebuilds the exact request body (and path, for path cases) of case `index` (0 is the
+/// baseline) from the base body, classes and path template a report carries. Generation is
+/// deterministic, so this is what was sent, without the report holding every payload.
 pub fn materialize(reference: &FuzzCaseRef) -> EngineResult<FuzzCasePayload> {
     let base = parse_base(Some(&reference.base_body))?;
     let classes = normalize_classes(&reference.classes);
-    let (label, body) = match reference.index {
-        0 => ("baseline".to_owned(), encode(&base)),
+    let path_template = match reference.path_template.as_deref() {
+        Some(text) => {
+            PathTemplate::parse(text).map_err(|err| invalid("pathTemplate", err.to_string()))?
+        }
+        None => None,
+    };
+    let (label, body, path) = match reference.index {
+        0 => ("baseline".to_owned(), encode(&base), None),
         index => {
             let offset = usize::try_from(index - 1).unwrap_or(usize::MAX);
-            let mut cases = generate(&base, &classes);
+            let mut cases = generate(&base, &classes, path_template.as_ref());
             let total = cases.len();
             if offset >= total {
                 return Err(invalid(
@@ -522,7 +688,11 @@ pub fn materialize(reference: &FuzzCaseRef) -> EngineResult<FuzzCasePayload> {
                 ));
             }
             let case = cases.swap_remove(offset);
-            (case.label, case.body.to_vec())
+            (
+                case.label,
+                case.body.to_vec(),
+                case.path.map(|uri| uri.to_string()),
+            )
         }
     };
     let bytes = u64::try_from(body.len()).unwrap_or(u64::MAX);
@@ -533,6 +703,7 @@ pub fn materialize(reference: &FuzzCaseRef) -> EngineResult<FuzzCasePayload> {
     Ok(FuzzCasePayload {
         index: reference.index,
         label,
+        path,
         body,
         bytes,
         lossy,
@@ -555,7 +726,7 @@ enum Outcome {
     },
 }
 
-async fn send(plan: &Plan, index: u32, body: Bytes) -> Outcome {
+async fn send(plan: &Plan, index: u32, body: Bytes, path: Option<&Uri>) -> Outcome {
     let opened =
         tokio::time::timeout(plan.connect_timeout, http1::open(&plan.template.target)).await;
     let mut sender = match opened {
@@ -583,7 +754,7 @@ async fn send(plan: &Plan, index: u32, body: Bytes) -> Outcome {
     };
 
     let started = Instant::now();
-    let exchange = http1::exchange(&mut sender, plan.request(index, body), PREVIEW_BYTES);
+    let exchange = http1::exchange(&mut sender, plan.request(index, body, path), PREVIEW_BYTES);
     match tokio::time::timeout(plan.timeout, exchange).await {
         Ok(Ok(received)) => Outcome::Response {
             status: received.status,
@@ -616,11 +787,20 @@ fn classify(
             (FuzzVerdict::ServerError, Some(Severity::Fault))
         }
         Outcome::Response { status, .. } if *status >= 400 => (FuzzVerdict::Rejected, None),
-        // A structurally invalid body taken as valid: the service parses leniently or never
-        // reads the body. Other accepted mutations may be legitimate input.
+        // Accepting these is itself the finding: a structurally invalid body (lenient parser,
+        // or the body is never read), a body outside the schema contract, or a boundary
+        // identifier the route treated as valid. Other accepted mutations may be legitimate.
         Outcome::Response { .. } => (
             FuzzVerdict::Accepted,
-            (class == Some(MutationClass::MalformedJson)).then_some(Severity::Warn),
+            matches!(
+                class,
+                Some(
+                    MutationClass::MalformedJson
+                        | MutationClass::SchemaContractBounds
+                        | MutationClass::PathParamValidation
+                )
+            )
+            .then_some(Severity::Warn),
         ),
         Outcome::Transport { .. } => (FuzzVerdict::TransportFailure, Some(Severity::Fault)),
         Outcome::Unreachable { .. } => (FuzzVerdict::Unreachable, None),
@@ -728,7 +908,7 @@ async fn execute(
         });
     };
 
-    let outcome = send(plan, 0, plan.base.clone()).await;
+    let outcome = send(plan, 0, plan.base.clone(), None).await;
     let baseline = to_result(0, None, "baseline", None, plan.base.len(), &outcome);
     emit(&baseline);
 
@@ -773,7 +953,7 @@ async fn execute(
             continue;
         }
 
-        let outcome = send(plan, index, case.body.clone()).await;
+        let outcome = send(plan, index, case.body.clone(), case.path.as_ref()).await;
         let result = to_result(
             index,
             Some(case.class),
@@ -851,6 +1031,7 @@ async fn execute(
         notes,
         base_body: String::from_utf8_lossy(&plan.base).into_owned(),
         classes: plan.classes.clone(),
+        path_template: plan.path_template.as_ref().map(ToString::to_string),
     }
 }
 
@@ -918,7 +1099,7 @@ mod tests {
     }
 
     fn cases_of(class: MutationClass) -> Vec<Case> {
-        generate(&default_template(), &[class])
+        generate(&default_template(), &[class], None)
     }
 
     fn body_of<'a>(cases: &'a [Case], label: &str) -> &'a [u8] {
@@ -945,20 +1126,35 @@ mod tests {
                 (MutationClass::OversizedField, 4),
                 (MutationClass::MalformedJson, 8),
                 (MutationClass::MissingFields, 9),
+                (MutationClass::SchemaContractBounds, 14),
+                (MutationClass::PathParamValidation, 0),
             ]
         );
-        assert_eq!(generate(&default_template(), &ALL_CLASSES).len(), 86);
+        assert_eq!(generate(&default_template(), &ALL_CLASSES, None).len(), 100);
     }
 
     #[test]
     fn generation_is_deterministic_and_keeps_field_order() {
         let base = default_template();
-        assert_eq!(generate(&base, &ALL_CLASSES), generate(&base, &ALL_CLASSES));
+        let path = pathparam::resolve("http://127.0.0.1/orders/{id}")
+            .unwrap()
+            .template;
+        assert_eq!(
+            generate(&base, &ALL_CLASSES, path.as_ref()),
+            generate(&base, &ALL_CLASSES, path.as_ref())
+        );
+        // Appended classes never shift the indices of the original seven.
+        let original = &ALL_CLASSES[..7];
+        assert_eq!(
+            generate(&base, original, None)[..],
+            generate(&base, &ALL_CLASSES, path.as_ref())[..86]
+        );
 
         let ordered: Map<String, Value> = serde_json::from_str(r#"{"z":1,"a":{"b":"x"}}"#).unwrap();
         let cases = generate(
             &ordered,
             &[MutationClass::NullInjection, MutationClass::MissingFields],
+            None,
         );
         assert_eq!(body_of(&cases, "/z = null"), br#"{"z":null,"a":{"b":"x"}}"#);
         assert_eq!(body_of(&cases, "/a/b = null"), br#"{"z":1,"a":{"b":null}}"#);
@@ -1026,6 +1222,170 @@ mod tests {
     }
 
     #[test]
+    fn schema_contract_bounds_stay_valid_syntax_but_break_the_contract() {
+        let cases = cases_of(MutationClass::SchemaContractBounds);
+        let labels: Vec<&str> = cases.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "duplicate /id = -1",
+                "duplicate /name = \"\"",
+                "duplicate /email = \"\"",
+                "duplicate /quantity = -1",
+                "duplicate /active = false",
+                "duplicate /tags = []",
+                "duplicate /meta = {}",
+                "+/zproxyNest = 64 nested objects",
+                "+/zproxyNest = 1024 nested objects",
+                "+/zproxyExtra = \"unexpected\"",
+                "+/isAdmin = true",
+                "+/meta/zproxyExtra = \"unexpected\"",
+                "/id = 1e309",
+                "/quantity = 1e309",
+            ]
+        );
+        let text = |label| String::from_utf8(body_of(&cases, label).to_vec()).unwrap();
+
+        let duplicate = text("duplicate /quantity = -1");
+        assert!(duplicate.contains(r#""quantity":1,"#), "{duplicate}");
+        assert!(duplicate.ends_with(r#","quantity":-1}"#), "{duplicate}");
+        // A last-wins parser sees the second occurrence; a first-wins validator the first.
+        let parsed: Value = serde_json::from_str(&duplicate).unwrap();
+        assert_eq!(parsed["quantity"], -1);
+
+        let nested: Value =
+            serde_json::from_str(&text("+/zproxyNest = 64 nested objects")).unwrap();
+        let mut levels = 1;
+        let mut cursor = &nested["zproxyNest"];
+        while let Some(next) = cursor.get("d") {
+            levels += 1;
+            cursor = next;
+        }
+        assert_eq!(levels, 64);
+        let deep =
+            serde_json::from_slice::<Value>(body_of(&cases, "+/zproxyNest = 1024 nested objects"));
+        assert!(deep
+            .unwrap_err()
+            .to_string()
+            .starts_with("recursion limit exceeded"));
+
+        let overflow = text("/quantity = 1e309");
+        assert!(overflow.contains(r#""quantity":1e309,"#), "{overflow}");
+        let refused = serde_json::from_str::<Value>(&overflow).unwrap_err();
+        assert!(
+            refused.to_string().starts_with("number out of range"),
+            "{refused}"
+        );
+
+        let nested_extra: Value =
+            serde_json::from_str(&text("+/meta/zproxyExtra = \"unexpected\"")).unwrap();
+        assert_eq!(nested_extra["meta"]["zproxyExtra"], "unexpected");
+        assert_eq!(nested_extra["meta"]["source"], "z-proxy");
+        assert!(cases.iter().all(|c| c.path.is_none()));
+
+        let empty = generate(&Map::new(), &[MutationClass::SchemaContractBounds], None);
+        let labels: Vec<&str> = empty.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "+/zproxyNest = 64 nested objects",
+                "+/zproxyNest = 1024 nested objects",
+                "+/zproxyExtra = \"unexpected\"",
+                "+/isAdmin = true",
+            ]
+        );
+    }
+
+    #[test]
+    fn path_cases_rewrite_one_slot_and_keep_the_base_body() {
+        let template = pathparam::resolve("http://127.0.0.1:9/api/orders/{orderId}/lines/{line}")
+            .unwrap()
+            .template
+            .unwrap();
+        let base = default_template();
+        let cases = generate(
+            &base,
+            &[MutationClass::PathParamValidation],
+            Some(&template),
+        );
+        assert_eq!(cases.len(), 14);
+        let path_of = |label: &str| {
+            cases
+                .iter()
+                .find(|c| c.label == label)
+                .unwrap_or_else(|| panic!("no case labelled {label}"))
+                .path
+                .as_ref()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(path_of("{orderId} = 0"), "/api/orders/0/lines/1");
+        assert_eq!(path_of("{orderId} = -1"), "/api/orders/-1/lines/1");
+        assert_eq!(
+            path_of("{orderId} = i64::MAX"),
+            "/api/orders/9223372036854775807/lines/1"
+        );
+        assert_eq!(
+            path_of("{orderId} = i64::MAX+1"),
+            "/api/orders/9223372036854775808/lines/1"
+        );
+        assert_eq!(
+            path_of("{line} = \"invalid-uuid\""),
+            "/api/orders/1/lines/invalid-uuid"
+        );
+        assert_eq!(path_of("{line} = empty segment"), "/api/orders/1/lines/");
+        assert_eq!(
+            path_of("{orderId} = 4 KiB of digits").len(),
+            "/api/orders//lines/1".len() + LONG_ID_DIGITS
+        );
+        let base_body = encode(&base);
+        assert!(cases
+            .iter()
+            .all(|c| c.body == base_body && c.pointer.is_none()));
+        assert!(generate(&base, &[MutationClass::PathParamValidation], None).is_empty());
+    }
+
+    #[test]
+    fn materialize_returns_the_path_of_path_cases() {
+        let fuzz = FuzzSpec {
+            classes: vec![
+                MutationClass::PathParamValidation,
+                MutationClass::NullInjection,
+            ],
+            ..spec("http://127.0.0.1:9/api/orders/{orderId}".into())
+        };
+        let plan = prepare(&fuzz).unwrap();
+        assert_eq!(plan.template.label, "http://127.0.0.1:9/api/orders/1");
+        let path_template = plan.path_template.as_ref().map(ToString::to_string);
+        assert_eq!(path_template.as_deref(), Some("/api/orders/{orderId}"));
+        let reference = |index: u32| FuzzCaseRef {
+            base_body: String::from_utf8(plan.base.to_vec()).unwrap(),
+            classes: fuzz.classes.clone(),
+            path_template: path_template.clone(),
+            index,
+        };
+        // Null injection runs first (8 cases), then the 7 path cases.
+        assert_eq!(plan.cases.len(), 15);
+        let body_case = materialize(&reference(1)).unwrap();
+        assert_eq!(body_case.path, None);
+        let path_case = materialize(&reference(10)).unwrap();
+        assert_eq!(path_case.label, "{orderId} = -1");
+        assert_eq!(path_case.path.as_deref(), Some("/api/orders/-1"));
+        assert_eq!(path_case.body.as_bytes(), &plan.base[..]);
+
+        let mut unrooted = reference(10);
+        unrooted.path_template = Some("api/orders/{orderId}".into());
+        match materialize(&unrooted) {
+            Err(EngineError::InvalidFuzzSpec { field, .. }) => assert_eq!(field, "pathTemplate"),
+            other => panic!("expected pathTemplate rejection, got {other:?}"),
+        }
+        // Without the template the path cases do not exist.
+        let mut bare = reference(10);
+        bare.path_template = None;
+        assert_eq!(materialize(&bare).unwrap_err().code(), "INVALID_FUZZ_SPEC");
+    }
+
+    #[test]
     fn spec_validation_happens_before_any_socket() {
         let code = |s: FuzzSpec| prepare(&s).err().unwrap().code();
         assert_eq!(
@@ -1075,6 +1435,7 @@ mod tests {
         let reference = |index: u32| FuzzCaseRef {
             base_body: base_body.clone(),
             classes: fuzz.classes.clone(),
+            path_template: None,
             index,
         };
 
@@ -1191,12 +1552,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.baseline.status, Some(201));
-        assert_eq!(report.cases.len(), 86);
+        assert_eq!(report.cases.len(), 100);
         assert_eq!(report.fields, 8);
         assert_eq!(report.classes, ALL_CLASSES);
+        assert_eq!(report.path_template, None);
         let replayed = materialize(&FuzzCaseRef {
             base_body: report.base_body.clone(),
             classes: report.classes.clone(),
+            path_template: None,
             index: 1,
         })
         .unwrap();
@@ -1213,7 +1576,26 @@ mod tests {
                 .filter(|c| c.severity.is_some())
                 .collect::<Vec<_>>()
         );
-        assert_eq!(report.warnings, 0);
+        // Every contract case the service took: six duplicates whose last value it accepts,
+        // the 64-level nest, and the three undeclared fields. The duplicate quantity (-1) is
+        // rejected, and 1024 levels and 1e309 fail its parser with a 400.
+        let warned: Vec<&str> = report
+            .cases
+            .iter()
+            .filter(|c| c.severity == Some(Severity::Warn))
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(warned.len(), 10, "{warned:#?}");
+        assert_eq!(report.warnings, 10);
+        let contract = report
+            .summary
+            .iter()
+            .find(|s| s.class == MutationClass::SchemaContractBounds)
+            .unwrap();
+        assert_eq!(
+            (contract.cases, contract.accepted, contract.rejected),
+            (14, 10, 4)
+        );
 
         let null_name = report
             .cases
@@ -1260,7 +1642,7 @@ mod tests {
         while let Ok(event) = events.try_recv() {
             match event {
                 TelemetryEvent::FuzzerStarted { cases, .. } => {
-                    assert_eq!(cases, 86);
+                    assert_eq!(cases, 100);
                     kinds.0 += 1;
                 }
                 TelemetryEvent::FuzzerCaseCompleted { .. } => kinds.1 += 1,
@@ -1271,7 +1653,7 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(kinds, (1, 87, 1));
+        assert_eq!(kinds, (1, 101, 1));
     }
 
     /// Express default error handler in development mode: malformed JSON is rejected with
@@ -1441,7 +1823,7 @@ mod tests {
             .iter()
             .filter(|c| c.verdict == FuzzVerdict::Skipped)
             .count();
-        assert!(skipped > 0 && skipped < 86, "skipped {skipped}");
+        assert!(skipped > 0 && skipped < 100, "skipped {skipped}");
         assert!(
             report.notes[0].contains("rejected with 422"),
             "{:?}",

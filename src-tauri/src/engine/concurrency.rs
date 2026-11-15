@@ -21,6 +21,7 @@ use uuid::Uuid;
 use super::error::{EngineError, EngineResult};
 use super::http1::{self, RequestTemplate, CONNECT_TIMEOUT};
 use super::net;
+use super::pathparam;
 use super::types::{
     Anomaly, AnomalyKind, BurstMethod, BurstReport, BurstSpec, LatencyStats, Severity, SizeStats,
     StatusBucket, TelemetryEvent, WorkerSample,
@@ -149,7 +150,12 @@ fn prepare(spec: &BurstSpec) -> EngineResult<Prepared> {
     }
 
     Ok(Prepared {
-        template: RequestTemplate::new(&spec.target, spec.method, &spec.headers, invalid)?,
+        template: RequestTemplate::new(
+            &pathparam::resolve(&spec.target)?.target,
+            spec.method,
+            &spec.headers,
+            invalid,
+        )?,
         body: spec.body.clone().map(Bytes::from).unwrap_or_default(),
         timeout: Duration::from_millis(u64::from(spec.timeout_ms)),
         expected_max_successes: spec.expected_max_successes,
@@ -999,6 +1005,44 @@ mod tests {
             .expect("race window anomaly");
         assert_eq!(race.workers, winners);
         assert_eq!(race.severity, Severity::Fault);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn path_placeholders_are_sent_as_the_default_identifier() {
+        let router = Router::new().route(
+            "/items/{id}/parts/{part}",
+            axum::routing::get(
+                |axum::extract::Path((id, part)): axum::extract::Path<(String, String)>| async move {
+                    if id == "1" && part == "1" {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    }
+                },
+            ),
+        );
+        let addr = serve(router).await;
+        let port = addr.port();
+        let report = run(
+            spec(
+                format!("http://127.0.0.1:{port}/items/{{id}}/parts/{{part}}"),
+                3,
+            ),
+            &TelemetryHub::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.target,
+            format!("http://127.0.0.1:{port}/items/1/parts/1")
+        );
+        assert_eq!(
+            report.status_histogram,
+            [StatusBucket {
+                status: Some(200),
+                count: 3
+            }]
+        );
     }
 
     #[tokio::test]

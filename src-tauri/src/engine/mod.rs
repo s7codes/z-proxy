@@ -7,5 +7,6 @@ pub mod guard;
 pub mod http1;
 pub mod lab;
 pub mod net;
+pub mod pathparam;
 pub mod proxy;
 pub mod types;

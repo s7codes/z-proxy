@@ -112,9 +112,15 @@ impl RequestTemplate {
     }
 
     pub fn request(&self, body: Bytes) -> Request<Full<Bytes>> {
+        self.request_at(&self.uri, body)
+    }
+
+    /// The same request with another origin-form target. Host and connection stay those of
+    /// the validated target, so a rewritten path cannot leave loopback.
+    pub fn request_at(&self, uri: &Uri, body: Bytes) -> Request<Full<Bytes>> {
         let mut request = Request::new(Full::new(body));
         *request.method_mut() = self.method.clone();
-        *request.uri_mut() = self.uri.clone();
+        *request.uri_mut() = uri.clone();
         let headers = request.headers_mut();
         headers.clone_from(&self.headers);
         headers.insert(header::HOST, self.host.clone());
