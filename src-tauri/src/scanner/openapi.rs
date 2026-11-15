@@ -4,7 +4,8 @@
 //! read through yaml-rust2's event stream, whose markers carry exact lines. Swagger
 //! `basePath` and the path component of the first OpenAPI `servers[].url` are prefixed so
 //! the reported path is what a client actually requests. Operations with a JSON request body
-//! carry a sample payload (`schema.rs`).
+//! carry a sample payload and every operation with documented responses a response contract
+//! (`schema.rs`).
 
 use std::sync::LazyLock;
 
@@ -59,7 +60,8 @@ pub fn from_json(src: &str) -> Result<Vec<RawRoute>, String> {
                     RouteSource::OpenApi,
                     lines.line(at),
                 )
-                .with_sample(schema::request_sample(&root, op)),
+                .with_sample(schema::request_sample(&root, op))
+                .with_contract(schema::response_contract(&root, op)),
             );
         }
     }
@@ -105,11 +107,12 @@ pub fn from_yaml(src: &str) -> Result<Vec<RawRoute>, String> {
                 continue;
             };
             if let Some(method) = operation(name) {
-                let sample = document
+                let op = document
                     .get("paths")
                     .and_then(|paths| paths.get(path))
-                    .and_then(|item| item.get(name))
-                    .and_then(|op| schema::request_sample(&document, op));
+                    .and_then(|item| item.get(name));
+                let sample = op.and_then(|op| schema::request_sample(&document, op));
+                let contract = op.and_then(|op| schema::response_contract(&document, op));
                 routes.push(
                     RawRoute::new(
                         method,
@@ -117,7 +120,8 @@ pub fn from_yaml(src: &str) -> Result<Vec<RawRoute>, String> {
                         RouteSource::OpenApi,
                         op_key.line,
                     )
-                    .with_sample(sample),
+                    .with_sample(sample)
+                    .with_contract(contract),
                 );
             }
         }

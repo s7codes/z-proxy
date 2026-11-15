@@ -1,16 +1,28 @@
-//! Sample JSON request bodies from OpenAPI / Swagger request body definitions.
+//! Request body samples and response contracts from OpenAPI / Swagger operations.
 //!
-//! Literal examples win (media `example`, the first `examples` entry, then schema `example`,
-//! `default`, `const`, `enum`); otherwise a value is synthesized from the schema shape, with
-//! numeric bounds and string lengths respected. The goal is a baseline the service accepts,
-//! so the fuzzer's mutations exercise field handling rather than the first validation check.
+//! Samples: literal examples win (media `example`, the first `examples` entry, then schema
+//! `example`, `default`, `const`, `enum`); otherwise a value is synthesized from the schema
+//! shape, with numeric bounds and string lengths respected. The goal is a baseline the
+//! service accepts, so the fuzzer's mutations exercise field handling rather than the first
+//! validation check.
+//!
+//! Contracts: the documented status codes plus the type and `required` list of every
+//! property of the 200 (else 201) JSON body, to a bounded depth, as RFC 6901 pointers.
 
 use serde_json::{json, Map, Number, Value};
+
+use crate::engine::contract;
+use crate::engine::types::{ContractField, JsonKind, ResponseContract};
 
 const MAX_DEPTH: usize = 8;
 const MAX_PROPERTIES: usize = 32;
 const MAX_STRING_LEN: usize = 1024;
 const MAX_SAMPLE_BYTES: usize = 64 * 1024;
+/// Response bodies are checked to this nesting depth below the root object.
+const CONTRACT_DEPTH: usize = 3;
+const MAX_CONTRACT_FIELDS: usize = 96;
+/// Success statuses whose body schema becomes the field contract, in preference order.
+const BODY_STATUSES: [u16; 2] = [200, 201];
 
 /// Pretty-printed JSON sample for the request body of `operation`; `root` is the whole
 /// document, used to resolve local `$ref`s. `None` when no JSON body is declared.
@@ -54,6 +66,241 @@ fn swagger2_body(root: &Value, operation: &Value) -> Option<Value> {
         .filter_map(|parameter| resolve(root, parameter))
         .find(|parameter| parameter.get("in").and_then(Value::as_str) == Some("body"))?;
     Some(synthesize(root, body.get("schema")?, 0, &mut Vec::new()))
+}
+
+/// Documented responses of `operation`; `None` when it documents none.
+pub fn response_contract(root: &Value, operation: &Value) -> Option<ResponseContract> {
+    let responses = operation.get("responses")?.as_object()?;
+    let mut statuses = Vec::new();
+    let mut status_classes = Vec::new();
+    let mut has_default = false;
+    for key in responses.keys().map(|key| key.trim()) {
+        if key.eq_ignore_ascii_case("default") {
+            has_default = true;
+        } else if let Ok(code) = key.parse::<u16>() {
+            if (100..600).contains(&code) {
+                statuses.push(code);
+            }
+        } else if let Some(class) = range_class(key) {
+            status_classes.push(class);
+        }
+    }
+    if statuses.is_empty() && status_classes.is_empty() && !has_default {
+        return None;
+    }
+    statuses.sort_unstable();
+    statuses.dedup();
+    status_classes.sort_unstable();
+    status_classes.dedup();
+
+    let body = BODY_STATUSES.iter().find_map(|status| {
+        let response = resolve(root, responses.get(&status.to_string())?)?;
+        let schema = response_schema(response)?;
+        Some((*status, contract_fields(root, schema)))
+    });
+    let (body_status, fields) = body.map_or((None, Vec::new()), |(status, fields)| {
+        (Some(status), fields)
+    });
+    Some(ResponseContract {
+        statuses,
+        status_classes,
+        has_default,
+        body_status,
+        fields,
+    })
+}
+
+/// `2XX` as 2; OpenAPI allows exactly the five range keys, in either case.
+fn range_class(key: &str) -> Option<u8> {
+    let bytes = key.as_bytes();
+    match bytes {
+        [digit @ b'1'..=b'5', x, y]
+            if x.eq_ignore_ascii_case(&b'x') && y.eq_ignore_ascii_case(&b'x') =>
+        {
+            Some(digit - b'0')
+        }
+        _ => None,
+    }
+}
+
+/// JSON schema of a response: OpenAPI 3 `content`, Swagger 2 `schema`.
+fn response_schema(response: &Value) -> Option<&Value> {
+    if let Some(content) = response.get("content").and_then(Value::as_object) {
+        return content
+            .iter()
+            .find(|(media_type, _)| essence(media_type) == "application/json")
+            .or_else(|| content.iter().find(|(media_type, _)| is_json(media_type)))
+            .and_then(|(_, media)| media.get("schema"));
+    }
+    response.get("schema")
+}
+
+fn contract_fields(root: &Value, schema: &Value) -> Vec<ContractField> {
+    let Some(schema) = resolve(root, schema) else {
+        return Vec::new();
+    };
+    let mut fields = vec![ContractField {
+        pointer: String::new(),
+        kinds: schema_kinds(root, schema, 0),
+        required: true,
+    }];
+    collect_properties(root, schema, "", 0, &mut fields);
+    fields
+}
+
+fn collect_properties(
+    root: &Value,
+    schema: &Value,
+    prefix: &str,
+    depth: usize,
+    out: &mut Vec<ContractField>,
+) {
+    if depth >= CONTRACT_DEPTH {
+        return;
+    }
+    let mut properties = Vec::new();
+    let mut required = Vec::new();
+    object_shape(root, schema, 0, &mut properties, &mut required);
+    for (name, property) in properties {
+        if out.len() >= MAX_CONTRACT_FIELDS {
+            return;
+        }
+        let Some(resolved) = resolve(root, property) else {
+            continue;
+        };
+        // `writeOnly` properties exist in requests only.
+        if resolved.get("writeOnly").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let pointer = format!("{prefix}/{}", name.replace('~', "~0").replace('/', "~1"));
+        let kinds = schema_kinds(root, resolved, 0);
+        let nested = kinds.contains(&JsonKind::Object);
+        out.push(ContractField {
+            pointer: pointer.clone(),
+            kinds,
+            required: required.contains(&name.as_str()),
+        });
+        if nested {
+            collect_properties(root, resolved, &pointer, depth + 1, out);
+        }
+    }
+}
+
+/// Properties and `required` names of an object schema with its `allOf` parts merged. A
+/// later definition of the same property replaces the earlier one.
+fn object_shape<'a>(
+    root: &'a Value,
+    schema: &'a Value,
+    depth: usize,
+    properties: &mut Vec<(&'a String, &'a Value)>,
+    required: &mut Vec<&'a str>,
+) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let Some(schema) = resolve(root, schema) else {
+        return;
+    };
+    if let Some(parts) = schema.get("allOf").and_then(Value::as_array) {
+        for part in parts {
+            object_shape(root, part, depth + 1, properties, required);
+        }
+    }
+    if let Some(declared) = schema.get("properties").and_then(Value::as_object) {
+        for (name, property) in declared {
+            match properties.iter_mut().find(|(known, _)| *known == name) {
+                Some(slot) => slot.1 = property,
+                None => properties.push((name, property)),
+            }
+        }
+    }
+    if let Some(names) = schema.get("required").and_then(Value::as_array) {
+        required.extend(names.iter().filter_map(Value::as_str));
+    }
+}
+
+/// Types a value of `schema` may have; empty means unconstrained.
+fn schema_kinds(root: &Value, schema: &Value, depth: usize) -> Vec<JsonKind> {
+    let Some(schema) = resolve(root, schema).filter(|_| depth <= MAX_DEPTH) else {
+        return Vec::new();
+    };
+    let mut kinds: Vec<JsonKind> = match schema.get("type") {
+        Some(Value::String(name)) => kind_named(name).into_iter().collect(),
+        Some(Value::Array(names)) => names
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(kind_named)
+            .collect(),
+        _ => untyped_kinds(root, schema, depth),
+    };
+    // OpenAPI 3.0 spells a nullable type as a sibling flag; 3.1 puts `null` in `type`.
+    if !kinds.is_empty()
+        && schema.get("nullable").and_then(Value::as_bool) == Some(true)
+        && !kinds.contains(&JsonKind::Null)
+    {
+        kinds.push(JsonKind::Null);
+    }
+    kinds
+}
+
+fn untyped_kinds(root: &Value, schema: &Value, depth: usize) -> Vec<JsonKind> {
+    if schema.get("properties").is_some() {
+        return vec![JsonKind::Object];
+    }
+    if schema.get("items").is_some() {
+        return vec![JsonKind::Array];
+    }
+    if let Some(value) = schema.get("const") {
+        return vec![contract::kind_of(value)];
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        let mut kinds = Vec::new();
+        for kind in values.iter().map(contract::kind_of) {
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+        return kinds;
+    }
+    for key in ["oneOf", "anyOf"] {
+        if let Some(variants) = schema.get(key).and_then(Value::as_array) {
+            let mut kinds = Vec::new();
+            for variant in variants {
+                let variant_kinds = schema_kinds(root, variant, depth + 1);
+                // One unconstrained variant makes the union unconstrained.
+                if variant_kinds.is_empty() {
+                    return Vec::new();
+                }
+                for kind in variant_kinds {
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
+                }
+            }
+            return kinds;
+        }
+    }
+    if let Some(parts) = schema.get("allOf").and_then(Value::as_array) {
+        return parts
+            .iter()
+            .map(|part| schema_kinds(root, part, depth + 1))
+            .find(|kinds| !kinds.is_empty())
+            .unwrap_or_default();
+    }
+    Vec::new()
+}
+
+fn kind_named(name: &str) -> Option<JsonKind> {
+    match name {
+        "string" => Some(JsonKind::String),
+        "integer" => Some(JsonKind::Integer),
+        "number" => Some(JsonKind::Number),
+        "boolean" => Some(JsonKind::Boolean),
+        "array" => Some(JsonKind::Array),
+        "object" => Some(JsonKind::Object),
+        "null" => Some(JsonKind::Null),
+        _ => None,
+    }
 }
 
 fn essence(media_type: &str) -> String {
@@ -375,6 +622,128 @@ mod tests {
             sample(&root, "/pets", "post"),
             Some(json!({ "name": "string", "age": 0 }))
         );
+    }
+
+    fn contract(root: &Value, path: &str, method: &str) -> Option<ResponseContract> {
+        response_contract(root, root.get("paths")?.get(path)?.get(method)?)
+    }
+
+    fn shape(contract: &ResponseContract) -> Vec<(String, Vec<JsonKind>, bool)> {
+        contract
+            .fields
+            .iter()
+            .map(|f| (f.pointer.clone(), f.kinds.clone(), f.required))
+            .collect()
+    }
+
+    #[test]
+    fn response_contracts_cover_statuses_types_and_required_fields() {
+        let root = json!({
+            "openapi": "3.0.3",
+            "paths": {
+                "/orders": { "post": { "responses": {
+                    "201": { "$ref": "#/components/responses/Created" },
+                    "4XX": { "description": "client error" },
+                    "422": { "description": "invalid" },
+                    "500": { "description": "crash" }
+                } } },
+                "/health": { "get": { "responses": { "200": { "description": "no body" } } } },
+                "/open": { "get": { "responses": { "default": { "description": "any" } } } },
+                "/bare": { "get": {} }
+            },
+            "components": {
+                "responses": { "Created": { "content": { "application/json; charset=utf-8": {
+                    "schema": { "$ref": "#/components/schemas/Order" }
+                } } } },
+                "schemas": {
+                    "Order": { "allOf": [
+                        { "$ref": "#/components/schemas/Entity" },
+                        { "type": "object", "required": ["total"], "properties": {
+                            "total": { "type": "integer" },
+                            "note": { "type": "string", "nullable": true },
+                            "secret": { "type": "string", "writeOnly": true },
+                            "state": { "enum": ["open", "paid", null] },
+                            "payer": { "oneOf": [ { "type": "string" }, { "type": "integer" } ] },
+                            "blob": { "oneOf": [ { "type": "string" }, {} ] },
+                            "customer": { "type": "object", "required": ["email"], "properties": {
+                                "email": { "type": "string" },
+                                "address": { "properties": { "city": { "type": "string" } } }
+                            } }
+                        } }
+                    ] },
+                    "Entity": { "type": "object", "required": ["id"], "properties": {
+                        "id": { "type": "string", "format": "uuid" }
+                    } }
+                }
+            }
+        });
+        let orders = contract(&root, "/orders", "post").unwrap();
+        assert_eq!(orders.statuses, [201, 422, 500]);
+        assert_eq!(orders.status_classes, [4]);
+        assert!(!orders.has_default);
+        assert_eq!(orders.body_status, Some(201));
+        use JsonKind::*;
+        let s = |p: &str| p.to_owned();
+        assert_eq!(
+            shape(&orders),
+            [
+                (s(""), vec![Object], true),
+                (s("/id"), vec![String], true),
+                (s("/total"), vec![Integer], true),
+                (s("/note"), vec![String, Null], false),
+                (s("/state"), vec![String, Null], false),
+                (s("/payer"), vec![String, Integer], false),
+                (s("/blob"), vec![], false),
+                (s("/customer"), vec![Object], false),
+                (s("/customer/email"), vec![String], true),
+                (s("/customer/address"), vec![Object], false),
+                (s("/customer/address/city"), vec![String], false),
+            ]
+        );
+
+        let health = contract(&root, "/health", "get").unwrap();
+        assert_eq!(
+            (health.statuses.as_slice(), health.body_status),
+            (&[200][..], None)
+        );
+        assert!(health.fields.is_empty());
+        let open = contract(&root, "/open", "get").unwrap();
+        assert!(open.has_default && open.statuses.is_empty());
+        assert_eq!(contract(&root, "/bare", "get"), None);
+    }
+
+    #[test]
+    fn swagger_and_openapi_31_response_contracts() {
+        let swagger = json!({
+            "swagger": "2.0",
+            "paths": { "/pets": { "get": { "responses": {
+                "200": { "schema": { "$ref": "#/definitions/Page" } },
+                "default": { "description": "error" }
+            } } } },
+            "definitions": { "Page": { "type": "object", "required": ["items"], "properties": {
+                "items": { "type": "array", "items": { "type": "object" } },
+                "next": { "type": "string" }
+            } } }
+        });
+        let pets = contract(&swagger, "/pets", "get").unwrap();
+        assert!(pets.has_default);
+        assert_eq!(pets.body_status, Some(200));
+        assert_eq!(pets.fields[1].pointer, "/items");
+        assert_eq!(pets.fields[1].kinds, [JsonKind::Array]);
+
+        let v31 = json!({
+            "openapi": "3.1.0",
+            "paths": { "/a/b": { "get": { "responses": {
+                "200": { "content": { "application/problem+json": { "schema": {
+                    "type": "object",
+                    "properties": { "x/y": { "type": ["number", "null"] }, "c": { "const": 3 } }
+                } } } }
+            } } } }
+        });
+        let fields = contract(&v31, "/a/b", "get").unwrap().fields;
+        assert_eq!(fields[1].pointer, "/x~1y");
+        assert_eq!(fields[1].kinds, [JsonKind::Number, JsonKind::Null]);
+        assert_eq!(fields[2].kinds, [JsonKind::Integer]);
     }
 
     #[test]

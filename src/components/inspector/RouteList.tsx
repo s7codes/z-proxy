@@ -178,6 +178,14 @@ const RouteRow = memo(function RouteRow({
             body
           </span>
         )}
+        {route.contract !== null && (
+          <span
+            className="shrink-0 text-fg-dim"
+            title="OpenAPI response contract; the fuzzer and the proxy check responses against it"
+          >
+            contract
+          </span>
+        )}
         <span className="ml-auto shrink-0">{SOURCE_LABEL[route.source]}</span>
       </div>
     </div>

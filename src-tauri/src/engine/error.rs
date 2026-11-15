@@ -36,6 +36,9 @@ pub enum EngineError {
     #[error("invalid fault rule #{index}: {reason}")]
     InvalidFaultRule { index: usize, reason: String },
 
+    #[error("invalid response contract #{index}: {reason}")]
+    InvalidContractSet { index: usize, reason: String },
+
     #[error("invalid burst spec field `{field}`: {reason}")]
     InvalidBurstSpec { field: &'static str, reason: String },
 
@@ -75,6 +78,7 @@ impl EngineError {
             Self::ProxyLoop { .. } => "PROXY_LOOP",
             Self::InvalidFaultProfile { .. } => "INVALID_FAULT_PROFILE",
             Self::InvalidFaultRule { .. } => "INVALID_FAULT_RULE",
+            Self::InvalidContractSet { .. } => "INVALID_CONTRACT_SET",
             Self::InvalidBurstSpec { .. } => "INVALID_BURST_SPEC",
             Self::InvalidFuzzSpec { .. } => "INVALID_FUZZ_SPEC",
             Self::FuzzerBusy => "FUZZER_BUSY",
@@ -106,7 +110,9 @@ impl Serialize for EngineError {
             Self::InvalidFaultProfile { field, .. }
             | Self::InvalidBurstSpec { field, .. }
             | Self::InvalidFuzzSpec { field, .. } => s.serialize_field("field", field)?,
-            Self::InvalidFaultRule { index, .. } => s.serialize_field("index", index)?,
+            Self::InvalidFaultRule { index, .. } | Self::InvalidContractSet { index, .. } => {
+                s.serialize_field("index", index)?
+            }
             Self::InvalidScanRoot { path, .. } => s.serialize_field("path", path)?,
             Self::ReportExport { path, .. } => s.serialize_field("path", path)?,
             Self::ClientBuild(_) | Self::InternalTask { .. } | Self::FuzzerBusy => {}

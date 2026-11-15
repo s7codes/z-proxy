@@ -27,11 +27,14 @@ use tower::ServiceExt;
 use url::Url;
 use uuid::Uuid;
 
+use super::contract::{self, ContractSet};
 use super::error::{EngineError, EngineResult};
 use super::fault::{self, FaultAction, FaultPlan, FaultProfile, FaultRule, FaultState};
 use super::guard::{self, GuardedTarget};
 use super::net;
-use super::types::{FaultKind, ProxyConfig, ProxyStatus, TelemetryEvent};
+use super::types::{
+    ContractViolation, FaultKind, ProxyConfig, ProxyStatus, RouteContract, TelemetryEvent,
+};
 use crate::telemetry::{now_us, TelemetryHub};
 
 /// Bodies are buffered so telemetry can report exact byte counts; the cap bounds memory
@@ -65,6 +68,8 @@ pub struct ProxyManager {
     /// Lives outside the listener so the profile survives restarts and can be changed
     /// while traffic is flowing.
     faults: watch::Sender<FaultState>,
+    /// Same lifetime as `faults`; requests take an `Arc` snapshot, never a lock across I/O.
+    contracts: watch::Sender<Arc<ContractSet>>,
     running: AsyncMutex<Option<RunningProxy>>,
     seed: Option<u64>,
 }
@@ -91,6 +96,7 @@ impl ProxyManager {
             hub,
             client: net::proxy_client()?,
             faults: watch::Sender::new(FaultState::default()),
+            contracts: watch::Sender::new(Arc::new(ContractSet::default())),
             running: AsyncMutex::new(None),
             seed,
         })
@@ -127,6 +133,7 @@ impl ProxyManager {
             upstream_label: upstream_label.clone(),
             client: self.client.clone(),
             faults: self.faults.subscribe(),
+            contracts: self.contracts.subscribe(),
             hub: Arc::clone(&self.hub),
             rng: Mutex::new(self.seed.map_or_else(Rng::new, Rng::with_seed)),
         });
@@ -187,6 +194,13 @@ impl ProxyManager {
         Ok(self.changed().await)
     }
 
+    /// Replaces the contract set atomically; an invalid template leaves the active set intact.
+    pub async fn set_contracts(&self, contracts: Vec<RouteContract>) -> EngineResult<ProxyStatus> {
+        let compiled = ContractSet::compile(contracts)?;
+        self.contracts.send_replace(Arc::new(compiled));
+        Ok(self.changed().await)
+    }
+
     async fn changed(&self) -> ProxyStatus {
         let running = self.running.lock().await;
         let status = self.snapshot(running.as_ref());
@@ -209,6 +223,7 @@ impl ProxyManager {
             armed: faults.armed,
             profile: faults.profile.clone(),
             rules: faults.rules.iter().map(|rule| rule.rule.clone()).collect(),
+            contracts: u32::try_from(self.contracts.borrow().len()).unwrap_or(u32::MAX),
         }
     }
 
@@ -329,6 +344,7 @@ struct ProxyContext {
     upstream_label: String,
     client: Client,
     faults: watch::Receiver<FaultState>,
+    contracts: watch::Receiver<Arc<ContractSet>>,
     hub: Arc<TelemetryHub>,
     rng: Mutex<Rng>,
 }
@@ -336,11 +352,10 @@ struct ProxyContext {
 impl ProxyContext {
     /// Decision plus the label of the rule that supplied it. Rules address routes as the
     /// service sees them, so matching uses the upstream path (base path included).
-    fn plan(&self, method: &str, path_and_query: &str) -> (FaultPlan, Option<String>) {
-        let upstream = upstream_url(&self.upstream.url, path_and_query);
+    fn plan(&self, method: &str, upstream_path: &str) -> (FaultPlan, Option<String>) {
         let state = self.faults.borrow();
         let mut rng = self.rng.lock().unwrap_or_else(PoisonError::into_inner);
-        let plan = fault::plan(&state, method, upstream.path(), &mut rng);
+        let plan = fault::plan(&state, method, upstream_path, &mut rng);
         let label = plan
             .rule
             .and_then(|index| state.rules.get(index))
@@ -372,7 +387,19 @@ impl ProxyContext {
             request_bytes: record.request_bytes,
             response_bytes: record.response_bytes,
             error: record.error,
+            contract: record.contract,
+            violations: record.violations,
         });
+    }
+
+    /// The contract bound to the upstream path, cloned out of the snapshot (an `Arc` bump)
+    /// so the watch read guard is released before any await.
+    fn contract(
+        &self,
+        method: &str,
+        upstream_path: &str,
+    ) -> Option<Arc<contract::CompiledContract>> {
+        self.contracts.borrow().find(method, upstream_path)
     }
 }
 
@@ -389,6 +416,8 @@ struct Exchange {
     request_bytes: u64,
     response_bytes: u64,
     error: Option<String>,
+    contract: Option<String>,
+    violations: Vec<ContractViolation>,
 }
 
 struct Reply {
@@ -427,9 +456,15 @@ async fn proxy_handler(
         request_bytes: 0,
         response_bytes: 0,
         error: None,
+        contract: None,
+        violations: Vec::new(),
     };
-    let (plan, rule) = ctx.plan(&record.method, &record.path);
+    let upstream_path = upstream_url(&ctx.upstream.url, &record.path)
+        .path()
+        .to_owned();
+    let (plan, rule) = ctx.plan(&record.method, &upstream_path);
     record.rule = rule;
+    let contract = ctx.contract(&record.method, &upstream_path);
 
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
@@ -465,6 +500,13 @@ async fn proxy_handler(
         FaultAction::Forward => match forward(&ctx, &conn, parts, body).await {
             Ok((mut reply, upstream_latency_us)) => {
                 record.upstream_latency_us = Some(upstream_latency_us);
+                // Only upstream answers are judged: an injected status or a 502 from the proxy
+                // itself says nothing about the service's contract.
+                if let Some(bound) = contract {
+                    record.violations =
+                        contract::check(&bound.contract, reply.status.as_u16(), Some(&reply.body));
+                    record.contract = Some(bound.label.clone());
+                }
                 if record.injected_delay_us > 0 {
                     reply.headers.insert(
                         HeaderName::from_static(DELAY_HEADER),

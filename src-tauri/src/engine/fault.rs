@@ -150,9 +150,27 @@ impl PathMatcher {
     }
 
     pub fn matches(&self, path: &str) -> bool {
-        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        self.regex.is_match(&format!("/{}", segments.join("/")))
+        self.matches_collapsed(&collapse_path(path))
     }
+
+    /// Match against a path already passed through `collapse_path`, so a caller testing one
+    /// request against many templates normalizes it once.
+    pub fn matches_collapsed(&self, collapsed: &str) -> bool {
+        self.regex.is_match(collapsed)
+    }
+}
+
+/// `/a//b/` as `/a/b`: the form `PathMatcher` regexes are anchored on.
+pub fn collapse_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 1);
+    for segment in path.split('/').filter(|s| !s.is_empty()) {
+        out.push('/');
+        out.push_str(segment);
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -177,7 +195,7 @@ impl CompiledRule {
     }
 }
 
-fn method_token(method: RouteMethod) -> &'static str {
+pub fn method_token(method: RouteMethod) -> &'static str {
     match method {
         RouteMethod::Get => "GET",
         RouteMethod::Post => "POST",

@@ -3,9 +3,11 @@
 //! Gives the burst runner, fuzzer and proxy a known target whose defects switch at runtime.
 //! `Unprotected` mode redeems a single-use coupon with a check-then-act race, lets
 //! unvalidated checkout input and order identifiers crash into handlers that leak stack
-//! traces and database errors, and accepts JSON that violates the documented contract.
-//! `Hardened` mode reserves the coupon with one conditional update and rejects every invalid
-//! body or path parameter with a 422 JSON body. The listener binds 127.0.0.1 only.
+//! traces and database errors, accepts JSON that violates the documented contract, and
+//! answers with bodies that drift from the documented response schemas. `Hardened` mode
+//! reserves the coupon with one conditional update, rejects every invalid body or path
+//! parameter with a 422 JSON body, and answers exactly as documented. The listener binds
+//! 127.0.0.1 only.
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
@@ -117,14 +119,21 @@ struct StoredOrder {
 }
 
 impl StoredOrder {
-    fn to_json(&self) -> Value {
+    /// The documented `Order` schema. Unprotected serializes the total through a decimal
+    /// formatter that yields a string, the drift a client parsing `totalCents` as an integer
+    /// trips over.
+    fn to_json(&self, mode: LabMode) -> Value {
+        let total = match mode {
+            LabMode::Unprotected => Value::String(self.total_cents.to_string()),
+            LabMode::Hardened => Value::from(self.total_cents),
+        };
         json!({
             "id": self.id,
             "orderId": format!("ord-{:06}", self.id),
             "status": "confirmed",
             "sku": self.sku,
             "quantity": self.quantity,
-            "totalCents": self.total_cents,
+            "totalCents": total,
         })
     }
 }
@@ -507,7 +516,11 @@ async fn redeem(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
         // The provider call happens after the reservation committed, so it cannot widen a
         // race window.
         tokio::time::sleep(COMMIT_WINDOW).await;
-        return redeemed(granted, "granted: reservation committed before side effect");
+        return redeemed(
+            LabMode::Hardened,
+            granted,
+            "granted: reservation committed before side effect",
+        );
     }
 
     // Read, act, write back the stale snapshot: the textbook TOCTOU with a lost update.
@@ -527,20 +540,25 @@ async fn redeem(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
     } else {
         "granted"
     };
-    redeemed(granted, outcome)
+    redeemed(LabMode::Unprotected, granted, outcome)
 }
 
-fn redeemed(granted: u32, outcome: &str) -> Response {
-    json_reply(
-        StatusCode::OK,
-        &json!({
-            "status": "redeemed",
-            "code": COUPON_CODE,
-            "discountCents": DISCOUNT_CENTS,
-            "redemptionId": format!("rdm-{granted:06}"),
-        }),
-        outcome,
-    )
+/// The documented `Redemption` schema. Unprotected still emits the field under its
+/// pre-rename name, so `discountCents` is missing from the response.
+fn redeemed(mode: LabMode, granted: u32, outcome: &str) -> Response {
+    let discount_key = match mode {
+        LabMode::Unprotected => "discount",
+        LabMode::Hardened => "discountCents",
+    };
+    let mut body = Map::with_capacity(4);
+    body.insert("status".to_owned(), json!("redeemed"));
+    body.insert("code".to_owned(), json!(COUPON_CODE));
+    body.insert(discount_key.to_owned(), json!(DISCOUNT_CENTS));
+    body.insert(
+        "redemptionId".to_owned(),
+        json!(format!("rdm-{granted:06}")),
+    );
+    json_reply(StatusCode::OK, &Value::Object(body), outcome)
 }
 
 fn exhausted(outcome: &str) -> Response {
@@ -580,7 +598,8 @@ struct Leak {
 }
 
 async fn checkout(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
-    match evaluate_checkout(shared.mode(), &body) {
+    let mode = shared.mode();
+    match evaluate_checkout(mode, &body) {
         Checkout::Created {
             sku,
             quantity,
@@ -592,7 +611,7 @@ async fn checkout(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
                 quantity,
                 total_cents,
             };
-            let body = order.to_json();
+            let body = order.to_json(mode);
             {
                 let mut ledger = shared.ledger();
                 ledger.orders += 1;
@@ -1001,8 +1020,9 @@ async fn empty_order_lookup(State(shared): State<Arc<Shared>>) -> Response {
 }
 
 fn lookup_response(shared: &Shared, order_id: &str) -> Response {
-    match evaluate_lookup(shared.mode(), order_id, |id| shared.find_order(id)) {
-        Lookup::Found(order) => json_reply(StatusCode::OK, &order.to_json(), "order found"),
+    let mode = shared.mode();
+    match evaluate_lookup(mode, order_id, |id| shared.find_order(id)) {
+        Lookup::Found(order) => json_reply(StatusCode::OK, &order.to_json(mode), "order found"),
         Lookup::NotFound => json_reply(
             StatusCode::NOT_FOUND,
             &json!({ "error": "order_not_found" }),
@@ -1292,10 +1312,17 @@ fn python_numeric_overflow(raw: &str) -> Leak {
 
 /// The lab's own OpenAPI 3.1 description, pretty-printed so route lines are meaningful.
 /// Request bodies use `$ref`s, a `readOnly` property and a 3.1 type union so the scanner's
-/// body synthesis is exercised end to end.
+/// body synthesis is exercised end to end; success responses carry `$ref` schemas so the
+/// extracted response contracts are too. Hardened mode answers exactly as documented.
 pub fn openapi_document(base_url: Option<&str>) -> String {
     let server = base_url.map_or_else(|| format!("http://127.0.0.1:{DEFAULT_PORT}"), str::to_owned);
     let response = |description: &str| json!({ "description": description });
+    let body = |description: &str, schema: &str| {
+        json!({
+            "description": description,
+            "content": { "application/json": { "schema": { "$ref": format!("#/components/schemas/{schema}") } } }
+        })
+    };
     let document = json!({
         "openapi": "3.1.0",
         "info": {
@@ -1308,7 +1335,7 @@ pub fn openapi_document(base_url: Option<&str>) -> String {
             "/api/v1/health": {
                 "get": {
                     "summary": "Liveness and active mode",
-                    "responses": { "200": response("Service is up") }
+                    "responses": { "200": body("Service is up", "Health") }
                 }
             },
             "/api/v1/coupons/redeem": {
@@ -1319,9 +1346,10 @@ pub fn openapi_document(base_url: Option<&str>) -> String {
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RedeemRequest" } } }
                     },
                     "responses": {
-                        "200": response("Coupon redeemed"),
-                        "404": response("Unknown coupon"),
-                        "409": response("Coupon already used")
+                        "200": body("Coupon redeemed", "Redemption"),
+                        "404": body("Unknown coupon", "Error"),
+                        "409": body("Coupon already used", "Error"),
+                        "422": body("No coupon code", "ValidationError")
                     }
                 }
             },
@@ -1330,8 +1358,8 @@ pub fn openapi_document(base_url: Option<&str>) -> String {
                     "summary": "Price and confirm an order",
                     "requestBody": { "$ref": "#/components/requestBodies/Checkout" },
                     "responses": {
-                        "201": response("Order confirmed"),
-                        "422": response("Validation failed"),
+                        "201": body("Order confirmed", "Order"),
+                        "422": body("Validation failed", "ValidationError"),
                         "500": response("Unhandled failure")
                     }
                 }
@@ -1346,9 +1374,9 @@ pub fn openapi_document(base_url: Option<&str>) -> String {
                         "schema": { "type": "integer", "minimum": 1, "maximum": ORDER_ID_MAX, "example": 1 }
                     }],
                     "responses": {
-                        "200": response("Order"),
-                        "404": response("Unknown order"),
-                        "422": response("Identifier outside the documented range")
+                        "200": body("Order", "Order"),
+                        "404": body("Unknown order", "Error"),
+                        "422": body("Identifier outside the documented range", "Error")
                     }
                 }
             },
@@ -1396,6 +1424,49 @@ pub fn openapi_document(base_url: Option<&str>) -> String {
                         "email": { "type": "string", "format": "email", "maxLength": EMAIL_MAX, "example": "operator@lab.local" },
                         "name": { "type": "string", "minLength": 1, "maxLength": NAME_MAX, "example": "Lab Operator" }
                     }
+                },
+                "Order": {
+                    "type": "object",
+                    "required": ["id", "orderId", "status", "sku", "quantity", "totalCents"],
+                    "properties": {
+                        "id": { "type": "integer", "minimum": 1 },
+                        "orderId": { "type": "string", "pattern": "^ord-[0-9]{6,}$" },
+                        "status": { "type": "string", "enum": ["confirmed"] },
+                        "sku": { "type": "string" },
+                        "quantity": { "type": "integer", "minimum": 1 },
+                        "totalCents": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "Redemption": {
+                    "type": "object",
+                    "required": ["status", "code", "discountCents", "redemptionId"],
+                    "properties": {
+                        "status": { "type": "string", "enum": ["redeemed"] },
+                        "code": { "type": "string" },
+                        "discountCents": { "type": "integer", "minimum": 0 },
+                        "redemptionId": { "type": "string" }
+                    }
+                },
+                "Health": {
+                    "type": "object",
+                    "required": ["status", "mode"],
+                    "properties": {
+                        "status": { "type": "string" },
+                        "mode": { "type": "string", "enum": ["unprotected", "hardened"] }
+                    }
+                },
+                "Error": {
+                    "type": "object",
+                    "required": ["error"],
+                    "properties": { "error": { "type": "string" } }
+                },
+                "ValidationError": {
+                    "type": "object",
+                    "required": ["error"],
+                    "properties": {
+                        "error": { "type": "string" },
+                        "violations": { "type": "array", "items": { "type": "object" } }
+                    }
                 }
             }
         }
@@ -1410,10 +1481,13 @@ mod tests {
     use crate::engine::concurrency;
     use crate::engine::disclosure;
     use crate::engine::fuzzer::{self, FuzzerSlot};
+    use crate::engine::proxy::ProxyManager;
     use crate::engine::types::{
-        AnomalyKind, BurstMethod, BurstSpec, DisclosureKind, FuzzSpec, FuzzVerdict, HeaderPair,
-        MutationClass,
+        AnomalyKind, BurstMethod, BurstSpec, ContractViolation, ContractViolationKind,
+        DisclosureKind, FuzzSpec, FuzzVerdict, HeaderPair, MutationClass, ProxyConfig,
+        ResponseContract, RouteContract, RouteMethod,
     };
+    use crate::scanner::routes;
 
     const CHECKOUT_SAMPLE: &str = r#"{"sku":"LAB-KB-01","quantity":2,"customer":{"email":"operator@lab.local","name":"Lab Operator"},"note":"leave at loading dock","giftWrap":false}"#;
 
@@ -1879,6 +1953,7 @@ mod tests {
             base_body: Some(CHECKOUT_SAMPLE.to_owned()),
             classes: Vec::new(),
             timeout_ms: 5_000,
+            contract: None,
         }
     }
 
@@ -1934,6 +2009,179 @@ mod tests {
             .cases
             .iter()
             .all(|c| matches!(c.status, Some(201) | Some(422))));
+        lab.stop().await;
+    }
+
+    /// Contracts of the lab's own document, as the route list hands them to the engine.
+    fn lab_contracts(base: &str) -> Vec<RouteContract> {
+        routes::spec_report("target-lab", SPEC_FILE, &openapi_document(Some(base)))
+            .routes
+            .into_iter()
+            .filter_map(|route| {
+                Some(RouteContract {
+                    method: route.method,
+                    path: route.path,
+                    contract: route.contract?,
+                })
+            })
+            .collect()
+    }
+
+    fn lab_contract(base: &str, method: RouteMethod, path: &str) -> ResponseContract {
+        lab_contracts(base)
+            .into_iter()
+            .find(|route| route.method == method && route.path == path)
+            .map(|route| route.contract)
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkout_responses_drift_from_the_contract_in_unprotected_mode_only() {
+        let (hub, lab, base) = started(LabMode::Unprotected).await;
+        let slot = FuzzerSlot::default();
+        let spec = || FuzzSpec {
+            contract: Some(lab_contract(
+                &base,
+                RouteMethod::Post,
+                "/api/v1/orders/checkout",
+            )),
+            ..checkout_fuzz(&base)
+        };
+
+        let report = fuzzer::run(spec(), &hub, &slot).await.unwrap();
+        assert_eq!(report.baseline.status, Some(201));
+        assert_eq!(
+            report.baseline.violations,
+            [ContractViolation {
+                kind: ContractViolationKind::ResponseTypeMismatch,
+                pointer: Some("/totalCents".to_owned()),
+                expected: "integer".to_owned(),
+                actual: "string".to_owned(),
+            }]
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("/totalCents: expected integer, got string")),
+            "{:?}",
+            report.notes
+        );
+        assert_eq!(report.baseline.severity, None, "the baseline is context");
+        let undocumented: std::collections::BTreeSet<String> = report
+            .cases
+            .iter()
+            .flat_map(|case| &case.violations)
+            .filter(|v| v.kind == ContractViolationKind::UndocumentedStatus)
+            .map(|v| v.actual.clone())
+            .collect();
+        assert!(undocumented.contains("400"), "{undocumented:?}");
+        assert!(report.contract_violations > 1);
+        for case in report.cases.iter().filter(|c| !c.violations.is_empty()) {
+            assert!(case.severity.is_some(), "{}", case.label);
+        }
+
+        lab.set_mode(LabMode::Hardened).await;
+        let report = fuzzer::run(spec(), &hub, &slot).await.unwrap();
+        assert_eq!(report.baseline.status, Some(201));
+        assert_eq!(report.contract_violations, 0, "{:?}", report.baseline);
+        assert_eq!(
+            (report.faults, report.warnings, report.disclosures),
+            (0, 0, 0)
+        );
+        lab.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_checks_lab_responses_against_the_documented_contracts() {
+        let (hub, lab, base) = started(LabMode::Unprotected).await;
+        let proxy = ProxyManager::new(Arc::clone(&hub)).unwrap();
+        let status = proxy.set_contracts(lab_contracts(&base)).await.unwrap();
+        assert_eq!(status.contracts, 5);
+        let listener = proxy
+            .start(ProxyConfig {
+                upstream: base.clone(),
+                listen_port: 0,
+            })
+            .await
+            .unwrap()
+            .listener
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let exchanges = |mode: LabMode| {
+            let client = client.clone();
+            let listener = listener.clone();
+            let mut events = hub.subscribe();
+            async move {
+                let url = |path: &str| format!("http://{listener}{path}");
+                let send = |request: reqwest::RequestBuilder| async move {
+                    request.send().await.unwrap().status().as_u16()
+                };
+                assert_eq!(send(client.get(url("/api/v1/health"))).await, 200);
+                assert_eq!(
+                    send(
+                        client
+                            .post(url("/api/v1/orders/checkout"))
+                            .body(CHECKOUT_SAMPLE)
+                    )
+                    .await,
+                    201
+                );
+                assert_eq!(send(client.get(url("/api/v1/orders/1"))).await, 200);
+                let redeem = format!(r#"{{"code":"{COUPON_CODE}"}}"#);
+                assert_eq!(
+                    send(client.post(url("/api/v1/coupons/redeem")).body(redeem)).await,
+                    200
+                );
+                let empty = send(client.post(url("/api/v1/coupons/redeem")).body("{}")).await;
+                assert_eq!(empty, if mode == LabMode::Hardened { 422 } else { 400 });
+                let mut seen = Vec::new();
+                while seen.len() < 5 {
+                    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if let TelemetryEvent::ProxyExchange {
+                        contract,
+                        violations,
+                        ..
+                    } = event
+                    {
+                        let drift: Vec<String> = violations
+                            .iter()
+                            .map(|v| {
+                                format!("{}={}", v.pointer.as_deref().unwrap_or("status"), v.actual)
+                            })
+                            .collect();
+                        seen.push((contract.unwrap_or_default(), drift.join(",")));
+                    }
+                }
+                seen
+            }
+        };
+
+        let drift = |label: &str, found: &str| (label.to_owned(), found.to_owned());
+        assert_eq!(
+            exchanges(LabMode::Unprotected).await,
+            [
+                drift("GET /api/v1/health", ""),
+                drift("POST /api/v1/orders/checkout", "/totalCents=string"),
+                drift("GET /api/v1/orders/{orderId}", "/totalCents=string"),
+                drift("POST /api/v1/coupons/redeem", "/discountCents=missing"),
+                drift("POST /api/v1/coupons/redeem", "status=400"),
+            ]
+        );
+
+        lab.set_mode(LabMode::Hardened).await;
+        let hardened = exchanges(LabMode::Hardened).await;
+        assert!(
+            hardened
+                .iter()
+                .all(|(label, found)| !label.is_empty() && found.is_empty()),
+            "{hardened:?}"
+        );
+        proxy.stop().await;
         lab.stop().await;
     }
 
@@ -1997,6 +2245,7 @@ mod tests {
             base_body: None,
             classes: vec![MutationClass::PathParamValidation],
             timeout_ms: 5_000,
+            contract: None,
         };
 
         let report = fuzzer::run(spec(), &hub, &slot).await.unwrap();

@@ -4,12 +4,20 @@ import {
   ipcAvailable,
   setFaultProfile,
   setFaultRules,
+  setProxyContracts,
   startProxy,
   stopProxy,
   type IpcResult,
   type TransportError,
 } from "../lib/ipc";
-import type { EngineError, FaultProfile, FaultRule, ProxyStatus, TelemetryEventOf } from "../lib/types";
+import type {
+  EngineError,
+  FaultProfile,
+  FaultRule,
+  ProxyStatus,
+  RouteContract,
+  TelemetryEventOf,
+} from "../lib/types";
 
 export interface ProxyControl {
   /** Engine-side truth; `null` until the first status arrives. */
@@ -26,6 +34,8 @@ export interface ProxyControl {
   stop: () => void;
   applyFaults: (armed: boolean, profile: FaultProfile) => void;
   applyRules: (rules: FaultRule[]) => void;
+  /** Replaces the response contracts checked on forwarded responses. */
+  applyContracts: (contracts: RouteContract[]) => void;
 }
 
 export function useProxy(latest: TelemetryEventOf<"proxyStateChanged"> | null): ProxyControl {
@@ -123,7 +133,14 @@ export function useProxy(latest: TelemetryEventOf<"proxyStateChanged"> | null): 
     [adopt],
   );
 
-  return { status, busy, error, start, routeTo, stop, applyFaults, applyRules };
+  const applyContracts = useCallback(
+    (contracts: RouteContract[]) => {
+      void setProxyContracts(contracts).then(adopt);
+    },
+    [adopt],
+  );
+
+  return { status, busy, error, start, routeTo, stop, applyFaults, applyRules, applyContracts };
 }
 
 export function sameProfile(a: FaultProfile, b: FaultProfile): boolean {

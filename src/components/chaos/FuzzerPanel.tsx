@@ -2,13 +2,14 @@ import { useMemo, useState } from "react";
 import { FileInput, FlaskConical, Square, X, Zap } from "lucide-react";
 import type { FuzzerControl } from "../../hooks/useFuzzer";
 import type { FuzzerProgress } from "../../hooks/useTelemetry";
+import { contractSummary, describeViolation, VIOLATION_LABEL } from "../../lib/contract";
 import { DISCLOSURE_LABEL } from "../../lib/disclosure";
 import { formatBytes, formatLatency } from "../../lib/format";
 import { materializeFuzzCase } from "../../lib/ipc";
 import { joinTarget, parseHeaders, type RequestOrigin } from "../../lib/request";
 import { pathParams, type RequestTarget } from "../../lib/routes";
 import { httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
-import type { FuzzCaseResult, FuzzReport, FuzzVerdict, MutationClass } from "../../lib/types";
+import type { FuzzCaseResult, FuzzReport, FuzzVerdict, MutationClass, ResponseContract } from "../../lib/types";
 import { Section, StatusSquare } from "../shell/PanelHeader";
 import { ErrorLine } from "./ErrorLine";
 import { Field, MethodPicker, Metric, OriginRow, PathField } from "./RequestFields";
@@ -54,6 +55,7 @@ const TEMPLATE = `{
 }`;
 
 const MAX_LISTED_FINDINGS = 200;
+const MAX_LISTED_VIOLATIONS = 3;
 
 const VERDICT_LABEL: Record<FuzzVerdict, string> = {
   rejected: "4xx",
@@ -75,6 +77,8 @@ interface FuzzerPanelProps {
   payload: string;
   onPayload: (payload: string) => void;
   sampleBody: string | null;
+  /** OpenAPI response contract of the targeted operation; responses are checked against it. */
+  contract: ResponseContract | null;
   /** Replays a case body through the burst runner: same method and path, N workers. */
   onSendToBurst: (target: RequestTarget, body: string, origin: string) => void;
 }
@@ -89,6 +93,7 @@ export function FuzzerPanel({
   payload,
   onPayload: setPayload,
   sampleBody,
+  contract,
   onSendToBurst,
 }: FuzzerPanelProps) {
   const { method, path } = request;
@@ -125,6 +130,7 @@ export function FuzzerPanel({
       baseBody: payload.trim() === "" ? null : payload,
       classes: CLASSES.filter((c) => selected.has(c.id)).map((c) => c.id),
       timeoutMs,
+      contract,
     });
   };
 
@@ -185,6 +191,11 @@ export function FuzzerPanel({
           {method === "GET" && (
             <div className="pt-1 text-2xs text-fg-faint">GET bodies are commonly ignored; prefer the route's write method.</div>
           )}
+          <div className="num truncate pt-1 text-2xs text-fg-faint" title={contract === null ? undefined : contractSummary(contract)}>
+            {contract === null
+              ? "No response contract; select an OpenAPI route to check responses for drift"
+              : `response contract: ${contractSummary(contract)}`}
+          </div>
         </Section>
 
         <Section
@@ -376,11 +387,16 @@ function FuzzReportView({
   return (
     <>
       <Section title="Result" aside={<span className="num text-2xs text-fg-faint">{report.id.slice(0, 8)}</span>}>
-        <div className="num mb-2 grid grid-cols-5 gap-px border border-line bg-line text-xs">
+        <div className="num mb-2 grid grid-cols-3 gap-px border border-line bg-line text-xs">
           <Metric label="cases" value={executed === report.cases.length ? String(executed) : `${executed}/${report.cases.length}`} />
           <Metric label="faults" value={String(report.faults)} tone={report.faults > 0 ? "fault" : undefined} />
           <Metric label="warns" value={String(report.warnings)} tone={report.warnings > 0 ? "warn" : undefined} />
           <Metric label="leaks" value={String(report.disclosures)} tone={report.disclosures > 0 ? "warn" : undefined} />
+          <Metric
+            label="drift"
+            value={String(report.contractViolations)}
+            tone={report.contractViolations > 0 ? "warn" : undefined}
+          />
           <Metric label="wall" value={formatLatency(report.wallUs)} />
         </div>
         <div className="num grid grid-cols-[64px_1fr_auto] items-center text-xs">
@@ -446,7 +462,7 @@ function FuzzReportView({
         {findings.length === 0 ? (
           <div className="flex items-center gap-1.5 text-xs text-ok">
             <StatusSquare className="bg-ok" />
-            No 5xx, transport failures or leaked traces across {executed} cases
+            No 5xx, transport failures, leaked traces or contract drift across {executed} cases
           </div>
         ) : (
           <div className="flex flex-col gap-1.5">
@@ -514,6 +530,19 @@ function FindingRow({
           <span className="shrink-0 text-warn">{DISCLOSURE_LABEL[result.disclosure.kind]}</span>
           <span className="truncate text-fg-dim">{result.disclosure.evidence}</span>
         </div>
+      )}
+      {result.violations.slice(0, MAX_LISTED_VIOLATIONS).map((violation) => (
+        <div
+          key={`${violation.kind}${violation.pointer ?? ""}`}
+          className="num flex min-w-0 items-center gap-1.5 text-2xs"
+          title={describeViolation(violation)}
+        >
+          <span className="shrink-0 text-warn">{VIOLATION_LABEL[violation.kind]}</span>
+          <span className="truncate text-fg-dim">{describeViolation(violation)}</span>
+        </div>
+      ))}
+      {result.violations.length > MAX_LISTED_VIOLATIONS && (
+        <div className="num text-2xs text-fg-faint">+{result.violations.length - MAX_LISTED_VIOLATIONS} more drift</div>
       )}
       {expanded && result.responsePreview !== null && (
         <pre className="num mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-xs border border-line bg-bg p-1.5 text-2xs leading-4 text-fg-dim select-text">

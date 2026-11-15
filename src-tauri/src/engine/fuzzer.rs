@@ -17,14 +17,15 @@ use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use super::contract;
 use super::disclosure;
 use super::error::{EngineError, EngineResult};
 use super::http1::{self, OpenError, RequestTemplate, CONNECT_TIMEOUT};
 use super::net;
 use super::pathparam::{self, PathTemplate};
 use super::types::{
-    BurstMethod, ClassSummary, FuzzCasePayload, FuzzCaseRef, FuzzCaseResult, FuzzReport, FuzzSpec,
-    FuzzVerdict, MutationClass, Severity, TelemetryEvent,
+    BurstMethod, ClassSummary, ContractViolation, FuzzCasePayload, FuzzCaseRef, FuzzCaseResult,
+    FuzzReport, FuzzSpec, FuzzVerdict, MutationClass, ResponseContract, Severity, TelemetryEvent,
 };
 use crate::telemetry::{now_us, TelemetryHub};
 
@@ -575,9 +576,20 @@ struct Plan {
     fields: u32,
     classes: Vec<MutationClass>,
     cases: Vec<Case>,
+    contract: Option<ResponseContract>,
 }
 
 impl Plan {
+    /// Body bytes kept per response: the disclosure preview, or the whole body (bounded) when
+    /// a contract needs it parsed.
+    fn capture_limit(&self) -> usize {
+        if self.contract.is_some() {
+            contract::MAX_BODY_BYTES
+        } else {
+            PREVIEW_BYTES
+        }
+    }
+
     fn request(&self, index: u32, body: Bytes, path: Option<&Uri>) -> Request<Full<Bytes>> {
         let mut request = match path {
             Some(uri) => self.template.request_at(uri, body),
@@ -624,6 +636,7 @@ fn prepare(spec: &FuzzSpec) -> EngineResult<Plan> {
         cases: generate(&base, &classes, resolved.template.as_ref()),
         path_template: resolved.template,
         classes,
+        contract: spec.contract.clone(),
     })
 }
 
@@ -754,7 +767,8 @@ async fn send(plan: &Plan, index: u32, body: Bytes, path: Option<&Uri>) -> Outco
     };
 
     let started = Instant::now();
-    let exchange = http1::exchange(&mut sender, plan.request(index, body, path), PREVIEW_BYTES);
+    let request = plan.request(index, body, path);
+    let exchange = http1::exchange(&mut sender, request, plan.capture_limit());
     match tokio::time::timeout(plan.timeout, exchange).await {
         Ok(Ok(received)) => Outcome::Response {
             status: received.status,
@@ -777,10 +791,11 @@ async fn send(plan: &Plan, index: u32, body: Bytes, path: Option<&Uri>) -> Outco
     }
 }
 
+/// `flagged`: the response leaked internals or broke the documented contract.
 fn classify(
     class: Option<MutationClass>,
     outcome: &Outcome,
-    disclosed: bool,
+    flagged: bool,
 ) -> (FuzzVerdict, Option<Severity>) {
     let (verdict, severity) = match outcome {
         Outcome::Response { status, .. } if *status >= 500 => {
@@ -806,28 +821,59 @@ fn classify(
         Outcome::Unreachable { .. } => (FuzzVerdict::Unreachable, None),
     };
     // A trace inside a 4xx is still a leak: validation rejected the payload, but only after
-    // the exception reached the response serializer.
-    let severity = severity.or(disclosed.then_some(Severity::Warn));
+    // the exception reached the response serializer. An undocumented status or a drifted
+    // body is a warning for the same reason: the payload was handled, but not as specified.
+    let severity = severity.or(flagged.then_some(Severity::Warn));
     // The baseline is context for the mutations, not a finding of its own.
     (verdict, if class.is_none() { None } else { severity })
 }
 
-fn to_result(
+struct CaseMeta<'a> {
     index: u32,
     class: Option<MutationClass>,
-    label: &str,
+    label: &'a str,
     pointer: Option<String>,
     request_bytes: usize,
+}
+
+fn to_result(
+    meta: CaseMeta<'_>,
     outcome: &Outcome,
+    contract: Option<&ResponseContract>,
 ) -> FuzzCaseResult {
+    let CaseMeta {
+        index,
+        class,
+        label,
+        pointer,
+        request_bytes,
+    } = meta;
+    let violations = match (contract, outcome) {
+        (
+            Some(contract),
+            Outcome::Response {
+                status,
+                bytes,
+                preview,
+                ..
+            },
+        ) => {
+            // A body longer than the capture limit was cut; its fields cannot be judged.
+            let complete = usize::try_from(*bytes).is_ok_and(|total| total <= preview.len());
+            contract::check(contract, *status, complete.then_some(preview.as_slice()))
+        }
+        _ => Vec::new(),
+    };
     let preview = match outcome {
         Outcome::Response { preview, .. } if !preview.is_empty() => {
-            Some(String::from_utf8_lossy(preview).into_owned())
+            let shown = &preview[..preview.len().min(PREVIEW_BYTES)];
+            Some(String::from_utf8_lossy(shown).into_owned())
         }
         _ => None,
     };
     let disclosure = preview.as_deref().and_then(disclosure::detect);
-    let (verdict, severity) = classify(class, outcome, disclosure.is_some());
+    let flagged = disclosure.is_some() || !violations.is_empty();
+    let (verdict, severity) = classify(class, outcome, flagged);
     let mut result = FuzzCaseResult {
         index,
         class,
@@ -841,6 +887,7 @@ fn to_result(
         verdict,
         severity,
         disclosure,
+        violations,
         error: None,
     };
     match outcome {
@@ -877,6 +924,7 @@ fn skipped(index: u32, case: &Case) -> FuzzCaseResult {
         verdict: FuzzVerdict::Skipped,
         severity: None,
         disclosure: None,
+        violations: Vec::new(),
         error: None,
     }
 }
@@ -909,7 +957,17 @@ async fn execute(
     };
 
     let outcome = send(plan, 0, plan.base.clone(), None).await;
-    let baseline = to_result(0, None, "baseline", None, plan.base.len(), &outcome);
+    let baseline = to_result(
+        CaseMeta {
+            index: 0,
+            class: None,
+            label: "baseline",
+            pointer: None,
+            request_bytes: plan.base.len(),
+        },
+        &outcome,
+        plan.contract.as_ref(),
+    );
     emit(&baseline);
 
     let mut notes = Vec::new();
@@ -939,6 +997,12 @@ async fn execute(
             disclosure.evidence
         ));
     }
+    if let Some(first) = baseline.violations.first() {
+        notes.push(format!(
+            "baseline response breaks the documented contract ({}); mutation cases inherit the drift",
+            describe_violation(first)
+        ));
+    }
 
     let mut results: Vec<FuzzCaseResult> = Vec::with_capacity(plan.cases.len());
     let mut unreachable_streak = 0u32;
@@ -955,12 +1019,15 @@ async fn execute(
 
         let outcome = send(plan, index, case.body.clone(), case.path.as_ref()).await;
         let result = to_result(
-            index,
-            Some(case.class),
-            &case.label,
-            case.pointer.clone(),
-            case.body.len(),
+            CaseMeta {
+                index,
+                class: Some(case.class),
+                label: &case.label,
+                pointer: case.pointer.clone(),
+                request_bytes: case.body.len(),
+            },
             &outcome,
+            plan.contract.as_ref(),
         );
         emit(&result);
         if result.verdict == FuzzVerdict::Unreachable {
@@ -1001,6 +1068,12 @@ async fn execute(
             .count(),
     );
     let disclosures = count_u32(results.iter().filter(|r| r.disclosure.is_some()).count());
+    let contract_violations = count_u32(
+        std::iter::once(&baseline)
+            .chain(results.iter())
+            .filter(|r| !r.violations.is_empty())
+            .count(),
+    );
     let wall_us = net::elapsed_us(started);
     hub.publish(TelemetryEvent::FuzzerCompleted {
         seq: hub.next_seq(),
@@ -1011,9 +1084,10 @@ async fn execute(
         faults,
         warnings,
         disclosures,
+        violations: contract_violations,
         aborted: aborted.clone(),
     });
-    tracing::info!(%id, wall_us, faults, warnings, disclosures, aborted = ?aborted, "fuzzer suite completed");
+    tracing::info!(%id, wall_us, faults, warnings, disclosures, contract_violations, aborted = ?aborted, "fuzzer suite completed");
 
     FuzzReport {
         id,
@@ -1027,11 +1101,31 @@ async fn execute(
         faults,
         warnings,
         disclosures,
+        contract_violations,
         aborted,
         notes,
         base_body: String::from_utf8_lossy(&plan.base).into_owned(),
         classes: plan.classes.clone(),
         path_template: plan.path_template.as_ref().map(ToString::to_string),
+    }
+}
+
+fn describe_violation(violation: &ContractViolation) -> String {
+    match &violation.pointer {
+        Some(pointer) if pointer.is_empty() => {
+            format!(
+                "body: expected {}, got {}",
+                violation.expected, violation.actual
+            )
+        }
+        Some(pointer) => format!(
+            "{pointer}: expected {}, got {}",
+            violation.expected, violation.actual
+        ),
+        None => format!(
+            "status {} not documented; {}",
+            violation.actual, violation.expected
+        ),
     }
 }
 
@@ -1095,6 +1189,7 @@ mod tests {
             base_body: None,
             classes: Vec::new(),
             timeout_ms: 5_000,
+            contract: None,
         }
     }
 

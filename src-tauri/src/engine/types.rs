@@ -75,6 +75,8 @@ pub struct ProxyStatus {
     pub profile: FaultProfile,
     /// Evaluated in order before the global profile; the first match wins.
     pub rules: Vec<FaultRule>,
+    /// Response contracts the proxy checks forwarded responses against.
+    pub contracts: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -245,6 +247,8 @@ pub struct FuzzSpec {
     /// Empty selects every class.
     pub classes: Vec<MutationClass>,
     pub timeout_ms: u32,
+    /// Documented responses of the targeted operation; every response is checked against it.
+    pub contract: Option<ResponseContract>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -305,6 +309,9 @@ pub struct FuzzCaseResult {
     /// Stack trace or database error found in the preview, whatever the status. Raises an
     /// otherwise clean mutation case to `Severity::Warn`.
     pub disclosure: Option<Disclosure>,
+    /// Drift from the spec's `contract`; empty without one. Raises an otherwise clean
+    /// mutation case to `Severity::Warn`.
+    pub violations: Vec<ContractViolation>,
     pub error: Option<String>,
 }
 
@@ -337,6 +344,8 @@ pub struct FuzzReport {
     pub warnings: u32,
     /// Mutation cases whose response disclosed a stack trace or database error.
     pub disclosures: u32,
+    /// Requests, baseline included, whose response broke the documented contract.
+    pub contract_violations: u32,
     /// Set when the run stopped early: target unreachable or operator cancel.
     pub aborted: Option<String>,
     /// Context that changes how results read, such as a baseline that was not accepted.
@@ -421,6 +430,8 @@ pub struct DiscoveredRoute {
     pub prefix: Option<String>,
     /// Pretty-printed JSON request body from the OpenAPI `requestBody` (example or schema).
     pub sample_body: Option<String>,
+    /// Documented responses of an OpenAPI operation.
+    pub contract: Option<ResponseContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -442,6 +453,81 @@ pub struct RouteScanReport {
     pub truncated: bool,
     pub routes: Vec<DiscoveredRoute>,
     pub issues: Vec<ScanIssue>,
+}
+
+// ---- response contracts ---------------------------------------------------------------
+
+/// JSON value type as an OpenAPI schema names it. `Integer` is a number without a fraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JsonKind {
+    String,
+    Integer,
+    Number,
+    Boolean,
+    Array,
+    Object,
+    Null,
+}
+
+/// One documented location in the success response body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContractField {
+    /// RFC 6901 pointer from the body root; `""` is the root itself.
+    pub pointer: String,
+    /// Accepted types; empty accepts any value (untyped or composed schema).
+    pub kinds: Vec<JsonKind>,
+    /// Listed in the parent schema's `required`. A nested field is only checked while its
+    /// parent object is present.
+    pub required: bool,
+}
+
+/// Response side of one OpenAPI operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResponseContract {
+    /// Explicit status codes under `responses`, ascending.
+    pub statuses: Vec<u16>,
+    /// Leading digit of each documented range (`4XX` is 4).
+    pub status_classes: Vec<u8>,
+    /// A `default` response documents every status.
+    pub has_default: bool,
+    /// Status whose JSON body `fields` describe: 200, else 201. `None` when neither declares
+    /// a JSON schema.
+    pub body_status: Option<u16>,
+    pub fields: Vec<ContractField>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ContractViolationKind {
+    /// A 2xx or 4xx status the operation does not document.
+    UndocumentedStatus,
+    MissingRequiredField,
+    ResponseTypeMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContractViolation {
+    pub kind: ContractViolationKind,
+    /// Field pointer; `None` for a status violation.
+    pub pointer: Option<String>,
+    /// `integer`, `string | null`, `one of 201, 422, 500`.
+    pub expected: String,
+    /// `string`, `missing`, `404`.
+    pub actual: String,
+}
+
+/// A contract bound to a route template. The proxy matches it like a fault rule, against
+/// the path the upstream receives.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RouteContract {
+    pub method: RouteMethod,
+    pub path: String,
+    pub contract: ResponseContract,
 }
 
 // ---- target lab -----------------------------------------------------------------------
@@ -556,6 +642,10 @@ pub enum TelemetryEvent {
         request_bytes: u64,
         response_bytes: u64,
         error: Option<String>,
+        /// Response contract matched to the upstream path, as `METHOD /pattern`.
+        contract: Option<String>,
+        /// Drift of a forwarded response from `contract`; injected faults are not checked.
+        violations: Vec<ContractViolation>,
     },
     BurstStarted {
         seq: u64,
@@ -615,6 +705,7 @@ pub enum TelemetryEvent {
         faults: u32,
         warnings: u32,
         disclosures: u32,
+        violations: u32,
         aborted: Option<String>,
     },
     /// Lab start, stop, mode switch and reset.

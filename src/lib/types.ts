@@ -64,6 +64,8 @@ export interface ProxyStatus {
   profile: FaultProfile;
   /** Evaluated in order before the global profile; the first match wins. */
   rules: FaultRule[];
+  /** Response contracts the proxy checks forwarded responses against. */
+  contracts: number;
 }
 
 export type FaultKind = "statusMutation" | "connectionDrop";
@@ -179,6 +181,8 @@ export interface FuzzSpec {
   /** Empty selects every class. */
   classes: MutationClass[];
   timeoutMs: number;
+  /** Documented responses of the targeted operation; every response is checked against it. */
+  contract: ResponseContract | null;
 }
 
 export type FuzzVerdict = "rejected" | "accepted" | "serverError" | "transportFailure" | "unreachable" | "skipped";
@@ -215,6 +219,8 @@ export interface FuzzCaseResult {
   severity: Severity | null;
   /** Found in the preview whatever the status; raises a clean mutation case to `warn`. */
   disclosure: Disclosure | null;
+  /** Drift from the spec's `contract`; empty without one. Raises a clean mutation case to `warn`. */
+  violations: ContractViolation[];
   error: string | null;
 }
 
@@ -240,6 +246,8 @@ export interface FuzzReport {
   warnings: number;
   /** Mutation cases whose response disclosed a stack trace or database error. */
   disclosures: number;
+  /** Requests, baseline included, whose response broke the documented contract. */
+  contractViolations: number;
   aborted: string | null;
   notes: string[];
   /** Base payload exactly as sent in the baseline; with `classes` and `pathTemplate` it reproduces any case. */
@@ -298,6 +306,8 @@ export interface DiscoveredRoute {
   prefix: string | null;
   /** Pretty-printed JSON request body from the OpenAPI `requestBody` (example or schema). */
   sampleBody: string | null;
+  /** Documented responses of an OpenAPI operation. */
+  contract: ResponseContract | null;
 }
 
 export interface ScanIssue {
@@ -314,6 +324,49 @@ export interface RouteScanReport {
   truncated: boolean;
   routes: DiscoveredRoute[];
   issues: ScanIssue[];
+}
+
+// ---- response contracts ---------------------------------------------------------------
+
+/** JSON value type as an OpenAPI schema names it; `integer` is a number without a fraction. */
+export type JsonKind = "string" | "integer" | "number" | "boolean" | "array" | "object" | "null";
+
+export interface ContractField {
+  /** RFC 6901 pointer from the body root; `""` is the root itself. */
+  pointer: string;
+  /** Accepted types; empty accepts any value. */
+  kinds: JsonKind[];
+  /** Listed in the parent schema's `required`; nested fields are checked while the parent is present. */
+  required: boolean;
+}
+
+export interface ResponseContract {
+  /** Explicit status codes under `responses`, ascending. */
+  statuses: number[];
+  /** Leading digit of each documented range (`4XX` is 4). */
+  statusClasses: number[];
+  /** A `default` response documents every status. */
+  hasDefault: boolean;
+  /** Status whose JSON body `fields` describe: 200, else 201. */
+  bodyStatus: number | null;
+  fields: ContractField[];
+}
+
+export type ContractViolationKind = "undocumentedStatus" | "missingRequiredField" | "responseTypeMismatch";
+
+export interface ContractViolation {
+  kind: ContractViolationKind;
+  /** Field pointer; `null` for a status violation. */
+  pointer: string | null;
+  expected: string;
+  actual: string;
+}
+
+/** A contract bound to a route template, matched against the path the upstream receives. */
+export interface RouteContract {
+  method: RouteMethod;
+  path: string;
+  contract: ResponseContract;
 }
 
 // ---- target lab -----------------------------------------------------------------------
@@ -403,6 +456,10 @@ export type TelemetryEvent =
       requestBytes: number;
       responseBytes: number;
       error: string | null;
+      /** Response contract matched to the upstream path, as `METHOD /pattern`. */
+      contract: string | null;
+      /** Drift of a forwarded response from `contract`; injected faults are not checked. */
+      violations: ContractViolation[];
     }
   | {
       kind: "burstStarted";
@@ -468,6 +525,7 @@ export type TelemetryEvent =
       faults: number;
       warnings: number;
       disclosures: number;
+      violations: number;
       aborted: string | null;
     }
   | {
@@ -507,6 +565,7 @@ export type EngineErrorCode =
   | "PROXY_LOOP"
   | "INVALID_FAULT_PROFILE"
   | "INVALID_FAULT_RULE"
+  | "INVALID_CONTRACT_SET"
   | "INVALID_BURST_SPEC"
   | "INVALID_FUZZ_SPEC"
   | "FUZZER_BUSY"
@@ -526,6 +585,7 @@ export type EngineError =
   | { code: "PROXY_LOOP"; message: string; addr: string }
   | { code: "INVALID_FAULT_PROFILE"; message: string; field: string }
   | { code: "INVALID_FAULT_RULE"; message: string; index: number }
+  | { code: "INVALID_CONTRACT_SET"; message: string; index: number }
   | { code: "INVALID_BURST_SPEC"; message: string; field: string }
   | { code: "INVALID_FUZZ_SPEC"; message: string; field: string }
   | { code: "FUZZER_BUSY"; message: string }

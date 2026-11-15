@@ -1,4 +1,5 @@
 pub mod concurrency;
+pub mod contract;
 pub mod disclosure;
 pub mod error;
 pub mod fault;

@@ -38,6 +38,8 @@ import { useLab } from "./hooks/useLab";
 import { sameProfile, useProxy } from "./hooks/useProxy";
 import { useRouteScan } from "./hooks/useRouteScan";
 import { useTelemetry } from "./hooks/useTelemetry";
+import { routeContracts } from "./lib/contract";
+import { ipcAvailable } from "./lib/ipc";
 import { originOf, type RequestOrigin } from "./lib/request";
 import { toBurstMethod, type RequestTarget } from "./lib/routes";
 import { DEFAULT_LISTEN_PORT } from "./lib/rules";
@@ -70,7 +72,15 @@ export function App() {
   const [burstOrigin, setBurstOrigin] = useState<string | null>(null);
   const [fuzzPayload, setFuzzPayload] = useState("");
 
-  const { status: proxyStatus, applyFaults, stop: stopProxy } = proxy;
+  const { status: proxyStatus, applyFaults, stop: stopProxy, applyContracts } = proxy;
+
+  // The route list in view is the contract source: a project scan or the lab document
+  // replaces the proxy's contract set, and a report without OpenAPI routes clears it.
+  const routeReport = routeScan.report;
+  useEffect(() => {
+    if (!ipcAvailable || routeReport === null) return;
+    applyContracts(routeContracts(routeReport.routes));
+  }, [routeReport, applyContracts]);
 
   const selectRoute = useCallback((route: DiscoveredRoute) => {
     setSelectedRoute(route);

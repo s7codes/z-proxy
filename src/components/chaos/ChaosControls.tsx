@@ -6,6 +6,7 @@ import type { FuzzerControl } from "../../hooks/useFuzzer";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import type { ProxyControl } from "../../hooks/useProxy";
 import type { FuzzerProgress } from "../../hooks/useTelemetry";
+import { contractFor } from "../../lib/contract";
 import type { RequestOrigin } from "../../lib/request";
 import { METHOD_BADGE, type RequestTarget } from "../../lib/routes";
 import { DEFAULT_LISTEN_PORT, summarizeProfile } from "../../lib/rules";
@@ -106,6 +107,7 @@ export function ChaosControls(props: ChaosControlsProps) {
           payload={props.fuzzPayload}
           onPayload={props.onFuzzPayload}
           sampleBody={sampleBody}
+          contract={contractFor(route, target.method, target.path)}
           onSendToBurst={props.onReplayInBurst}
         />
       )}
@@ -186,6 +188,14 @@ function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget }: Faults
         <span className="num truncate text-fg" title={proxy.status?.upstream ?? upstream ?? undefined}>
           {proxy.status?.upstream ?? upstream ?? "no validated target"}
         </span>
+        {(proxy.status?.contracts ?? 0) > 0 && (
+          <span
+            className="num ml-auto shrink-0 text-fg-faint"
+            title="OpenAPI response contracts from the route list; forwarded responses are checked against them"
+          >
+            {proxy.status?.contracts} contracts
+          </span>
+        )}
       </div>
 
       {proxy.error !== null && <ErrorLine error={proxy.error} />}

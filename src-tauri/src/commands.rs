@@ -13,7 +13,7 @@ use crate::engine::net;
 use crate::engine::types::{
     BurstReport, BurstSpec, EngineStatus, FuzzCasePayload, FuzzCaseRef, FuzzReport, FuzzSpec,
     LabConfig, LabMode, LabStatus, ProbeResult, ProxyConfig, ProxyStatus, ReportFormat,
-    RouteScanReport, TelemetryEvent, ValidatedTarget, Verdict,
+    RouteContract, RouteScanReport, TelemetryEvent, ValidatedTarget, Verdict,
 };
 use crate::report;
 use crate::scanner::routes;
@@ -140,6 +140,16 @@ pub async fn set_fault_rules(
     rules: Vec<FaultRule>,
 ) -> Result<ProxyStatus, EngineError> {
     state.proxy.set_rules(rules).await
+}
+
+/// Replaces the response contracts forwarded responses are checked against; an invalid
+/// template rejects the set and keeps the active one.
+#[tauri::command]
+pub async fn set_proxy_contracts(
+    state: State<'_, AppState>,
+    contracts: Vec<RouteContract>,
+) -> Result<ProxyStatus, EngineError> {
+    state.proxy.set_contracts(contracts).await
 }
 
 #[tauri::command]

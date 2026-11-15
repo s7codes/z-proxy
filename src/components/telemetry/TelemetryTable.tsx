@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { TelemetryStore } from "../../hooks/useTelemetry";
 import { TELEMETRY_CAPACITY } from "../../hooks/useTelemetry";
+import { summarizeViolations } from "../../lib/contract";
 import { DISCLOSURE_LABEL } from "../../lib/disclosure";
 import { formatBytes, formatLatency, formatTimestamp, formatUptime } from "../../lib/format";
 import { ipcAvailable } from "../../lib/ipc";
@@ -182,11 +183,12 @@ function toRow(event: TelemetryEvent): Row {
           .join("  "),
       };
     }
-    case "proxyExchange":
+    case "proxyExchange": {
+      const drift = summarizeViolations(event.violations);
       return {
         ...base,
         kind: "PROXY",
-        kindTone: event.fault === null ? "muted" : "warn",
+        kindTone: event.fault === null && drift === null ? "muted" : "warn",
         target: `${event.method} ${event.path}`,
         result: event.status === null ? "RST" : String(event.status),
         resultTone: event.status === null ? "fault" : httpStatusTone(event.status),
@@ -194,6 +196,7 @@ function toRow(event: TelemetryEvent): Row {
         detail: [
           event.fault === "statusMutation" ? "injected status" : null,
           event.fault === "connectionDrop" ? "injected reset" : null,
+          drift === null ? null : `drift ${drift}`,
           event.rule === null ? null : `rule ${event.rule}`,
           event.injectedDelayUs > 0 ? `+${formatLatency(event.injectedDelayUs)} delay` : null,
           event.upstreamLatencyUs === null ? null : `upstream ${formatLatency(event.upstreamLatencyUs)}`,
@@ -204,6 +207,7 @@ function toRow(event: TelemetryEvent): Row {
           .filter((part) => part !== null)
           .join("  "),
       };
+    }
     case "burstStarted":
       return {
         ...base,
@@ -287,6 +291,7 @@ function toRow(event: TelemetryEvent): Row {
           result.error ??
           [
             result.disclosure === null ? null : `leak ${DISCLOSURE_LABEL[result.disclosure.kind]}: ${result.disclosure.evidence}`,
+            result.violations.length === 0 ? null : `drift ${summarizeViolations(result.violations) ?? ""}`,
             `req ${formatBytes(result.requestBytes)}`,
             `res ${formatBytes(result.responseBytes)}`,
           ]
@@ -303,7 +308,13 @@ function toRow(event: TelemetryEvent): Row {
         result: event.faults > 0 ? `${event.faults} FAULT` : event.aborted !== null ? "ABORTED" : "CLEAN",
         resultTone: event.faults > 0 ? "fault" : event.aborted !== null ? "warn" : "ok",
         latency: formatLatency(event.wallUs),
-        detail: [`${event.cases} cases`, `${event.warnings} warn`, `${event.disclosures} leaks`, event.aborted]
+        detail: [
+          `${event.cases} cases`,
+          `${event.warnings} warn`,
+          `${event.disclosures} leaks`,
+          event.violations > 0 ? `${event.violations} drift` : null,
+          event.aborted,
+        ]
           .filter((part) => part !== null)
           .join("  "),
       };

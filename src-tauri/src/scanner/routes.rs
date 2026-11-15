@@ -17,7 +17,9 @@ use walkdir::{DirEntry, WalkDir};
 use super::lex::{Lang, Source};
 use super::{axum, go, next, node, openapi};
 use crate::engine::error::{EngineError, EngineResult};
-use crate::engine::types::{DiscoveredRoute, RouteMethod, RouteScanReport, RouteSource, ScanIssue};
+use crate::engine::types::{
+    DiscoveredRoute, ResponseContract, RouteMethod, RouteScanReport, RouteSource, ScanIssue,
+};
 
 /// Build output, dependency and VCS trees: large, never hand-written, and full of route
 /// declarations that belong to third-party code.
@@ -56,6 +58,8 @@ pub struct RawRoute {
     pub prefix: Option<String>,
     /// Pretty-printed JSON request body derived from an OpenAPI definition.
     pub sample_body: Option<String>,
+    /// Documented responses of an OpenAPI operation.
+    pub contract: Option<ResponseContract>,
 }
 
 impl RawRoute {
@@ -67,11 +71,17 @@ impl RawRoute {
             line,
             prefix: None,
             sample_body: None,
+            contract: None,
         }
     }
 
     pub fn with_sample(mut self, sample_body: Option<String>) -> Self {
         self.sample_body = sample_body;
+        self
+    }
+
+    pub fn with_contract(mut self, contract: Option<ResponseContract>) -> Self {
+        self.contract = contract;
         self
     }
 
@@ -285,6 +295,7 @@ pub fn discovered(route: RawRoute, file: &str) -> DiscoveredRoute {
         line: route.line,
         prefix,
         sample_body: route.sample_body,
+        contract: route.contract,
     }
 }
 
@@ -664,6 +675,16 @@ mod tests {
         let lookup = &report.routes[3];
         assert_eq!(lookup.params, ["orderId"]);
         assert_eq!(lookup.sample_body, None);
+        let contract = lookup.contract.as_ref().unwrap();
+        assert_eq!(contract.statuses, [200, 404, 422]);
+        assert_eq!(contract.body_status, Some(200));
+        let total = contract
+            .fields
+            .iter()
+            .find(|f| f.pointer == "/totalCents")
+            .unwrap();
+        assert!(total.required);
+        assert_eq!(total.kinds, [crate::engine::types::JsonKind::Integer]);
         let body = |path: &str| -> serde_json::Value {
             let route = report.routes.iter().find(|r| r.path == path).unwrap();
             serde_json::from_str(route.sample_body.as_deref().unwrap()).unwrap()

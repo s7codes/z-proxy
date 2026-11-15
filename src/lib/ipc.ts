@@ -17,6 +17,7 @@ import type {
   ProxyConfig,
   ProxyStatus,
   ReportFormat,
+  RouteContract,
   RouteScanReport,
   TelemetryEvent,
   ValidatedTarget,
@@ -43,6 +44,7 @@ const ENGINE_CODES: ReadonlySet<string> = new Set<EngineErrorCode>([
   "PROXY_LOOP",
   "INVALID_FAULT_PROFILE",
   "INVALID_FAULT_RULE",
+  "INVALID_CONTRACT_SET",
   "INVALID_BURST_SPEC",
   "INVALID_FUZZ_SPEC",
   "FUZZER_BUSY",
@@ -111,6 +113,11 @@ export function setFaultProfile(armed: boolean, profile: FaultProfile): Promise<
 /** Replaces the whole rule set; an invalid rule rejects the set and keeps the active one. */
 export function setFaultRules(rules: FaultRule[]): Promise<IpcResult<ProxyStatus>> {
   return call<ProxyStatus>("set_fault_rules", { rules });
+}
+
+/** Replaces the response contracts the proxy checks; an invalid template keeps the active set. */
+export function setProxyContracts(contracts: RouteContract[]): Promise<IpcResult<ProxyStatus>> {
+  return call<ProxyStatus>("set_proxy_contracts", { contracts });
 }
 
 export function runConcurrencyBurst(spec: BurstSpec): Promise<IpcResult<BurstReport>> {
