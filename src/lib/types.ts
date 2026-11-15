@@ -155,6 +155,22 @@ export interface FuzzSpec {
 
 export type FuzzVerdict = "rejected" | "accepted" | "serverError" | "transportFailure" | "unreachable" | "skipped";
 
+/** Runtime or database internals exposed in a response body. */
+export type DisclosureKind =
+  | "nodeStackTrace"
+  | "pythonTraceback"
+  | "rustPanic"
+  | "goPanic"
+  | "jvmStackTrace"
+  | "dotNetStackTrace"
+  | "sqlError";
+
+export interface Disclosure {
+  kind: DisclosureKind;
+  /** Matched fragment, trimmed to 160 characters. */
+  evidence: string;
+}
+
 export interface FuzzCaseResult {
   index: number;
   /** `null` for the unmutated baseline request. */
@@ -169,6 +185,8 @@ export interface FuzzCaseResult {
   responsePreview: string | null;
   verdict: FuzzVerdict;
   severity: Severity | null;
+  /** Found in the preview whatever the status; raises a clean mutation case to `warn`. */
+  disclosure: Disclosure | null;
   error: string | null;
 }
 
@@ -192,6 +210,8 @@ export interface FuzzReport {
   summary: ClassSummary[];
   faults: number;
   warnings: number;
+  /** Mutation cases whose response disclosed a stack trace or database error. */
+  disclosures: number;
   aborted: string | null;
   notes: string[];
 }
@@ -353,6 +373,7 @@ export type TelemetryEvent =
       cases: number;
       faults: number;
       warnings: number;
+      disclosures: number;
       aborted: string | null;
     };
 

@@ -3,6 +3,7 @@ import { FlaskConical, Square } from "lucide-react";
 import type { FuzzerControl } from "../../hooks/useFuzzer";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import type { FuzzerProgress } from "../../hooks/useTelemetry";
+import { DISCLOSURE_LABEL } from "../../lib/disclosure";
 import { formatBytes, formatLatency } from "../../lib/format";
 import { joinTarget, originOf, parseHeaders } from "../../lib/request";
 import { unresolvedParams, type RequestTarget } from "../../lib/routes";
@@ -258,10 +259,11 @@ function FuzzReportView({ report }: { report: FuzzReport }) {
   return (
     <>
       <Section title="Result" aside={<span className="num text-2xs text-fg-faint">{report.id.slice(0, 8)}</span>}>
-        <div className="num mb-2 grid grid-cols-4 gap-px border border-line bg-line text-xs">
+        <div className="num mb-2 grid grid-cols-5 gap-px border border-line bg-line text-xs">
           <Metric label="cases" value={executed === report.cases.length ? String(executed) : `${executed}/${report.cases.length}`} />
           <Metric label="faults" value={String(report.faults)} tone={report.faults > 0 ? "fault" : undefined} />
           <Metric label="warns" value={String(report.warnings)} tone={report.warnings > 0 ? "warn" : undefined} />
+          <Metric label="leaks" value={String(report.disclosures)} tone={report.disclosures > 0 ? "warn" : undefined} />
           <Metric label="wall" value={formatLatency(report.wallUs)} />
         </div>
         <div className="num grid grid-cols-[64px_1fr_auto] items-center text-xs">
@@ -314,7 +316,7 @@ function FuzzReportView({ report }: { report: FuzzReport }) {
         {findings.length === 0 ? (
           <div className="flex items-center gap-1.5 text-xs text-ok">
             <StatusSquare className="bg-ok" />
-            No 5xx or transport failures across {executed} cases
+            No 5xx, transport failures or leaked traces across {executed} cases
           </div>
         ) : (
           <div className="flex flex-col gap-1.5">
@@ -370,6 +372,12 @@ function FindingRow({
         </span>
       </button>
       {result.error !== null && <div className="num text-2xs text-fg-dim">{result.error}</div>}
+      {result.disclosure !== null && (
+        <div className="num flex min-w-0 items-center gap-1.5 text-2xs" title={result.disclosure.evidence}>
+          <span className="shrink-0 text-warn">{DISCLOSURE_LABEL[result.disclosure.kind]}</span>
+          <span className="truncate text-fg-dim">{result.disclosure.evidence}</span>
+        </div>
+      )}
       {expanded && result.responsePreview !== null && (
         <pre className="num mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-xs border border-line bg-bg p-1.5 text-2xs leading-4 text-fg-dim select-text">
           {result.responsePreview}

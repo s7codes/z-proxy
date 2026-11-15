@@ -17,6 +17,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use super::disclosure;
 use super::error::{EngineError, EngineResult};
 use super::http1::{self, OpenError, RequestTemplate, CONNECT_TIMEOUT};
 use super::net;
@@ -34,7 +35,9 @@ const MAX_BASE_BYTES: usize = 256 * 1024;
 const MAX_FIELDS: usize = 48;
 const MAX_DEPTH: usize = 3;
 const MAX_CASES: usize = 1_024;
-const PREVIEW_BYTES: usize = 512;
+/// Long enough to hold the exception line and the first frames of a leaked trace, which is
+/// where the disclosure signatures look.
+const PREVIEW_BYTES: usize = 2 * 1024;
 /// Consecutive connect failures that end a run: the target is down, not flaky.
 const UNREACHABLE_LIMIT: u32 = 3;
 const USER_AGENT: &str = concat!("chaosproxy-fuzzer/", env!("CARGO_PKG_VERSION"));
@@ -559,7 +562,11 @@ async fn send(plan: &Plan, index: u32, body: Bytes) -> Outcome {
     }
 }
 
-fn classify(class: Option<MutationClass>, outcome: &Outcome) -> (FuzzVerdict, Option<Severity>) {
+fn classify(
+    class: Option<MutationClass>,
+    outcome: &Outcome,
+    disclosed: bool,
+) -> (FuzzVerdict, Option<Severity>) {
     let (verdict, severity) = match outcome {
         Outcome::Response { status, .. } if *status >= 500 => {
             (FuzzVerdict::ServerError, Some(Severity::Fault))
@@ -574,6 +581,9 @@ fn classify(class: Option<MutationClass>, outcome: &Outcome) -> (FuzzVerdict, Op
         Outcome::Transport { .. } => (FuzzVerdict::TransportFailure, Some(Severity::Fault)),
         Outcome::Unreachable { .. } => (FuzzVerdict::Unreachable, None),
     };
+    // A trace inside a 4xx is still a leak: validation rejected the payload, but only after
+    // the exception reached the response serializer.
+    let severity = severity.or(disclosed.then_some(Severity::Warn));
     // The baseline is context for the mutations, not a finding of its own.
     (verdict, if class.is_none() { None } else { severity })
 }
@@ -586,7 +596,14 @@ fn to_result(
     request_bytes: usize,
     outcome: &Outcome,
 ) -> FuzzCaseResult {
-    let (verdict, severity) = classify(class, outcome);
+    let preview = match outcome {
+        Outcome::Response { preview, .. } if !preview.is_empty() => {
+            Some(String::from_utf8_lossy(preview).into_owned())
+        }
+        _ => None,
+    };
+    let disclosure = preview.as_deref().and_then(disclosure::detect);
+    let (verdict, severity) = classify(class, outcome, disclosure.is_some());
     let mut result = FuzzCaseResult {
         index,
         class,
@@ -596,23 +613,22 @@ fn to_result(
         status: None,
         latency_us: 0,
         response_bytes: 0,
-        response_preview: None,
+        response_preview: preview,
         verdict,
         severity,
+        disclosure,
         error: None,
     };
     match outcome {
         Outcome::Response {
             status,
             bytes,
-            preview,
             latency_us,
+            ..
         } => {
             result.status = Some(*status);
             result.response_bytes = *bytes;
             result.latency_us = *latency_us;
-            result.response_preview =
-                (!preview.is_empty()).then(|| String::from_utf8_lossy(preview).into_owned());
         }
         Outcome::Transport { error, latency_us } => {
             result.error = Some(error.clone());
@@ -636,6 +652,7 @@ fn skipped(index: u32, case: &Case) -> FuzzCaseResult {
         response_preview: None,
         verdict: FuzzVerdict::Skipped,
         severity: None,
+        disclosure: None,
         error: None,
     }
 }
@@ -691,6 +708,12 @@ async fn execute(
             baseline.error.as_deref().unwrap_or("unknown error")
         )),
         _ => {}
+    }
+    if let Some(disclosure) = &baseline.disclosure {
+        notes.push(format!(
+            "baseline response already discloses internals ({}); disclosures below may not be caused by their mutation",
+            disclosure.evidence
+        ));
     }
 
     let mut results: Vec<FuzzCaseResult> = Vec::with_capacity(plan.cases.len());
@@ -753,6 +776,7 @@ async fn execute(
             .filter(|r| r.severity == Some(Severity::Warn))
             .count(),
     );
+    let disclosures = count_u32(results.iter().filter(|r| r.disclosure.is_some()).count());
     let wall_us = net::elapsed_us(started);
     hub.publish(TelemetryEvent::FuzzerCompleted {
         seq: hub.next_seq(),
@@ -762,9 +786,10 @@ async fn execute(
         cases: total,
         faults,
         warnings,
+        disclosures,
         aborted: aborted.clone(),
     });
-    tracing::info!(%id, wall_us, faults, warnings, aborted = ?aborted, "fuzzer suite completed");
+    tracing::info!(%id, wall_us, faults, warnings, disclosures, aborted = ?aborted, "fuzzer suite completed");
 
     FuzzReport {
         id,
@@ -777,6 +802,7 @@ async fn execute(
         summary,
         faults,
         warnings,
+        disclosures,
         aborted,
         notes,
     }
@@ -832,6 +858,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::engine::types::DisclosureKind;
 
     fn spec(target: String) -> FuzzSpec {
         FuzzSpec {
@@ -1092,6 +1119,10 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("TypeError"));
+        let leak = null_name.disclosure.as_ref().unwrap();
+        assert_eq!(leak.kind, DisclosureKind::NodeStackTrace);
+        assert_eq!(leak.evidence, "at createOrder (/srv/orders.js:42:17)");
+        assert_eq!(report.disclosures, 1);
 
         for case in report
             .cases
@@ -1133,6 +1164,95 @@ mod tests {
             }
         }
         assert_eq!(kinds, (1, 87, 1));
+    }
+
+    /// Express default error handler in development mode: malformed JSON is rejected with
+    /// 400, but the body-parser stack trace is serialized into the response.
+    fn leaky_parser(_: usize, body: Bytes) -> Result<(u16, &'static str), io::Error> {
+        if serde_json::from_slice::<Value>(&body).is_ok() {
+            return Ok((201, "created"));
+        }
+        Ok((
+            400,
+            "SyntaxError: Unexpected token } in JSON at position 41\n    at JSON.parse (<anonymous>)\n    at parse (/srv/node_modules/body-parser/lib/types/json.js:92:19)",
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stack_traces_in_rejections_are_warnings() {
+        let addr = serve(leaky_parser, None).await;
+        let hub = TelemetryHub::new();
+        let mut events = hub.subscribe();
+        let mut fuzz = spec(format!("http://{addr}/orders"));
+        fuzz.classes = vec![MutationClass::MalformedJson, MutationClass::NullInjection];
+
+        let report = run(fuzz, &hub, &FuzzerSlot::default()).await.unwrap();
+
+        assert_eq!(report.baseline.disclosure, None);
+        assert!(report.notes.is_empty(), "{:?}", report.notes);
+        let malformed: Vec<&FuzzCaseResult> = report
+            .cases
+            .iter()
+            .filter(|c| c.class == Some(MutationClass::MalformedJson))
+            .collect();
+        assert_eq!(malformed.len(), 8);
+        for case in &malformed {
+            assert_eq!(case.verdict, FuzzVerdict::Rejected, "{}", case.label);
+            assert_eq!(case.severity, Some(Severity::Warn), "{}", case.label);
+            let leak = case.disclosure.as_ref().unwrap();
+            assert_eq!(leak.kind, DisclosureKind::NodeStackTrace);
+            assert!(leak.evidence.contains("body-parser"), "{}", leak.evidence);
+        }
+        assert!(report
+            .cases
+            .iter()
+            .filter(|c| c.class == Some(MutationClass::NullInjection))
+            .all(|c| c.severity.is_none() && c.disclosure.is_none()));
+        assert_eq!(
+            (report.faults, report.warnings, report.disclosures),
+            (0, 8, 8)
+        );
+
+        let mut completed = None;
+        while let Ok(event) = events.try_recv() {
+            if let TelemetryEvent::FuzzerCompleted { disclosures, .. } = event {
+                completed = Some(disclosures);
+            }
+        }
+        assert_eq!(completed, Some(8));
+    }
+
+    #[test]
+    fn disclosure_raises_only_clean_mutation_cases() {
+        let rejected = Outcome::Response {
+            status: 422,
+            bytes: 10,
+            preview: Vec::new(),
+            latency_us: 1,
+        };
+        let crashed = Outcome::Response {
+            status: 500,
+            bytes: 10,
+            preview: Vec::new(),
+            latency_us: 1,
+        };
+        let class = Some(MutationClass::NullInjection);
+        assert_eq!(
+            classify(class, &rejected, true),
+            (FuzzVerdict::Rejected, Some(Severity::Warn))
+        );
+        assert_eq!(
+            classify(class, &rejected, false),
+            (FuzzVerdict::Rejected, None)
+        );
+        assert_eq!(
+            classify(class, &crashed, true),
+            (FuzzVerdict::ServerError, Some(Severity::Fault))
+        );
+        assert_eq!(
+            classify(None, &rejected, true),
+            (FuzzVerdict::Rejected, None)
+        );
     }
 
     fn crash_on_third(n: usize, _: Bytes) -> Result<(u16, &'static str), io::Error> {

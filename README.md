@@ -178,8 +178,26 @@ sets one.
 Three consecutive connect failures abort the run; the remaining cases are `skipped` and the last
 case that reached the service is marked as a fault. A baseline that was not accepted is reported
 as a note. One suite runs at a time (`FUZZER_BUSY`); `cancel_fuzzer_suite` stops between cases.
-Response bodies are fingerprinted in full and the first 512 bytes are kept as a preview, which
-shows stack traces leaked by 5xx handlers.
+Response bodies are fingerprinted in full and the first 2 KiB are kept as a preview.
+
+The preview of every response, whatever its status, is checked for disclosure signatures
+(`engine/disclosure.rs`). A match is attached to the case as `disclosure { kind, evidence }` and
+raises a case without other findings to severity warn, so a 400 that serializes a parser stack
+trace is reported even though the payload was rejected. Patterns require structure, not
+keywords, and accept JSON-escaped (`\n`) traces:
+
+| Kind               | Signature                                                                  |
+|--------------------|----------------------------------------------------------------------------|
+| `nodeStackTrace`   | `at fn (path.js:line:col)`, `.mjs/.cjs/.ts/.tsx/.jsx`, `node:internal` frames |
+| `pythonTraceback`  | `Traceback (most recent call last)`, `File "x.py", line N, in`             |
+| `rustPanic`        | `panicked at src/x.rs:line:col`                                            |
+| `goPanic`          | `goroutine N [state]:`, `panic: runtime error:`                            |
+| `jvmStackTrace`    | `at pkg.Class.method(File.java:N)` (also `.kt`, `.scala`)                  |
+| `dotNetStackTrace` | `at Ns.Type.Method(..) in path:line N`                                     |
+| `sqlError`         | MySQL syntax error, PostgreSQL `syntax error at or near` / `invalid input syntax` / missing relation, `SQLSTATE[..]`, `ORA-NNNNN`, SQLite, psycopg2, MSSQL unclosed quotation |
+
+Runtime traces take precedence over database errors found in the same body. The report counts
+affected mutation cases in `disclosures`; a disclosing baseline is reported as a note.
 
 ## IPC
 

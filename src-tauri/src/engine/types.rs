@@ -240,6 +240,27 @@ pub enum FuzzVerdict {
     Skipped,
 }
 
+/// Runtime or database internals exposed in a response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DisclosureKind {
+    NodeStackTrace,
+    PythonTraceback,
+    RustPanic,
+    GoPanic,
+    JvmStackTrace,
+    DotNetStackTrace,
+    SqlError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Disclosure {
+    pub kind: DisclosureKind,
+    /// Matched fragment, trimmed to 160 characters.
+    pub evidence: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FuzzCaseResult {
@@ -253,10 +274,13 @@ pub struct FuzzCaseResult {
     pub status: Option<u16>,
     pub latency_us: u64,
     pub response_bytes: u64,
-    /// Leading response bytes, lossily decoded; stack traces leaked in 5xx bodies show here.
+    /// Leading response bytes, lossily decoded.
     pub response_preview: Option<String>,
     pub verdict: FuzzVerdict,
     pub severity: Option<Severity>,
+    /// Stack trace or database error found in the preview, whatever the status. Raises an
+    /// otherwise clean mutation case to `Severity::Warn`.
+    pub disclosure: Option<Disclosure>,
     pub error: Option<String>,
 }
 
@@ -287,6 +311,8 @@ pub struct FuzzReport {
     pub summary: Vec<ClassSummary>,
     pub faults: u32,
     pub warnings: u32,
+    /// Mutation cases whose response disclosed a stack trace or database error.
+    pub disclosures: u32,
     /// Set when the run stopped early: target unreachable or operator cancel.
     pub aborted: Option<String>,
     /// Context that changes how results read, such as a baseline that was not accepted.
@@ -470,6 +496,7 @@ pub enum TelemetryEvent {
         cases: u32,
         faults: u32,
         warnings: u32,
+        disclosures: u32,
         aborted: Option<String>,
     },
 }

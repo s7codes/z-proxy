@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { TelemetryStore } from "../../hooks/useTelemetry";
 import { TELEMETRY_CAPACITY } from "../../hooks/useTelemetry";
+import { DISCLOSURE_LABEL } from "../../lib/disclosure";
 import { formatBytes, formatLatency, formatTimestamp, formatUptime } from "../../lib/format";
 import { ipcAvailable } from "../../lib/ipc";
 import { httpStatusTone, TONE_TEXT, type Tone } from "../../lib/tone";
@@ -276,7 +277,15 @@ function toRow(event: TelemetryEvent): Row {
         result: result.status === null ? fuzzVerdictLabel(result.verdict) : String(result.status),
         resultTone: result.status === null ? (result.verdict === "unreachable" ? "warn" : "fault") : httpStatusTone(result.status),
         latency: result.latencyUs === 0 ? "-" : formatLatency(result.latencyUs),
-        detail: result.error ?? `req ${formatBytes(result.requestBytes)}  res ${formatBytes(result.responseBytes)}`,
+        detail:
+          result.error ??
+          [
+            result.disclosure === null ? null : `leak ${DISCLOSURE_LABEL[result.disclosure.kind]}: ${result.disclosure.evidence}`,
+            `req ${formatBytes(result.requestBytes)}`,
+            `res ${formatBytes(result.responseBytes)}`,
+          ]
+            .filter((part) => part !== null)
+            .join("  "),
       };
     }
     case "fuzzerCompleted":
@@ -288,7 +297,9 @@ function toRow(event: TelemetryEvent): Row {
         result: event.faults > 0 ? `${event.faults} FAULT` : event.aborted !== null ? "ABORTED" : "CLEAN",
         resultTone: event.faults > 0 ? "fault" : event.aborted !== null ? "warn" : "ok",
         latency: formatLatency(event.wallUs),
-        detail: [`${event.cases} cases`, `${event.warnings} warn`, event.aborted].filter((part) => part !== null).join("  "),
+        detail: [`${event.cases} cases`, `${event.warnings} warn`, `${event.disclosures} leaks`, event.aborted]
+          .filter((part) => part !== null)
+          .join("  "),
       };
   }
 }
