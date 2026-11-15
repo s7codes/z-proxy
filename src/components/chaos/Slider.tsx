@@ -19,12 +19,15 @@ export function Slider({ label, unit, min, max, step, value, disabled = false, o
   };
 
   return (
-    <div className={`grid grid-cols-[52px_1fr_76px] items-center gap-2 ${disabled ? "opacity-40" : ""}`}>
+    // minmax(0,1fr): a range input's intrinsic width (~129px in Chromium) would otherwise push
+    // the numeric field past the panel edge at the 260px minimum panel width.
+    <div className={`grid grid-cols-[52px_minmax(0,1fr)_76px] items-center gap-2 ${disabled ? "opacity-40" : ""}`}>
       <label htmlFor={id} className="text-xs text-fg-dim">
         {label}
       </label>
       <input
         id={id}
+        className="w-full min-w-0"
         type="range"
         min={min}
         max={max}

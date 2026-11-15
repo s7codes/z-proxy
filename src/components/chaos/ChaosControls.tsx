@@ -68,12 +68,16 @@ function FaultsTab({ profile, onChange, link, guard, proxy }: FaultsTabProps) {
 
   return (
     <>
-      <div className="flex h-7 shrink-0 items-center gap-1.5 border-b border-line px-2.5 text-xs">
-        <StatusSquare className={running ? "bg-ok" : "bg-muted"} />
-        <span className="num truncate text-fg-dim">
-          {running ? `listener ${proxy.status?.listener ?? "-"}` : "listener offline"}
-        </span>
-        <div className="ml-auto flex items-center gap-1">
+      {/* Wraps instead of truncating: below ~280px the controls move to a second line so the
+          bound address stays readable. */}
+      <div className="flex min-h-7 shrink-0 flex-wrap items-center gap-x-1.5 gap-y-1 border-b border-line px-2.5 py-[3px] text-xs">
+        <div className="flex min-w-0 flex-1 basis-36 items-center gap-1.5">
+          <StatusSquare className={running ? "bg-ok" : "bg-muted"} />
+          <span className="num truncate text-fg-dim">
+            {running ? `listener ${proxy.status?.listener ?? "-"}` : "listener offline"}
+          </span>
+        </div>
+        <div className="ml-auto flex shrink-0 items-center gap-1">
           <label className="flex h-5 items-center rounded-xs border border-line bg-bg pl-1.5 focus-within:border-fg-faint">
             <span className="text-2xs text-fg-faint">port</span>
             <input
