@@ -85,6 +85,20 @@ export function Field({
   );
 }
 
+/** Footer under a payload field when the selected route carries an OpenAPI body sample. */
+export function SampleHint({ active, onLoad }: { active: boolean; onLoad: () => void }) {
+  return (
+    <div className="flex items-center gap-2 pt-0.5 text-2xs text-fg-faint">
+      <span>{active ? "OpenAPI request body sample" : "Route has an OpenAPI body sample"}</span>
+      {!active && (
+        <button type="button" onClick={onLoad} className="ml-auto text-fg-dim hover:text-fg">
+          Load sample
+        </button>
+      )}
+    </div>
+  );
+}
+
 export function Metric({ label, value, tone }: { label: string; value: string; tone?: Tone | undefined }) {
   return (
     <div className="flex flex-col bg-bg px-1.5 py-1">

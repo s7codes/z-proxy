@@ -362,6 +362,8 @@ pub struct DiscoveredRoute {
     pub line: u32,
     /// Normalized mount prefix resolved within the declaring file; already part of `path`.
     pub prefix: Option<String>,
+    /// Pretty-printed JSON request body from the OpenAPI `requestBody` (example or schema).
+    pub sample_body: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

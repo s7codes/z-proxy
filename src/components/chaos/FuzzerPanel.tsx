@@ -59,12 +59,24 @@ interface FuzzerPanelProps {
   online: boolean;
   target: RequestTarget;
   onTarget: (target: RequestTarget) => void;
+  payload: string;
+  onPayload: (payload: string) => void;
+  sampleBody: string | null;
 }
 
-export function FuzzerPanel({ guard, fuzzer, progress, online, target: request, onTarget }: FuzzerPanelProps) {
+export function FuzzerPanel({
+  guard,
+  fuzzer,
+  progress,
+  online,
+  target: request,
+  onTarget,
+  payload,
+  onPayload: setPayload,
+  sampleBody,
+}: FuzzerPanelProps) {
   const { method, path } = request;
   const [headerText, setHeaderText] = useState("");
-  const [payload, setPayload] = useState("");
   const [selected, setSelected] = useState<ReadonlySet<MutationClass>>(() => new Set(CLASSES.map((c) => c.id)));
   const [timeoutMs, setTimeoutMs] = useState(5_000);
 
@@ -133,11 +145,24 @@ export function FuzzerPanel({ guard, fuzzer, progress, online, target: request, 
               className="num w-full min-w-0 resize-y rounded-xs border border-line bg-bg px-1.5 py-1 text-xs text-fg-bright outline-none placeholder:text-fg-faint focus:border-fg-faint"
             />
             <div className="flex items-center gap-2 pt-0.5 text-2xs text-fg-faint">
-              <span>JSON object; nested objects mutate to depth 3</span>
+              <span className="truncate">
+                {sampleBody !== null && payload === sampleBody
+                  ? "OpenAPI request body sample"
+                  : "JSON object; nested objects mutate to depth 3"}
+              </span>
+              {sampleBody !== null && payload !== sampleBody && (
+                <button
+                  type="button"
+                  onClick={() => setPayload(sampleBody)}
+                  className="ml-auto shrink-0 text-fg-dim hover:text-fg"
+                >
+                  Sample
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => setPayload(TEMPLATE)}
-                className="ml-auto text-fg-dim hover:text-fg"
+                className={`shrink-0 text-fg-dim hover:text-fg ${sampleBody !== null && payload !== sampleBody ? "" : "ml-auto"}`}
               >
                 Template
               </button>

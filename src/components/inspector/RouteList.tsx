@@ -185,6 +185,11 @@ const RouteRow = memo(function RouteRow({
             mount {route.prefix}
           </span>
         )}
+        {route.sampleBody !== null && (
+          <span className="shrink-0 text-fg-dim" title="OpenAPI request body sample; loads into Burst and Fuzzer">
+            body
+          </span>
+        )}
         <span className="ml-auto shrink-0">{SOURCE_LABEL[route.source]}</span>
       </div>
     </div>

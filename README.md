@@ -149,9 +149,20 @@ A router mounted under several prefixes is reported once per prefix (at most 16)
 mounted from another file or module (`require("./users")`, `other::routes()`), Fastify
 `register(.., { prefix })` and gin groups keep the path written at their declaration.
 
-Selecting a route loads its method and path into the Burst and Fuzzer panels and adds an
-endpoint node to the topology. Requests stay blocked while the path contains unresolved
-`{param}` segments.
+OpenAPI and Swagger operations with a JSON request body (`application/json` or `*+json`; a
+Swagger 2.0 `in: body` parameter) carry `sampleBody`, a pretty-printed payload. Literal examples
+win: the media `example`, the first `examples` entry, then schema `example`, `default`, `const`
+and the first `enum` value. Otherwise the schema is synthesized: local `$ref` chains are
+followed (recursive references are cut at the first repeat, remote ones yield `null`),
+`allOf` is merged, the first `oneOf`/`anyOf` branch is taken, `readOnly` properties are
+omitted, numbers take the smallest value inside `minimum`/`maximum` (exclusive forms of 3.0
+and 3.1, default 1), strings respect `minLength`/`maxLength` and common `format`s. YAML
+scalars are typed by the YAML 1.2 core schema, so `age: 3` stays a number and `tag: '7'` a
+string.
+
+Selecting a route loads its method and path into the Burst and Fuzzer panels, loads its
+`sampleBody` (if any) into both payload fields, and adds an endpoint node to the topology.
+Requests stay blocked while the path contains unresolved `{param}` segments.
 
 The folder picker (`pick_project_root`) is opened from Rust through `tauri-plugin-dialog`; the
 webview capability set remains `core:default`.

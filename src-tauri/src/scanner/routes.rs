@@ -54,6 +54,8 @@ pub struct RawRoute {
     pub line: u32,
     /// Mount prefix resolved within the file and already joined into `path`.
     pub prefix: Option<String>,
+    /// Pretty-printed JSON request body derived from an OpenAPI definition.
+    pub sample_body: Option<String>,
 }
 
 impl RawRoute {
@@ -64,7 +66,13 @@ impl RawRoute {
             source,
             line,
             prefix: None,
+            sample_body: None,
         }
+    }
+
+    pub fn with_sample(mut self, sample_body: Option<String>) -> Self {
+        self.sample_body = sample_body;
+        self
     }
 
     /// Re-roots the route under `prefix`; an empty or `/` prefix leaves it unchanged.
@@ -245,6 +253,7 @@ pub fn discovered(route: RawRoute, file: &str) -> DiscoveredRoute {
         file: file.to_owned(),
         line: route.line,
         prefix,
+        sample_body: route.sample_body,
     }
 }
 

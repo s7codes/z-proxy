@@ -51,12 +51,20 @@ export function App() {
   const [chaosTab, setChaosTab] = useState<ChaosTab>("faults");
   const [selectedRoute, setSelectedRoute] = useState<DiscoveredRoute | null>(null);
   const [requestTarget, setRequestTarget] = useState<RequestTarget>({ method: "POST", path: "/" });
+  // Payloads live here rather than in the panels so a route selection (OpenAPI sample) and
+  // later a fuzz finding can write them while the owning tab is not mounted.
+  const [burstBody, setBurstBody] = useState("");
+  const [fuzzPayload, setFuzzPayload] = useState("");
 
   const { status: proxyStatus, applyFaults, stop: stopProxy } = proxy;
 
   const selectRoute = useCallback((route: DiscoveredRoute) => {
     setSelectedRoute(route);
     setRequestTarget((current) => ({ method: toBurstMethod(route.method) ?? current.method, path: route.path }));
+    if (route.sampleBody !== null) {
+      setBurstBody(route.sampleBody);
+      setFuzzPayload(route.sampleBody);
+    }
   }, []);
 
   // Adopt the engine profile once so a webview reload does not replace an armed profile
@@ -236,6 +244,11 @@ export function App() {
             fuzzerProgress={telemetry.fuzzerProgress}
             target={requestTarget}
             onTarget={setRequestTarget}
+            burstBody={burstBody}
+            onBurstBody={setBurstBody}
+            fuzzPayload={fuzzPayload}
+            onFuzzPayload={setFuzzPayload}
+            sampleBody={selectedRoute?.sampleBody ?? null}
           />
         }
         telemetry={<TelemetryTable store={telemetry} />}

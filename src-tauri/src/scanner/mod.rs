@@ -5,3 +5,4 @@ mod next;
 mod node;
 mod openapi;
 pub mod routes;
+mod schema;

@@ -40,10 +40,16 @@ interface ChaosControlsProps {
   fuzzerProgress: FuzzerProgress | null;
   target: RequestTarget;
   onTarget: (target: RequestTarget) => void;
+  burstBody: string;
+  onBurstBody: (body: string) => void;
+  fuzzPayload: string;
+  onFuzzPayload: (payload: string) => void;
+  /** OpenAPI sample of the selected route, offered by both payload fields. */
+  sampleBody: string | null;
 }
 
 export function ChaosControls(props: ChaosControlsProps) {
-  const { tab, onTab, link, guard, target, onTarget } = props;
+  const { tab, onTab, link, guard, target, onTarget, sampleBody } = props;
   const online = link.state === "online";
 
   return (
@@ -57,7 +63,16 @@ export function ChaosControls(props: ChaosControlsProps) {
         <FaultsTab profile={props.profile} onChange={props.onChange} link={link} guard={guard} proxy={props.proxy} />
       )}
       {tab === "burst" && (
-        <BurstPanel guard={guard} burst={props.burst} online={online} target={target} onTarget={onTarget} />
+        <BurstPanel
+          guard={guard}
+          burst={props.burst}
+          online={online}
+          target={target}
+          onTarget={onTarget}
+          body={props.burstBody}
+          onBody={props.onBurstBody}
+          sampleBody={sampleBody}
+        />
       )}
       {tab === "fuzzer" && (
         <FuzzerPanel
@@ -67,6 +82,9 @@ export function ChaosControls(props: ChaosControlsProps) {
           online={online}
           target={target}
           onTarget={onTarget}
+          payload={props.fuzzPayload}
+          onPayload={props.onFuzzPayload}
+          sampleBody={sampleBody}
         />
       )}
     </div>

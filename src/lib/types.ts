@@ -241,6 +241,8 @@ export interface DiscoveredRoute {
   line: number;
   /** Normalized mount prefix resolved within the declaring file; already part of `path`. */
   prefix: string | null;
+  /** Pretty-printed JSON request body from the OpenAPI `requestBody` (example or schema). */
+  sampleBody: string | null;
 }
 
 export interface ScanIssue {

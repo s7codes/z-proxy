@@ -9,7 +9,7 @@ import { httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
 import type { Anomaly, AnomalyKind, BurstReport } from "../../lib/types";
 import { Section, StatusSquare } from "../shell/PanelHeader";
 import { ErrorLine } from "./ErrorLine";
-import { Field, MethodPicker, Metric, OriginRow, PathField } from "./RequestFields";
+import { Field, MethodPicker, Metric, OriginRow, PathField, SampleHint } from "./RequestFields";
 import { Slider } from "./Slider";
 
 const MAX_WORKERS = 100;
@@ -28,14 +28,25 @@ interface BurstPanelProps {
   online: boolean;
   target: RequestTarget;
   onTarget: (target: RequestTarget) => void;
+  body: string;
+  onBody: (body: string) => void;
+  sampleBody: string | null;
 }
 
-export function BurstPanel({ guard, burst, online, target: request, onTarget }: BurstPanelProps) {
+export function BurstPanel({
+  guard,
+  burst,
+  online,
+  target: request,
+  onTarget,
+  body,
+  onBody: setBody,
+  sampleBody,
+}: BurstPanelProps) {
   const { method, path } = request;
   const [workers, setWorkers] = useState(20);
   const [timeoutMs, setTimeoutMs] = useState(5_000);
   const [headerText, setHeaderText] = useState("");
-  const [body, setBody] = useState("");
 
   const origin = guard.phase === "accepted" ? originOf(guard.target.normalized) : null;
   const parsed = useMemo(() => parseHeaders(headerText), [headerText]);
@@ -83,6 +94,9 @@ export function BurstPanel({ guard, burst, online, target: request, onTarget }: 
               rows={3}
               className="num w-full min-w-0 resize-y rounded-xs border border-line bg-bg px-1.5 py-1 text-xs text-fg-bright outline-none placeholder:text-fg-faint focus:border-fg-faint"
             />
+            {sampleBody !== null && (
+              <SampleHint active={body === sampleBody} onLoad={() => setBody(sampleBody)} />
+            )}
           </Field>
         </Section>
 
