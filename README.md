@@ -8,11 +8,13 @@ is created.
 
 ## Status
 
-Milestone 4: loopback reverse proxy with global and route-scoped fault injection,
-barrier-synchronized concurrency burst runner with anomaly detection, filesystem route scanner
-with in-file mount prefix resolution and OpenAPI request body synthesis, deterministic payload
-fuzzer with stack trace and database error detection and fuzz-to-burst replay, embedded target
-lab service with switchable defects.
+1.0.0: loopback reverse proxy with global and route-scoped fault injection,
+barrier-synchronized concurrency burst runner with TTFB/total latency split, success quota
+and anomaly detection, filesystem route scanner with in-file mount prefix resolution and
+OpenAPI request body synthesis, deterministic payload fuzzer (nine vectors including schema
+contract bounds and path parameter boundaries) with stack trace and database error detection
+and fuzz-to-burst replay, embedded target lab service with switchable defects that can be
+chained behind the proxy, Markdown/JSON audit report export, CI on Linux and Windows.
 Not implemented yet: WebSocket proxying, TLS upstreams, query-string and header fuzzing,
 mount prefixes across files.
 
@@ -349,7 +351,7 @@ body synthesis as a scanned project), preselects the redeem route with its sampl
 opens the Burst tab. Every request the lab serves is reported as a `labExchange` event with
 the handler outcome and live counters.
 
-"Route via Proxy" (inspector and command palette) chains the proxy in front of the lab in one
+"Via Proxy" in the inspector ("Route lab traffic via proxy" in the command palette) chains the proxy in front of the lab in one
 step: it reuses a listener that already forwards to the lab, restarts one that forwards
 elsewhere, or starts one on port 8787, then sends Burst and Fuzzer traffic to the listener.
 The fault profile and route rules survive the restart. The inspector keeps the lab as the
