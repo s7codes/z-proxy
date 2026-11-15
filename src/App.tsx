@@ -39,6 +39,7 @@ import { sameProfile, useProxy } from "./hooks/useProxy";
 import { useRouteScan } from "./hooks/useRouteScan";
 import { useTelemetry } from "./hooks/useTelemetry";
 import { routeContracts } from "./lib/contract";
+import type { AuditKind } from "./lib/traffic";
 import { ipcAvailable } from "./lib/ipc";
 import { originOf, type RequestOrigin } from "./lib/request";
 import { toBurstMethod, type RequestTarget } from "./lib/routes";
@@ -212,7 +213,14 @@ export function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const { setPaused, paused, clear } = telemetry;
+  const { setPaused, paused, clear, setFilter: setTelemetryFilter } = telemetry;
+  const showAudit = useCallback(
+    (kind: AuditKind | null) => {
+      setTelemetryFilter({ kind: "findings", audit: kind });
+      telemetryRef.current?.expand();
+    },
+    [setTelemetryFilter],
+  );
   const { scan: scanRoutes, browse: browseRoot, root: scanRoot } = routeScan;
   const { running: fuzzing, cancel: cancelFuzzer } = fuzzer;
   const { status: labStatus, start: startLab, stop: stopLab, setMode: setLabMode, reset: resetLab } = lab;
@@ -458,6 +466,8 @@ export function App() {
             route={selectedRoute}
             burstOrigin={burstOrigin}
             onReplayInBurst={replayInBurst}
+            audit={telemetry.audit}
+            onAuditFilter={showAudit}
           />
         }
         telemetry={<TelemetryTable store={telemetry} />}

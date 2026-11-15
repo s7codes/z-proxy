@@ -377,7 +377,20 @@ async fn observe(State(shared): State<Arc<Shared>>, request: Request, next: Next
     let started = Instant::now();
     let method = request.method().to_string();
     let path = request.uri().path().to_owned();
-    let response = next.run(request).await;
+    let mut response = next.run(request).await;
+    if shared.mode() == LabMode::Unprotected {
+        // `cors({ origin: "*", credentials: true })`: the pair browsers refuse, which the
+        // passive audit reports on every proxied response.
+        let headers = response.headers_mut();
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+    }
     shared.requests.fetch_add(1, Ordering::SeqCst);
     let outcome = response
         .extensions()
@@ -1485,7 +1498,7 @@ mod tests {
     use crate::engine::types::{
         AnomalyKind, BurstMethod, BurstSpec, ContractViolation, ContractViolationKind,
         DisclosureKind, FuzzSpec, FuzzVerdict, HeaderPair, MutationClass, ProxyConfig,
-        ResponseContract, RouteContract, RouteMethod,
+        ResponseContract, RouteContract, RouteMethod, Severity, TrafficFindingKind,
     };
     use crate::scanner::routes;
 
@@ -2183,6 +2196,91 @@ mod tests {
         );
         proxy.stop().await;
         lab.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn proxy_audits_lab_traffic_passively() {
+        let (hub, lab, base) = started(LabMode::Unprotected).await;
+        let proxy = ProxyManager::new(Arc::clone(&hub)).unwrap();
+        let listener = proxy
+            .start(ProxyConfig {
+                upstream: base.clone(),
+                listen_port: 0,
+            })
+            .await
+            .unwrap()
+            .listener
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        // An order list rendered one row at a time: eight lookups fired together.
+        let audit = |mode: LabMode| {
+            let client = client.clone();
+            let listener = listener.clone();
+            let mut events = hub.subscribe();
+            async move {
+                let mut lookups = tokio::task::JoinSet::new();
+                for id in 1..=8 {
+                    let request = client.get(format!("http://{listener}/api/v1/orders/{id}"));
+                    lookups.spawn(async move { request.send().await.unwrap().status().as_u16() });
+                }
+                while let Some(status) = lookups.join_next().await {
+                    assert!(matches!(status.unwrap(), 200 | 404));
+                }
+                let leak = client
+                    .get(format!("http://{listener}/api/v1/orders/invalid-id"))
+                    .send()
+                    .await
+                    .unwrap();
+                let expected = if mode == LabMode::Hardened { 422 } else { 500 };
+                assert_eq!(leak.status().as_u16(), expected);
+
+                let mut findings = Vec::new();
+                let mut exchanges = 0;
+                while exchanges < 9 {
+                    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if let TelemetryEvent::ProxyExchange {
+                        findings: found, ..
+                    } = event
+                    {
+                        exchanges += 1;
+                        findings.extend(found.into_iter().map(|f| (f.kind, f.severity)));
+                    }
+                }
+                findings
+            }
+        };
+        let count = |findings: &[(TrafficFindingKind, Severity)], kind| {
+            findings.iter().filter(|(found, _)| *found == kind).count()
+        };
+
+        let unprotected = audit(LabMode::Unprotected).await;
+        assert_eq!(count(&unprotected, TrafficFindingKind::NPlusOneBurst), 1);
+        assert_eq!(
+            count(&unprotected, TrafficFindingKind::HeaderMisconfiguration),
+            9,
+            "credentialed CORS wildcard on every response"
+        );
+        assert!(unprotected.contains(&(TrafficFindingKind::PassiveDisclosure, Severity::Fault)));
+
+        lab.set_mode(LabMode::Hardened).await;
+        // Let the template window lapse so the hardened fan-out counts as a new burst.
+        tokio::time::sleep(linter_window()).await;
+        let hardened = audit(LabMode::Hardened).await;
+        assert_eq!(
+            hardened,
+            [(TrafficFindingKind::NPlusOneBurst, Severity::Warn)],
+            "N+1 is client behaviour; the hardened service adds nothing else"
+        );
+        proxy.stop().await;
+        lab.stop().await;
+    }
+
+    fn linter_window() -> Duration {
+        crate::engine::linter::N_PLUS_ONE_WINDOW * 2
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

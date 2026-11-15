@@ -369,6 +369,22 @@ export interface RouteContract {
   contract: ResponseContract;
 }
 
+// ---- passive traffic audit ------------------------------------------------------------
+
+export type TrafficFindingKind =
+  | "nPlusOneBurst"
+  | "unboundedCollection"
+  | "headerMisconfiguration"
+  | "passiveDisclosure";
+
+export interface TrafficFinding {
+  kind: TrafficFindingKind;
+  severity: Severity;
+  detail: string;
+  /** Route template, header value or matched fragment the finding rests on. */
+  evidence: string | null;
+}
+
 // ---- target lab -----------------------------------------------------------------------
 
 export type LabMode = "unprotected" | "hardened";
@@ -460,6 +476,8 @@ export type TelemetryEvent =
       contract: string | null;
       /** Drift of a forwarded response from `contract`; injected faults are not checked. */
       violations: ContractViolation[];
+      /** Passive audit: N+1 bursts for every GET, response checks for forwarded responses. */
+      findings: TrafficFinding[];
     }
   | {
       kind: "burstStarted";

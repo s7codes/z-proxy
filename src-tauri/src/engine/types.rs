@@ -530,6 +530,33 @@ pub struct RouteContract {
     pub contract: ResponseContract,
 }
 
+// ---- passive traffic audit ------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TrafficFindingKind {
+    /// Distinct GETs to one route template inside a short window: a client loading a
+    /// collection one member at a time.
+    NPlusOneBurst,
+    /// A JSON collection above the item limit without pagination metadata, or a JSON body
+    /// above 1 MiB.
+    UnboundedCollection,
+    /// Content-Type, CORS or Cache-Control headers that contradict the response.
+    HeaderMisconfiguration,
+    /// Stack trace or database error in a proxied response.
+    PassiveDisclosure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrafficFinding {
+    pub kind: TrafficFindingKind,
+    pub severity: Severity,
+    pub detail: String,
+    /// Route template, header value or matched fragment the finding rests on.
+    pub evidence: Option<String>,
+}
+
 // ---- target lab -----------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -646,6 +673,9 @@ pub enum TelemetryEvent {
         contract: Option<String>,
         /// Drift of a forwarded response from `contract`; injected faults are not checked.
         violations: Vec<ContractViolation>,
+        /// Passive audit of the exchange: N+1 bursts for every GET, response checks for
+        /// forwarded responses.
+        findings: Vec<TrafficFinding>,
     },
     BurstStarted {
         seq: u64,

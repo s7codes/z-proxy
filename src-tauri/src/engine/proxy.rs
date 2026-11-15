@@ -31,9 +31,11 @@ use super::contract::{self, ContractSet};
 use super::error::{EngineError, EngineResult};
 use super::fault::{self, FaultAction, FaultPlan, FaultProfile, FaultRule, FaultState};
 use super::guard::{self, GuardedTarget};
+use super::linter::{self, ResponseView, TrafficLinter};
 use super::net;
 use super::types::{
     ContractViolation, FaultKind, ProxyConfig, ProxyStatus, RouteContract, TelemetryEvent,
+    TrafficFinding,
 };
 use crate::telemetry::{now_us, TelemetryHub};
 
@@ -134,6 +136,7 @@ impl ProxyManager {
             client: self.client.clone(),
             faults: self.faults.subscribe(),
             contracts: self.contracts.subscribe(),
+            linter: TrafficLinter::default(),
             hub: Arc::clone(&self.hub),
             rng: Mutex::new(self.seed.map_or_else(Rng::new, Rng::with_seed)),
         });
@@ -345,6 +348,8 @@ struct ProxyContext {
     client: Client,
     faults: watch::Receiver<FaultState>,
     contracts: watch::Receiver<Arc<ContractSet>>,
+    /// N+1 windows live with the listener; a restart starts them empty.
+    linter: TrafficLinter,
     hub: Arc<TelemetryHub>,
     rng: Mutex<Rng>,
 }
@@ -370,7 +375,15 @@ impl ProxyContext {
         reply.into_response()
     }
 
-    fn publish(&self, record: Exchange) {
+    fn publish(&self, mut record: Exchange) {
+        // Every GET counts, whatever its fate: a fan-out is client behaviour, and a dropped or
+        // injected response does not make it less of one.
+        if let Some(burst) = self
+            .linter
+            .track(record.started, &record.method, &record.path)
+        {
+            record.findings.push(burst);
+        }
         self.hub.publish(TelemetryEvent::ProxyExchange {
             seq: self.hub.next_seq(),
             id: record.id,
@@ -389,6 +402,7 @@ impl ProxyContext {
             error: record.error,
             contract: record.contract,
             violations: record.violations,
+            findings: record.findings,
         });
     }
 
@@ -418,6 +432,7 @@ struct Exchange {
     error: Option<String>,
     contract: Option<String>,
     violations: Vec<ContractViolation>,
+    findings: Vec<TrafficFinding>,
 }
 
 struct Reply {
@@ -458,6 +473,7 @@ async fn proxy_handler(
         error: None,
         contract: None,
         violations: Vec::new(),
+        findings: Vec::new(),
     };
     let upstream_path = upstream_url(&ctx.upstream.url, &record.path)
         .path()
@@ -467,6 +483,8 @@ async fn proxy_handler(
     let contract = ctx.contract(&record.method, &upstream_path);
 
     let (parts, body) = request.into_parts();
+    let credentialed = parts.headers.contains_key(header::AUTHORIZATION)
+        || parts.headers.contains_key(header::COOKIE);
     let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -507,6 +525,14 @@ async fn proxy_handler(
                         contract::check(&bound.contract, reply.status.as_u16(), Some(&reply.body));
                     record.contract = Some(bound.label.clone());
                 }
+                record.findings = linter::inspect(&ResponseView {
+                    method: &record.method,
+                    path: &record.path,
+                    credentialed,
+                    status: reply.status.as_u16(),
+                    headers: &reply.headers,
+                    body: &reply.body,
+                });
                 if record.injected_delay_us > 0 {
                     reply.headers.insert(
                         HeaderName::from_static(DELAY_HEADER),

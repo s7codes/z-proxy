@@ -86,6 +86,19 @@ fn compile(pattern: &str) -> Option<Regex> {
     Regex::new(pattern).ok()
 }
 
+/// Operator-facing name; mirrors `DISCLOSURE_LABEL` in `src/lib/disclosure.ts`.
+pub fn label(kind: DisclosureKind) -> &'static str {
+    match kind {
+        DisclosureKind::NodeStackTrace => "Node.js stack trace",
+        DisclosureKind::PythonTraceback => "Python traceback",
+        DisclosureKind::RustPanic => "Rust panic",
+        DisclosureKind::GoPanic => "Go panic",
+        DisclosureKind::JvmStackTrace => "JVM stack trace",
+        DisclosureKind::DotNetStackTrace => ".NET stack trace",
+        DisclosureKind::SqlError => "SQL error",
+    }
+}
+
 /// First disclosure signature found in `text`, with the matched fragment as evidence.
 pub fn detect(text: &str) -> Option<Disclosure> {
     SIGNATURES.iter().find_map(|signature| {

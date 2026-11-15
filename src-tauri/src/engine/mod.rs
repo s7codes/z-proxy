@@ -7,6 +7,7 @@ pub mod fuzzer;
 pub mod guard;
 pub mod http1;
 pub mod lab;
+pub mod linter;
 pub mod net;
 pub mod pathparam;
 pub mod proxy;

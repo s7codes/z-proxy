@@ -1,14 +1,15 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { TelemetryStore } from "../../hooks/useTelemetry";
 import { TELEMETRY_CAPACITY } from "../../hooks/useTelemetry";
 import { summarizeViolations } from "../../lib/contract";
+import { AUDIT_SHORT, type AuditKind } from "../../lib/traffic";
 import { DISCLOSURE_LABEL } from "../../lib/disclosure";
 import { formatBytes, formatLatency, formatTimestamp, formatUptime } from "../../lib/format";
 import { ipcAvailable } from "../../lib/ipc";
 import { httpStatusTone, TONE_TEXT, type Tone } from "../../lib/tone";
 import type { FaultProfile, FuzzVerdict, TelemetryEvent } from "../../lib/types";
-import { FILTER_KINDS, TelemetryToolbar, type KindFilter } from "./TelemetryToolbar";
+import { FILTER_KINDS, TelemetryToolbar } from "./TelemetryToolbar";
 
 const ROW_HEIGHT = 22;
 const GRID = "grid grid-cols-[72px_118px_92px_minmax(160px,1.4fr)_84px_88px_minmax(160px,1fr)]";
@@ -26,14 +27,26 @@ interface Row {
   detail: string;
 }
 
+function audited(event: TelemetryEvent, audit: AuditKind | null): boolean {
+  if (event.kind !== "proxyExchange") return false;
+  if (audit === null) return event.findings.length > 0 || event.violations.length > 0;
+  if (audit === "contractDrift") return event.violations.length > 0;
+  return event.findings.some((finding) => finding.kind === audit);
+}
+
 export function TelemetryTable({ store }: { store: TelemetryStore }) {
-  const [filter, setFilter] = useState<KindFilter>("all");
+  const { filter, setFilter } = store;
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
 
   const rows = useMemo(() => {
-    const kinds = filter === "all" ? null : FILTER_KINDS[filter];
-    const source = kinds === null ? store.events : store.events.filter((e) => kinds.has(e.kind));
+    const { kind, audit } = filter;
+    const source =
+      kind === "all"
+        ? store.events
+        : kind === "findings"
+          ? store.events.filter((e) => audited(e, audit))
+          : store.events.filter((e) => FILTER_KINDS[kind].has(e.kind));
     return source.map(toRow);
   }, [store.events, filter]);
 
@@ -55,6 +68,7 @@ export function TelemetryTable({ store }: { store: TelemetryStore }) {
       <TelemetryToolbar
         filter={filter}
         onFilter={setFilter}
+        audit={store.audit}
         paused={store.paused}
         onTogglePause={() => store.setPaused(!store.paused)}
         onClear={store.clear}
@@ -81,7 +95,7 @@ export function TelemetryTable({ store }: { store: TelemetryStore }) {
         }}
       >
         {rows.length === 0 ? (
-          <EmptyState paused={store.paused} hasFilter={filter !== "all" && store.events.length > 0} />
+          <EmptyState paused={store.paused} hasFilter={filter.kind !== "all" && store.events.length > 0} />
         ) : (
           <div style={{ height: virtualizer.getTotalSize() }} className="relative w-full">
             {virtualizer.getVirtualItems().map((item) => {
@@ -185,10 +199,12 @@ function toRow(event: TelemetryEvent): Row {
     }
     case "proxyExchange": {
       const drift = summarizeViolations(event.violations);
+      const faulted = event.findings.some((finding) => finding.severity === "fault");
+      const flagged = event.fault !== null || drift !== null || event.findings.length > 0;
       return {
         ...base,
         kind: "PROXY",
-        kindTone: event.fault === null && drift === null ? "muted" : "warn",
+        kindTone: faulted ? "fault" : flagged ? "warn" : "muted",
         target: `${event.method} ${event.path}`,
         result: event.status === null ? "RST" : String(event.status),
         resultTone: event.status === null ? "fault" : httpStatusTone(event.status),
@@ -196,6 +212,7 @@ function toRow(event: TelemetryEvent): Row {
         detail: [
           event.fault === "statusMutation" ? "injected status" : null,
           event.fault === "connectionDrop" ? "injected reset" : null,
+          ...event.findings.map((finding) => `${AUDIT_SHORT[finding.kind]} ${finding.detail}`),
           drift === null ? null : `drift ${drift}`,
           event.rule === null ? null : `rule ${event.rule}`,
           event.injectedDelayUs > 0 ? `+${formatLatency(event.injectedDelayUs)} delay` : null,

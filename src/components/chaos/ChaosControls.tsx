@@ -5,11 +5,12 @@ import type { EngineLink } from "../../hooks/useEngineStatus";
 import type { FuzzerControl } from "../../hooks/useFuzzer";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import type { ProxyControl } from "../../hooks/useProxy";
-import type { FuzzerProgress } from "../../hooks/useTelemetry";
+import type { FuzzerProgress, TrafficAudit } from "../../hooks/useTelemetry";
 import { contractFor } from "../../lib/contract";
 import type { RequestOrigin } from "../../lib/request";
 import { METHOD_BADGE, type RequestTarget } from "../../lib/routes";
 import { DEFAULT_LISTEN_PORT, summarizeProfile } from "../../lib/rules";
+import { AUDIT_KINDS, AUDIT_LABEL, type AuditKind } from "../../lib/traffic";
 import type { DiscoveredRoute, FaultProfile, FaultRule, RouteMethod, StatusMutation } from "../../lib/types";
 import { PanelHeader, Section, StatusSquare, ToolButton } from "../shell/PanelHeader";
 import { BurstPanel } from "./BurstPanel";
@@ -54,6 +55,10 @@ interface ChaosControlsProps {
   /** Where the current burst body came from, when it was not typed: a replayed fuzz case. */
   burstOrigin: string | null;
   onReplayInBurst: (target: RequestTarget, body: string, origin: string) => void;
+  /** Passive audit counters folded from proxied exchanges. */
+  audit: TrafficAudit;
+  /** Narrows the telemetry table to one audit category (`null`: every audited exchange). */
+  onAuditFilter: (kind: AuditKind | null) => void;
 }
 
 export function ChaosControls(props: ChaosControlsProps) {
@@ -81,6 +86,8 @@ export function ChaosControls(props: ChaosControlsProps) {
           guard={guard}
           proxy={props.proxy}
           ruleTarget={ruleTarget}
+          audit={props.audit}
+          onAuditFilter={props.onAuditFilter}
         />
       )}
       {tab === "burst" && (
@@ -127,9 +134,11 @@ interface FaultsTabProps {
   guard: GuardState;
   proxy: ProxyControl;
   ruleTarget: RuleTarget;
+  audit: TrafficAudit;
+  onAuditFilter: (kind: AuditKind | null) => void;
 }
 
-function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget }: FaultsTabProps) {
+function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget, audit, onAuditFilter }: FaultsTabProps) {
   const [listenPort, setListenPort] = useState(DEFAULT_LISTEN_PORT);
   const online = link.state === "online" && proxy.status !== null;
   const running = proxy.status?.running ?? false;
@@ -201,6 +210,8 @@ function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget }: Faults
       {proxy.error !== null && <ErrorLine error={proxy.error} />}
 
       <div className="min-h-0 flex-1 overflow-y-auto">
+        <TrafficAuditSection audit={audit} running={running} onFilter={onAuditFilter} />
+
         <Section
           title="Latency"
           aside={
@@ -289,6 +300,60 @@ function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget }: Faults
         </button>
       </div>
     </>
+  );
+}
+
+/** Live counters of the passive audit; a row opens the matching exchanges in telemetry. */
+function TrafficAuditSection({
+  audit,
+  running,
+  onFilter,
+}: {
+  audit: TrafficAudit;
+  running: boolean;
+  onFilter: (kind: AuditKind | null) => void;
+}) {
+  const total = AUDIT_KINDS.reduce((sum, kind) => sum + audit.counts[kind], 0);
+  return (
+    <Section
+      title="Traffic Audit"
+      aside={
+        <button
+          type="button"
+          onClick={() => onFilter(null)}
+          disabled={total === 0}
+          title="Show every audited exchange in telemetry"
+          className="num text-2xs text-fg-faint hover:text-fg disabled:hover:text-fg-faint"
+        >
+          {audit.exchanges} exchanges
+        </button>
+      }
+    >
+      <div className="flex flex-col border-t border-line/60">
+        {AUDIT_KINDS.map((kind) => {
+          const count = audit.counts[kind];
+          const tone = count === 0 ? "text-fg-faint" : kind === "passiveDisclosure" && audit.faults > 0 ? "text-fault" : "text-warn";
+          return (
+            <button
+              key={kind}
+              type="button"
+              disabled={count === 0}
+              onClick={() => onFilter(kind)}
+              title={count === 0 ? AUDIT_LABEL[kind] : `Show ${AUDIT_LABEL[kind].toLowerCase()} findings in telemetry`}
+              className="grid h-5 grid-cols-[minmax(0,1fr)_auto] items-center border-b border-line/60 text-left text-xs hover:bg-active disabled:cursor-default disabled:hover:bg-transparent"
+            >
+              <span className={`truncate ${count === 0 ? "text-fg-faint" : "text-fg-dim"}`}>{AUDIT_LABEL[kind]}</span>
+              <span className={`num ${tone}`}>{count}</span>
+            </button>
+          );
+        })}
+      </div>
+      <div className="pt-1 text-2xs text-fg-faint">
+        {running
+          ? "Every proxied exchange is checked; injected faults are excluded from response checks."
+          : "Starts with the listener; findings attach to proxy exchanges in telemetry."}
+      </div>
+    </Section>
   );
 }
 
