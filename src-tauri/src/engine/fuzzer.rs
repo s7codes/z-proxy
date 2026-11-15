@@ -22,8 +22,8 @@ use super::error::{EngineError, EngineResult};
 use super::http1::{self, OpenError, RequestTemplate, CONNECT_TIMEOUT};
 use super::net;
 use super::types::{
-    BurstMethod, ClassSummary, FuzzCaseResult, FuzzReport, FuzzSpec, FuzzVerdict, MutationClass,
-    Severity, TelemetryEvent,
+    BurstMethod, ClassSummary, FuzzCasePayload, FuzzCaseRef, FuzzCaseResult, FuzzReport, FuzzSpec,
+    FuzzVerdict, MutationClass, Severity, TelemetryEvent,
 };
 use crate::telemetry::{now_us, TelemetryHub};
 
@@ -452,8 +452,23 @@ fn prepare(spec: &FuzzSpec) -> EngineResult<Plan> {
         ));
     }
     let template = RequestTemplate::new(&spec.target, spec.method, &spec.headers, invalid)?;
+    let base = parse_base(spec.base_body.as_deref())?;
+    let classes = normalize_classes(&spec.classes);
 
-    let base = match spec.base_body.as_deref().map(str::trim) {
+    Ok(Plan {
+        content_type: !template.has_header(&header::CONTENT_TYPE),
+        template,
+        timeout: Duration::from_millis(u64::from(spec.timeout_ms)),
+        connect_timeout: CONNECT_TIMEOUT,
+        base: Bytes::from(encode(&base)),
+        fields: count_u32(collect_fields(&base).len()),
+        cases: generate(&base, &classes),
+        classes,
+    })
+}
+
+fn parse_base(text: Option<&str>) -> EngineResult<Map<String, Value>> {
+    let base = match text.map(str::trim) {
         None | Some("") => default_template(),
         Some(text) if text.len() > MAX_BASE_BYTES => {
             return Err(invalid(
@@ -474,24 +489,53 @@ fn prepare(spec: &FuzzSpec) -> EngineResult<Plan> {
             format!("{fields} fields including nested ones; the limit is {MAX_FIELDS}"),
         ));
     }
+    Ok(base)
+}
 
-    let mut classes = if spec.classes.is_empty() {
+fn normalize_classes(requested: &[MutationClass]) -> Vec<MutationClass> {
+    let mut classes = if requested.is_empty() {
         ALL_CLASSES.to_vec()
     } else {
-        spec.classes.clone()
+        requested.to_vec()
     };
     classes.sort_unstable();
     classes.dedup();
+    classes
+}
 
-    Ok(Plan {
-        content_type: !template.has_header(&header::CONTENT_TYPE),
-        template,
-        timeout: Duration::from_millis(u64::from(spec.timeout_ms)),
-        connect_timeout: CONNECT_TIMEOUT,
-        base: Bytes::from(encode(&base)),
-        fields: count_u32(fields),
-        cases: generate(&base, &classes),
-        classes,
+/// Rebuilds the exact request body of case `index` (0 is the baseline) from the base body
+/// and classes a report carries. Generation is deterministic, so this is the body that was
+/// sent, without the report having to hold every payload.
+pub fn materialize(reference: &FuzzCaseRef) -> EngineResult<FuzzCasePayload> {
+    let base = parse_base(Some(&reference.base_body))?;
+    let classes = normalize_classes(&reference.classes);
+    let (label, body) = match reference.index {
+        0 => ("baseline".to_owned(), encode(&base)),
+        index => {
+            let offset = usize::try_from(index - 1).unwrap_or(usize::MAX);
+            let mut cases = generate(&base, &classes);
+            let total = cases.len();
+            if offset >= total {
+                return Err(invalid(
+                    "index",
+                    format!("case #{index} does not exist; the suite has {total} cases"),
+                ));
+            }
+            let case = cases.swap_remove(offset);
+            (case.label, case.body.to_vec())
+        }
+    };
+    let bytes = u64::try_from(body.len()).unwrap_or(u64::MAX);
+    let (body, lossy) = match String::from_utf8(body) {
+        Ok(text) => (text, false),
+        Err(err) => (String::from_utf8_lossy(err.as_bytes()).into_owned(), true),
+    };
+    Ok(FuzzCasePayload {
+        index: reference.index,
+        label,
+        body,
+        bytes,
+        lossy,
     })
 }
 
@@ -805,6 +849,8 @@ async fn execute(
         disclosures,
         aborted,
         notes,
+        base_body: String::from_utf8_lossy(&plan.base).into_owned(),
+        classes: plan.classes.clone(),
     }
 }
 
@@ -1017,6 +1063,63 @@ mod tests {
         assert_eq!(code(bad), "INVALID_FUZZ_SPEC");
     }
 
+    #[test]
+    fn materialize_reproduces_every_case_byte_for_byte() {
+        let mut fuzz = spec("http://127.0.0.1:9/orders".into());
+        fuzz.base_body = Some(r#"{"name":"é","qty":2,"nested":{"k":"v"}}"#.into());
+        // Deliberately unsorted: replay must normalize the order the same way the run did.
+        fuzz.classes = vec![
+            MutationClass::MissingFields,
+            MutationClass::MalformedJson,
+            MutationClass::NullInjection,
+        ];
+        let plan = prepare(&fuzz).unwrap();
+        let base_body = String::from_utf8(plan.base.to_vec()).unwrap();
+        let reference = |index: u32| FuzzCaseRef {
+            base_body: base_body.clone(),
+            classes: fuzz.classes.clone(),
+            index,
+        };
+
+        let baseline = materialize(&reference(0)).unwrap();
+        assert_eq!(baseline.label, "baseline");
+        assert_eq!(baseline.body.as_bytes(), &plan.base[..]);
+
+        for (offset, case) in plan.cases.iter().enumerate() {
+            let payload = materialize(&reference(count_u32(offset + 1))).unwrap();
+            assert_eq!(payload.label, case.label);
+            assert_eq!(payload.bytes, u64::try_from(case.body.len()).unwrap());
+            if payload.lossy {
+                assert!(case.label.starts_with("invalid UTF-8"), "{}", case.label);
+                assert!(payload.body.contains('\u{FFFD}'));
+            } else {
+                assert_eq!(payload.body.as_bytes(), &case.body[..], "{}", case.label);
+            }
+        }
+        assert_eq!(
+            plan.cases
+                .iter()
+                .enumerate()
+                .filter(|(offset, _)| materialize(&reference(count_u32(offset + 1)))
+                    .unwrap()
+                    .lossy)
+                .count(),
+            1
+        );
+
+        let past_end = count_u32(plan.cases.len() + 1);
+        match materialize(&reference(past_end)) {
+            Err(EngineError::InvalidFuzzSpec { field, .. }) => assert_eq!(field, "index"),
+            other => panic!("expected index rejection, got {other:?}"),
+        }
+        let mut broken = reference(1);
+        broken.base_body = "[1]".into();
+        assert_eq!(
+            materialize(&broken).unwrap_err().code(),
+            "INVALID_FUZZ_SPEC"
+        );
+    }
+
     // ---- integration -------------------------------------------------------------------
 
     type Handler = fn(usize, Bytes) -> Result<(u16, &'static str), io::Error>;
@@ -1093,6 +1196,14 @@ mod tests {
         assert_eq!(report.baseline.status, Some(201));
         assert_eq!(report.cases.len(), 86);
         assert_eq!(report.fields, 8);
+        assert_eq!(report.classes, ALL_CLASSES);
+        let replayed = materialize(&FuzzCaseRef {
+            base_body: report.base_body.clone(),
+            classes: report.classes.clone(),
+            index: 1,
+        })
+        .unwrap();
+        assert_eq!(replayed.label, report.cases[0].label);
         assert_eq!(report.aborted, None);
         assert!(report.notes.is_empty(), "{:?}", report.notes);
         assert_eq!(

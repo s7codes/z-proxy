@@ -59,6 +59,7 @@ export function App() {
   // Payloads live here rather than in the panels so a route selection (OpenAPI sample) and
   // later a fuzz finding can write them while the owning tab is not mounted.
   const [burstBody, setBurstBody] = useState("");
+  const [burstOrigin, setBurstOrigin] = useState<string | null>(null);
   const [fuzzPayload, setFuzzPayload] = useState("");
 
   const { status: proxyStatus, applyFaults, stop: stopProxy } = proxy;
@@ -68,8 +69,14 @@ export function App() {
     setRequestTarget((current) => ({ method: toBurstMethod(route.method) ?? current.method, path: route.path }));
     if (route.sampleBody !== null) {
       setBurstBody(route.sampleBody);
+      setBurstOrigin(null);
       setFuzzPayload(route.sampleBody);
     }
+  }, []);
+
+  const editBurstBody = useCallback((body: string) => {
+    setBurstBody(body);
+    setBurstOrigin(null);
   }, []);
 
   // Adopt the engine profile once so a webview reload does not replace an armed profile
@@ -91,6 +98,17 @@ export function App() {
   const inspectorRef = useRef<PanelImperativeHandle | null>(null);
   const chaosRef = useRef<PanelImperativeHandle | null>(null);
   const telemetryRef = useRef<PanelImperativeHandle | null>(null);
+
+  // Fuzz-to-burst escalation: the payload that broke one request is fired from N
+  // pre-connected workers, which separates a deterministic crash from one that only
+  // surfaces under contention.
+  const replayInBurst = useCallback((target: RequestTarget, body: string, origin: string) => {
+    setRequestTarget(target);
+    setBurstBody(body);
+    setBurstOrigin(origin);
+    chaosRef.current?.expand();
+    setChaosTab("burst");
+  }, []);
 
   // The lab becomes the validated target, so the proxy upstream and the Burst/Fuzzer origin
   // follow from the guard; its routes replace the list and the race-prone redeem route is
@@ -309,11 +327,13 @@ export function App() {
             target={requestTarget}
             onTarget={setRequestTarget}
             burstBody={burstBody}
-            onBurstBody={setBurstBody}
+            onBurstBody={editBurstBody}
             fuzzPayload={fuzzPayload}
             onFuzzPayload={setFuzzPayload}
             sampleBody={selectedRoute?.sampleBody ?? null}
             route={selectedRoute}
+            burstOrigin={burstOrigin}
+            onReplayInBurst={replayInBurst}
           />
         }
         telemetry={<TelemetryTable store={telemetry} />}

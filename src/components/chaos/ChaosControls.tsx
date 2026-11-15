@@ -47,6 +47,9 @@ interface ChaosControlsProps {
   /** OpenAPI sample of the selected route, offered by both payload fields. */
   sampleBody: string | null;
   route: DiscoveredRoute | null;
+  /** Where the current burst body came from, when it was not typed: a replayed fuzz case. */
+  burstOrigin: string | null;
+  onReplayInBurst: (target: RequestTarget, body: string, origin: string) => void;
 }
 
 export function ChaosControls(props: ChaosControlsProps) {
@@ -86,6 +89,7 @@ export function ChaosControls(props: ChaosControlsProps) {
           body={props.burstBody}
           onBody={props.onBurstBody}
           sampleBody={sampleBody}
+          origin={props.burstOrigin}
         />
       )}
       {tab === "fuzzer" && (
@@ -99,6 +103,7 @@ export function ChaosControls(props: ChaosControlsProps) {
           payload={props.fuzzPayload}
           onPayload={props.onFuzzPayload}
           sampleBody={sampleBody}
+          onSendToBurst={props.onReplayInBurst}
         />
       )}
     </div>

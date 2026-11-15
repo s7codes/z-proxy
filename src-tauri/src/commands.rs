@@ -11,9 +11,9 @@ use crate::engine::guard;
 use crate::engine::lab;
 use crate::engine::net;
 use crate::engine::types::{
-    BurstReport, BurstSpec, EngineStatus, FuzzReport, FuzzSpec, LabConfig, LabMode, LabStatus,
-    ProbeResult, ProxyConfig, ProxyStatus, RouteScanReport, TelemetryEvent, ValidatedTarget,
-    Verdict,
+    BurstReport, BurstSpec, EngineStatus, FuzzCasePayload, FuzzCaseRef, FuzzReport, FuzzSpec,
+    LabConfig, LabMode, LabStatus, ProbeResult, ProxyConfig, ProxyStatus, RouteScanReport,
+    TelemetryEvent, ValidatedTarget, Verdict,
 };
 use crate::scanner::routes;
 use crate::state::AppState;
@@ -155,6 +155,12 @@ pub async fn run_fuzzer_suite(
     spec: FuzzSpec,
 ) -> Result<FuzzReport, EngineError> {
     fuzzer::run(spec, &state.hub, &state.fuzzer).await
+}
+
+/// Rebuilds one case's request body for replay in the burst runner or as a new base payload.
+#[tauri::command]
+pub async fn materialize_fuzz_case(reference: FuzzCaseRef) -> Result<FuzzCasePayload, EngineError> {
+    fuzzer::materialize(&reference)
 }
 
 /// Resolves `true` when a running suite was asked to stop; it ends after the in-flight case.

@@ -1,10 +1,11 @@
 import { useMemo, useState } from "react";
-import { FlaskConical, Square } from "lucide-react";
+import { FileInput, FlaskConical, Square, X, Zap } from "lucide-react";
 import type { FuzzerControl } from "../../hooks/useFuzzer";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import type { FuzzerProgress } from "../../hooks/useTelemetry";
 import { DISCLOSURE_LABEL } from "../../lib/disclosure";
 import { formatBytes, formatLatency } from "../../lib/format";
+import { materializeFuzzCase } from "../../lib/ipc";
 import { joinTarget, originOf, parseHeaders } from "../../lib/request";
 import { unresolvedParams, type RequestTarget } from "../../lib/routes";
 import { httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
@@ -62,6 +63,8 @@ interface FuzzerPanelProps {
   payload: string;
   onPayload: (payload: string) => void;
   sampleBody: string | null;
+  /** Replays a case body through the burst runner: same method and path, N workers. */
+  onSendToBurst: (target: RequestTarget, body: string, origin: string) => void;
 }
 
 export function FuzzerPanel({
@@ -74,6 +77,7 @@ export function FuzzerPanel({
   payload,
   onPayload: setPayload,
   sampleBody,
+  onSendToBurst,
 }: FuzzerPanelProps) {
   const { method, path } = request;
   const [headerText, setHeaderText] = useState("");
@@ -207,7 +211,14 @@ export function FuzzerPanel({
           <Slider label="Timeout" unit="ms" min={100} max={60000} step={100} value={timeoutMs} onChange={setTimeoutMs} />
         </Section>
 
-        {fuzzer.report !== null && <FuzzReportView key={fuzzer.report.id} report={fuzzer.report} />}
+        {fuzzer.report !== null && (
+          <FuzzReportView
+            key={fuzzer.report.id}
+            report={fuzzer.report}
+            onLoadPayload={setPayload}
+            onSendToBurst={onSendToBurst}
+          />
+        )}
       </div>
 
       <div className="flex shrink-0 flex-col border-t border-line">
@@ -272,9 +283,65 @@ function caseTone(result: FuzzCaseResult): Tone {
   return result.verdict === "rejected" ? "ok" : "muted";
 }
 
-function FuzzReportView({ report }: { report: FuzzReport }) {
+/** Path and query the suite targeted, so a replay hits the same resource. */
+function reportPath(report: FuzzReport): string | null {
+  try {
+    const url = new URL(report.target);
+    return `${url.pathname}${url.search}`;
+  } catch {
+    return null;
+  }
+}
+
+type ReplayNotice = { tone: Tone; text: string };
+
+function FuzzReportView({
+  report,
+  onLoadPayload,
+  onSendToBurst,
+}: {
+  report: FuzzReport;
+  onLoadPayload: (payload: string) => void;
+  onSendToBurst: (target: RequestTarget, body: string, origin: string) => void;
+}) {
   const [expanded, setExpanded] = useState<number | null>(null);
+  const [pending, setPending] = useState<number | null>(null);
+  const [notice, setNotice] = useState<ReplayNotice | null>(null);
   const executed = report.cases.filter((c) => c.verdict !== "skipped").length;
+
+  // Bodies are rebuilt by the engine from the report's base body and classes rather than
+  // kept per case: generation is deterministic, and oversize cases are 64 KiB each.
+  const replay = (result: FuzzCaseResult, destination: "burst" | "fuzzer") => {
+    setPending(result.index);
+    void materializeFuzzCase({ baseBody: report.baseBody, classes: report.classes, index: result.index }).then(
+      (outcome) => {
+        setPending(null);
+        if (!outcome.ok) {
+          setNotice({ tone: "fault", text: `${outcome.error.code} ${outcome.error.message}` });
+          return;
+        }
+        const payload = outcome.value;
+        if (destination === "fuzzer") {
+          if (validatePayload(payload.body) !== null || payload.body.trim() === "") {
+            setNotice({ tone: "warn", text: `#${payload.index} is not a JSON object; it can seed a burst, not the fuzzer` });
+            return;
+          }
+          onLoadPayload(payload.body);
+          setNotice({ tone: "muted", text: `#${payload.index} ${payload.label} loaded as base payload` });
+          return;
+        }
+        const path = reportPath(report);
+        if (path === null) {
+          setNotice({ tone: "fault", text: `cannot derive a path from ${report.target}` });
+          return;
+        }
+        const origin = `fuzz case #${payload.index} ${payload.label}${
+          payload.lossy ? "; invalid UTF-8 replaced with U+FFFD" : ""
+        }`;
+        onSendToBurst({ method: report.method, path }, payload.body, origin);
+      },
+    );
+  };
   const findings = report.cases
     .filter((c) => c.severity !== null)
     .sort((a, b) => (a.severity === b.severity ? a.index - b.index : a.severity === "fault" ? -1 : 1));
@@ -338,6 +405,19 @@ function FuzzReportView({ report }: { report: FuzzReport }) {
       </Section>
 
       <Section title="Findings" aside={<span className="num text-2xs text-fg-faint">{findings.length}</span>}>
+        {notice !== null && (
+          <div className={`num mb-1.5 flex items-start gap-1.5 text-2xs ${TONE_TEXT[notice.tone]}`}>
+            <span className="min-w-0 flex-1 break-words">{notice.text}</span>
+            <button
+              type="button"
+              aria-label="Dismiss"
+              onClick={() => setNotice(null)}
+              className="shrink-0 text-fg-faint hover:text-fg"
+            >
+              <X size={10} strokeWidth={1.5} />
+            </button>
+          </div>
+        )}
         {findings.length === 0 ? (
           <div className="flex items-center gap-1.5 text-xs text-ok">
             <StatusSquare className="bg-ok" />
@@ -351,6 +431,8 @@ function FuzzReportView({ report }: { report: FuzzReport }) {
                 result={result}
                 expanded={expanded === result.index}
                 onToggle={() => setExpanded((current) => (current === result.index ? null : result.index))}
+                pending={pending === result.index}
+                onReplay={(destination) => replay(result, destination)}
               />
             ))}
             {findings.length > listed.length && (
@@ -367,13 +449,19 @@ function FindingRow({
   result,
   expanded,
   onToggle,
+  pending,
+  onReplay,
 }: {
   result: FuzzCaseResult;
   expanded: boolean;
   onToggle: () => void;
+  pending: boolean;
+  onReplay: (destination: "burst" | "fuzzer") => void;
 }) {
   const tone = caseTone(result);
   const hasDetail = result.responsePreview !== null;
+  // A malformed body cannot become a base payload, which must be a JSON object.
+  const seedable = result.class !== "malformedJson";
   return (
     <div className={`border-l pl-2 ${tone === "fault" ? "border-fault" : "border-warn"}`}>
       <button
@@ -408,6 +496,31 @@ function FindingRow({
           {result.responsePreview}
         </pre>
       )}
+      <div className="flex items-center gap-3 pt-0.5 text-2xs">
+        <button
+          type="button"
+          disabled={pending}
+          onClick={() => onReplay("burst")}
+          title="Fire this exact body from N concurrent workers"
+          className="flex items-center gap-1 text-fg-dim hover:text-fg disabled:text-fg-faint"
+        >
+          <Zap size={10} strokeWidth={1.5} />
+          Send to burst
+        </button>
+        {seedable && (
+          <button
+            type="button"
+            disabled={pending}
+            onClick={() => onReplay("fuzzer")}
+            title="Use this body as the fuzzer base payload"
+            className="flex items-center gap-1 text-fg-dim hover:text-fg disabled:text-fg-faint"
+          >
+            <FileInput size={10} strokeWidth={1.5} />
+            Load payload
+          </button>
+        )}
+        {pending && <span className="text-fg-faint">rebuilding</span>}
+      </div>
     </div>
   );
 }

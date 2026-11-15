@@ -8,10 +8,13 @@ is created.
 
 ## Status
 
-Milestone 3: loopback reverse proxy with fault injection, barrier-synchronized concurrency burst
-runner with anomaly detection, filesystem route scanner, deterministic payload fuzzer.
-Not implemented yet: WebSocket proxying, TLS upstreams, per-route fault rules, query-string and
-header fuzzing.
+Milestone 4: loopback reverse proxy with global and route-scoped fault injection,
+barrier-synchronized concurrency burst runner with anomaly detection, filesystem route scanner
+with in-file mount prefix resolution and OpenAPI request body synthesis, deterministic payload
+fuzzer with stack trace and database error detection and fuzz-to-burst replay, embedded target
+lab service with switchable defects.
+Not implemented yet: WebSocket proxying, TLS upstreams, query-string and header fuzzing,
+mount prefixes across files.
 
 ## Layout
 
@@ -237,6 +240,16 @@ keywords, and accept JSON-escaped (`\n`) traces:
 Runtime traces take precedence over database errors found in the same body. The report counts
 affected mutation cases in `disclosures`; a disclosing baseline is reported as a note.
 
+Each finding offers two escalations. "Send to burst" loads the case's exact body, the suite's
+method and its path into the Burst panel, so a payload that broke one request is fired from N
+pre-connected workers (a crash that only appears under contention, or a race on an error
+path). "Load payload" makes the body the fuzzer's base payload for a second suite around it;
+malformed bodies are not offered, since a base must be a JSON object. The report carries
+`baseBody` (the base as sent) and `classes`; `materialize_fuzz_case` regenerates case
+`index` from them instead of the report holding every payload (oversize cases are 64 KiB
+each). Bodies that were not valid UTF-8 come back with `lossy: true` and U+FFFD in place of the
+invalid bytes; the Burst panel shows the replayed case and that substitution.
+
 ## Target lab
 
 An embedded Axum service (`engine/lab.rs`) that gives the burst runner, fuzzer and proxy a
@@ -302,6 +315,7 @@ the handler outcome and live counters.
 | `run_concurrency_burst`  | `spec: BurstSpec`                           | `BurstReport`      |
 | `run_fuzzer_suite`       | `spec: FuzzSpec`                            | `FuzzReport`       |
 | `cancel_fuzzer_suite`    | none                                        | `boolean`          |
+| `materialize_fuzz_case`  | `reference: FuzzCaseRef`                    | `FuzzCasePayload`  |
 | `scan_project_routes`    | `root: string`                              | `RouteScanReport`  |
 | `pick_project_root`      | none                                        | `string \| null`   |
 | `start_lab_server`       | `config: LabConfig`                         | `LabStatus`        |

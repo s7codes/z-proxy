@@ -225,6 +225,28 @@ export interface FuzzReport {
   disclosures: number;
   aborted: string | null;
   notes: string[];
+  /** Base payload exactly as sent in the baseline; with `classes` it reproduces any case. */
+  baseBody: string;
+  /** Classes in execution order. */
+  classes: MutationClass[];
+}
+
+/** Addresses one case of a finished suite for replay. */
+export interface FuzzCaseRef {
+  baseBody: string;
+  classes: MutationClass[];
+  /** `0` is the baseline. */
+  index: number;
+}
+
+export interface FuzzCasePayload {
+  index: number;
+  label: string;
+  body: string;
+  /** Size of the body as sent by the fuzzer. */
+  bytes: number;
+  /** The sent body was not valid UTF-8; invalid sequences in `body` are U+FFFD. */
+  lossy: boolean;
 }
 
 // ---- route scanner --------------------------------------------------------------------

@@ -31,6 +31,8 @@ interface BurstPanelProps {
   body: string;
   onBody: (body: string) => void;
   sampleBody: string | null;
+  /** Set while the body is a replayed fuzz case; editing the body clears it. */
+  origin: string | null;
 }
 
 export function BurstPanel({
@@ -42,6 +44,7 @@ export function BurstPanel({
   body,
   onBody: setBody,
   sampleBody,
+  origin: bodyOrigin,
 }: BurstPanelProps) {
   const { method, path } = request;
   const [workers, setWorkers] = useState(20);
@@ -94,6 +97,11 @@ export function BurstPanel({
               rows={3}
               className="num w-full min-w-0 resize-y rounded-xs border border-line bg-bg px-1.5 py-1 text-xs text-fg-bright outline-none placeholder:text-fg-faint focus:border-fg-faint"
             />
+            {bodyOrigin !== null && (
+              <div className="num truncate pt-0.5 text-2xs text-warn" title={bodyOrigin}>
+                {bodyOrigin}
+              </div>
+            )}
             {sampleBody !== null && (
               <SampleHint active={body === sampleBody} onLoad={() => setBody(sampleBody)} />
             )}

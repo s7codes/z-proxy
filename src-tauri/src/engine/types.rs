@@ -319,6 +319,32 @@ pub struct FuzzReport {
     pub aborted: Option<String>,
     /// Context that changes how results read, such as a baseline that was not accepted.
     pub notes: Vec<String>,
+    /// Base payload exactly as sent in the baseline; with `classes` it reproduces any case.
+    pub base_body: String,
+    /// Classes in execution order.
+    pub classes: Vec<MutationClass>,
+}
+
+/// Addresses one case of a finished suite for replay.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FuzzCaseRef {
+    pub base_body: String,
+    pub classes: Vec<MutationClass>,
+    /// `0` is the baseline.
+    pub index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FuzzCasePayload {
+    pub index: u32,
+    pub label: String,
+    pub body: String,
+    /// Size of the body as sent by the fuzzer.
+    pub bytes: u64,
+    /// The sent body was not valid UTF-8; invalid sequences in `body` are U+FFFD.
+    pub lossy: bool,
 }
 
 // ---- route scanner --------------------------------------------------------------------

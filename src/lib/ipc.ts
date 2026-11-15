@@ -7,6 +7,8 @@ import type {
   EngineStatus,
   FaultProfile,
   FaultRule,
+  FuzzCasePayload,
+  FuzzCaseRef,
   FuzzReport,
   FuzzSpec,
   LabConfig,
@@ -115,6 +117,11 @@ export function runConcurrencyBurst(spec: BurstSpec): Promise<IpcResult<BurstRep
 
 export function runFuzzerSuite(spec: FuzzSpec): Promise<IpcResult<FuzzReport>> {
   return call<FuzzReport>("run_fuzzer_suite", { spec });
+}
+
+/** Rebuilds one case's request body from a report's base body and classes. */
+export function materializeFuzzCase(reference: FuzzCaseRef): Promise<IpcResult<FuzzCasePayload>> {
+  return call<FuzzCasePayload>("materialize_fuzz_case", { reference });
 }
 
 /** `true` when a running suite was asked to stop; it ends after the in-flight case. */

@@ -36,6 +36,7 @@ pub fn run() {
             commands::run_concurrency_burst,
             commands::run_fuzzer_suite,
             commands::cancel_fuzzer_suite,
+            commands::materialize_fuzz_case,
             commands::scan_project_routes,
             commands::pick_project_root,
             commands::start_lab_server,
