@@ -1,5 +1,5 @@
 [package]
-name = "chaosproxy"
+name = "z-proxy"
 version = "0.1.0"
 description = "Local API resilience, fault injection and telemetry suite"
 edition = "2021"
@@ -8,7 +8,7 @@ publish = false
 
 [lib]
 # Distinct lib name avoids the bin/lib name collision on Windows (cargo#8519).
-name = "chaosproxy_lib"
+name = "z_proxy_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

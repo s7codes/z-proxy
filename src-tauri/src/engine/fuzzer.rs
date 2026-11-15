@@ -40,13 +40,13 @@ const MAX_CASES: usize = 1_024;
 const PREVIEW_BYTES: usize = 2 * 1024;
 /// Consecutive connect failures that end a run: the target is down, not flaky.
 const UNREACHABLE_LIMIT: u32 = 3;
-const USER_AGENT: &str = concat!("chaosproxy-fuzzer/", env!("CARGO_PKG_VERSION"));
-const CASE_HEADER: &str = "x-chaosproxy-fuzz-case";
-const PAD_FIELD: &str = "chaosproxyPad";
-const UTF8_FIELD: &str = "chaosproxyUtf8";
+const USER_AGENT: &str = concat!("z-proxy-fuzzer/", env!("CARGO_PKG_VERSION"));
+const CASE_HEADER: &str = "x-zproxy-fuzz-case";
+const PAD_FIELD: &str = "zproxyPad";
+const UTF8_FIELD: &str = "zproxyUtf8";
 /// Serialized in place of a field, then replaced byte-wise with content serde_json refuses
 /// to emit (a bare `NaN`, invalid UTF-8).
-const MARKER: &str = "__chaosproxy_marker_7f3a__";
+const MARKER: &str = "__zproxy_marker_7f3a__";
 
 const ALL_CLASSES: [MutationClass; 7] = [
     MutationClass::NullInjection,
@@ -132,12 +132,12 @@ struct Field {
 fn default_template() -> Map<String, Value> {
     let template = json!({
         "id": 1,
-        "name": "chaosproxy",
-        "email": "fuzz@chaosproxy.invalid",
+        "name": "z-proxy",
+        "email": "fuzz@zproxy.invalid",
         "quantity": 1,
         "active": true,
         "tags": ["alpha"],
-        "meta": { "source": "chaosproxy" }
+        "meta": { "source": "z-proxy" }
     });
     match template {
         Value::Object(map) => map,
@@ -1021,10 +1021,7 @@ mod tests {
     fn oversized_fields_and_pointer_escaping() {
         let cases = cases_of(MutationClass::OversizedField);
         assert!(cases.iter().all(|case| case.body.len() > OVERSIZED_LEN));
-        assert_eq!(
-            cases.last().unwrap().pointer.as_deref(),
-            Some("/chaosproxyPad")
-        );
+        assert_eq!(cases.last().unwrap().pointer.as_deref(), Some("/zproxyPad"));
         assert_eq!(pointer(&["a/b".to_owned(), "c~d".to_owned()]), "/a~1b/c~0d");
     }
 

@@ -29,8 +29,8 @@ use crate::telemetry::{now_us, TelemetryHub};
 
 pub const MAX_WORKERS: u16 = 100;
 const MAX_TIMEOUT_MS: u32 = 60_000;
-const USER_AGENT: &str = concat!("chaosproxy-burst/", env!("CARGO_PKG_VERSION"));
-const WORKER_HEADER: &str = "x-chaosproxy-burst-worker";
+const USER_AGENT: &str = concat!("z-proxy-burst/", env!("CARGO_PKG_VERSION"));
+const WORKER_HEADER: &str = "x-zproxy-burst-worker";
 
 /// Statuses that mean a request lost a uniqueness, precondition or idempotency check.
 const CONFLICT_STATUSES: [u16; 6] = [409, 412, 422, 423, 425, 429];

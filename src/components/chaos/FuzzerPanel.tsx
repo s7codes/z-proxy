@@ -34,12 +34,12 @@ const SHORT: Record<MutationClass, string> = Object.fromEntries(CLASSES.map((c) 
 // exactly what an empty payload field sends.
 const TEMPLATE = `{
   "id": 1,
-  "name": "chaosproxy",
-  "email": "fuzz@chaosproxy.invalid",
+  "name": "z-proxy",
+  "email": "fuzz@zproxy.invalid",
   "quantity": 1,
   "active": true,
   "tags": ["alpha"],
-  "meta": { "source": "chaosproxy" }
+  "meta": { "source": "z-proxy" }
 }`;
 
 const MAX_LISTED_FINDINGS = 200;

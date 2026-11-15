@@ -40,12 +40,12 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
-const FAULT_HEADER: &str = "x-chaosproxy-fault";
-const DELAY_HEADER: &str = "x-chaosproxy-injected-delay-us";
-const ERROR_HEADER: &str = "x-chaosproxy-error";
+const FAULT_HEADER: &str = "x-zproxy-fault";
+const DELAY_HEADER: &str = "x-zproxy-injected-delay-us";
+const ERROR_HEADER: &str = "x-zproxy-error";
 const FORWARDED_HOST: &str = "x-forwarded-host";
 const FORWARDED_FOR: &str = "x-forwarded-for";
-const VIA: &str = "1.1 chaosproxy";
+const VIA: &str = "1.1 z-proxy";
 
 /// RFC 9110 section 7.6.1 connection-specific fields.
 static HOP_BY_HOP: [HeaderName; 8] = [
@@ -621,7 +621,7 @@ fn injected_reply(status: StatusCode) -> Reply {
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
     }
     let body =
-        serde_json::json!({ "error": "injected_fault", "status": code, "source": "chaosproxy" });
+        serde_json::json!({ "error": "injected_fault", "status": code, "source": "z-proxy" });
     Reply {
         status,
         headers,
@@ -638,7 +638,7 @@ fn error_reply(status: StatusCode, error: &str, detail: &str) -> Reply {
     if let Ok(value) = HeaderValue::try_from(error) {
         headers.insert(HeaderName::from_static(ERROR_HEADER), value);
     }
-    let body = serde_json::json!({ "error": error, "detail": detail, "source": "chaosproxy" });
+    let body = serde_json::json!({ "error": error, "detail": detail, "source": "z-proxy" });
     Reply {
         status,
         headers,
@@ -817,7 +817,7 @@ mod tests {
         let body = response.text().await.unwrap();
 
         let expected = format!(
-            "POST /api/items?x=1 host=127.0.0.1:{} via=1.1 chaosproxy xfh={proxy} xff=127.0.0.1 hop=- ka=- body=5",
+            "POST /api/items?x=1 host=127.0.0.1:{} via=1.1 z-proxy xfh={proxy} xff=127.0.0.1 hop=- ka=- body=5",
             h.upstream.port()
         );
         assert_eq!(body, expected);

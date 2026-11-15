@@ -1,4 +1,4 @@
-# ChaosProxy
+# z-proxy
 
 Desktop fault-injection and telemetry workbench for HTTP services running on the local machine.
 Tauri v2 shell, Rust engine on the Tokio runtime, React 19 operator UI.
@@ -88,9 +88,9 @@ Fault profile, applied per request while armed, in this order:
 | `statusMutation` | 429/5xx      | Synthetic JSON response; upstream is not contacted        |
 | `mutationRate`   | 0-100 %      | Probability of the status mutation                        |
 
-Synthetic responses carry `x-chaosproxy-fault: status-<code>`; 429 adds `Retry-After: 1`.
-Forwarded responses that were delayed carry `x-chaosproxy-injected-delay-us`. Upstream
-failures return 502, response timeouts 504, both with `x-chaosproxy-error`. The profile can be
+Synthetic responses carry `x-zproxy-fault: status-<code>`; 429 adds `Retry-After: 1`.
+Forwarded responses that were delayed carry `x-zproxy-injected-delay-us`. Upstream
+failures return 502, response timeouts 504, both with `x-zproxy-error`. The profile can be
 changed while the listener runs and survives listener restarts.
 
 Route rules (`set_fault_rules`) bind a profile to one route:
@@ -205,7 +205,7 @@ addressed by RFC 6901 pointer, nested objects to depth 3, at most 48 fields.
 
 The default template yields 86 cases. An unmutated baseline request runs first. Cases run
 sequentially, one connection each, with `Connection: close` and
-`x-chaosproxy-fuzz-case: <index>`; `Content-Type: application/json` is added unless the operator
+`x-zproxy-fuzz-case: <index>`; `Content-Type: application/json` is added unless the operator
 sets one.
 
 | Response                                   | Verdict            | Severity               |
@@ -330,6 +330,23 @@ Event kinds: `engineHeartbeat` (1 Hz), `guardDecision`, `probeCompleted`,
 `proxyStateChanged`, `proxyExchange`, `burstStarted`, `burstSample`, `burstCompleted`,
 `fuzzerStarted`, `fuzzerCaseCompleted`, `fuzzerCompleted`, `routeScanCompleted`,
 `labStateChanged`, `labExchange`.
+
+## Wire identifiers
+
+Every value the engine writes onto the wire, so upstream logs can attribute test traffic:
+
+| Origin       | Field                          | Value                                    |
+|--------------|--------------------------------|------------------------------------------|
+| Proxy        | `Via`                          | `1.1 z-proxy`                            |
+| Proxy        | `x-zproxy-fault`               | `status-<code>` on synthetic responses   |
+| Proxy        | `x-zproxy-injected-delay-us`   | Applied delay on forwarded responses     |
+| Proxy        | `x-zproxy-error`               | Upstream failure class on 502/504        |
+| Proxy        | JSON body `source`             | `z-proxy` on synthetic and error bodies  |
+| Burst runner | `User-Agent`                   | `z-proxy-burst/<version>` unless set     |
+| Burst runner | `x-zproxy-burst-worker`        | Worker number, 1-based                   |
+| Fuzzer       | `User-Agent`                   | `z-proxy-fuzzer/<version>` unless set    |
+| Fuzzer       | `x-zproxy-fuzz-case`           | Case index, `0` for the baseline         |
+| Fuzzer       | Added fields                   | `zproxyPad`, `zproxyUtf8`                |
 
 ## Requirements
 

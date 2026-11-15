@@ -474,7 +474,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!("chaosproxy-scan-{}", Uuid::new_v4()));
+            let root = std::env::temp_dir().join(format!("zproxy-scan-{}", Uuid::new_v4()));
             fs::create_dir_all(&root).unwrap();
             Self { root }
         }

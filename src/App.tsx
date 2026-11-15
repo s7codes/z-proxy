@@ -276,7 +276,7 @@ export function App() {
   return (
     <div className="flex h-full flex-col bg-bg text-fg">
       <header className="flex h-8 shrink-0 items-center gap-3 border-b border-line bg-panel px-2.5">
-        <span className="text-sm font-semibold tracking-tight text-fg-bright">ChaosProxy</span>
+        <span className="text-sm font-semibold tracking-tight text-fg-bright">z-proxy</span>
         <span className="h-3.5 w-px bg-line" />
         <span className="text-xs text-fg-dim">workspace</span>
         <span className="num text-xs text-fg">local</span>

@@ -2,7 +2,7 @@ import { useCallback, useRef, useState } from "react";
 import { pickProjectRoot, scanProjectRoutes, type TransportError } from "../lib/ipc";
 import type { EngineError, RouteScanReport } from "../lib/types";
 
-const ROOT_KEY = "chaosproxy.scanRoot";
+const ROOT_KEY = "zproxy.scanRoot";
 
 export interface RouteScanControl {
   root: string;

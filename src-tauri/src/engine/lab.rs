@@ -349,7 +349,7 @@ async fn index(State(shared): State<Arc<Shared>>) -> Response {
     json_reply(
         StatusCode::OK,
         &json!({
-            "service": "chaosproxy-target-lab",
+            "service": "z-proxy-target-lab",
             "mode": shared.mode(),
             "spec": SPEC_PATH,
             "endpoints": ["GET /api/v1/health", "POST /api/v1/coupons/redeem", "POST /api/v1/orders/checkout"]
@@ -941,7 +941,7 @@ pub fn openapi_document(base_url: Option<&str>) -> String {
     let document = json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "ChaosProxy Target Lab",
+            "title": "z-proxy Target Lab",
             "version": env!("CARGO_PKG_VERSION"),
             "description": "Embedded loopback service with switchable defects: unprotected or hardened."
         },
@@ -1182,7 +1182,7 @@ mod tests {
             with("customer.email", json!("")),
             with("giftWrap", json!("yes")),
             omit("note"),
-            with("chaosproxyPad", json!("x".repeat(70_000))),
+            with("zproxyPad", json!("x".repeat(70_000))),
         ] {
             assert!(
                 matches!(unprotected_checkout(&body), Checkout::Created { .. }),
@@ -1229,7 +1229,7 @@ mod tests {
             with("customer.role", json!("admin")),
             with("note", json!(1)),
             with("giftWrap", json!("yes")),
-            with("chaosproxyPad", json!("x")),
+            with("zproxyPad", json!("x")),
             with("sku", json!("A".repeat(40_000))),
             b"[]".to_vec(),
         ];
