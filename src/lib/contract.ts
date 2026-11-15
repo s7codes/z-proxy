@@ -12,6 +12,7 @@ export const VIOLATION_LABEL: Record<ContractViolationKind, string> = {
   undocumentedStatus: "undocumented status",
   missingRequiredField: "missing field",
   responseTypeMismatch: "type mismatch",
+  constraintViolation: "constraint",
 };
 
 export function describeViolation(violation: ContractViolation): string {
@@ -52,5 +53,10 @@ export function contractSummary(contract: ResponseContract): string {
     ...(contract.hasDefault ? ["default"] : []),
   ];
   const fields = contract.fields.filter((field) => field.pointer !== "").length;
-  return `${statuses.join(" ")}${contract.bodyStatus === null ? "" : `; ${fields} fields on ${contract.bodyStatus}`}`;
+  const constrained = contract.fields.filter((field) => (field.constraints ?? null) !== null).length;
+  const body =
+    contract.bodyStatus === null
+      ? ""
+      : `; ${fields} fields on ${contract.bodyStatus}${constrained > 0 ? `, ${constrained} constrained` : ""}`;
+  return `${statuses.join(" ")}${body}`;
 }

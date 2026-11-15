@@ -23,6 +23,7 @@ use tokio::sync::Barrier;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
+use super::contract;
 use super::error::{EngineError, EngineResult};
 use super::guard::GuardedTarget;
 use super::http1::{self, RequestTemplate, SplitConnection, CONNECT_TIMEOUT};
@@ -30,7 +31,8 @@ use super::net;
 use super::pathparam;
 use super::types::{
     Anomaly, AnomalyKind, BurstMethod, BurstReport, BurstSpec, BurstSyncMode, HeaderPair,
-    LatencyStats, Severity, SizeStats, StatusBucket, TelemetryEvent, WorkerSample,
+    LatencyStats, ResponseContract, Severity, SizeStats, StatusBucket, TelemetryEvent,
+    WorkerSample,
 };
 use crate::telemetry::{now_us, TelemetryHub};
 
@@ -42,6 +44,9 @@ pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 
 /// Statuses that mean a request lost a uniqueness, precondition or idempotency check.
 const CONFLICT_STATUSES: [u16; 6] = [409, 412, 422, 423, 425, 429];
+/// Body bytes a worker keeps for the contract check; a longer body is checked by status
+/// only. Bounds a 100-worker burst at 6.4 MiB of retained bodies.
+const CONTRACT_BODY_BYTES: usize = 64 * 1024;
 
 struct Prepared {
     template: RequestTemplate,
@@ -50,9 +55,27 @@ struct Prepared {
     expected_max_successes: Option<u16>,
     idempotency_key: Option<String>,
     sync_mode: BurstSyncMode,
+    contract: Option<ResponseContract>,
+}
+
+/// A worker's sample and the body it captured for the contract check, which the collector
+/// runs after the timed section so parsing never delays another worker's I/O.
+struct Finished {
+    sample: WorkerSample,
+    /// The complete body; `None` without a contract, without a response, or when the body
+    /// outgrew `CONTRACT_BODY_BYTES`.
+    body: Option<Vec<u8>>,
 }
 
 impl Prepared {
+    fn preview_limit(&self) -> usize {
+        if self.contract.is_some() {
+            CONTRACT_BODY_BYTES
+        } else {
+            0
+        }
+    }
+
     fn request(&self, worker: u16) -> Request<Full<Bytes>> {
         let mut request = self.template.request(self.body.clone());
         let headers = request.headers_mut();
@@ -100,7 +123,10 @@ pub async fn run(spec: BurstSpec, hub: &TelemetryHub) -> EngineResult<BurstRepor
     let mut samples = Vec::with_capacity(usize::from(workers));
     while let Some(joined) = tasks.join_next().await {
         match joined {
-            Ok(sample) => {
+            Ok(Finished { mut sample, body }) => {
+                if let (Some(contract), Some(status)) = (&prepared.contract, sample.status) {
+                    sample.violations = contract::check(contract, status, body.as_deref());
+                }
                 hub.publish(TelemetryEvent::BurstSample {
                     seq: hub.next_seq(),
                     id,
@@ -206,6 +232,7 @@ fn prepare(spec: &BurstSpec) -> EngineResult<Prepared> {
         expected_max_successes: spec.expected_max_successes,
         idempotency_key,
         sync_mode: spec.sync_mode.unwrap_or_default(),
+        contract: spec.contract.clone(),
     })
 }
 
@@ -214,7 +241,7 @@ async fn run_worker(
     prepared: Arc<Prepared>,
     barrier: Arc<Barrier>,
     release: Arc<OnceLock<Instant>>,
-) -> WorkerSample {
+) -> Finished {
     match prepared.sync_mode {
         BurstSyncMode::PreConnected => pre_connected(worker, &prepared, &barrier, &release).await,
         BurstSyncMode::LastByte => last_byte(worker, &prepared, &barrier, &release).await,
@@ -226,7 +253,7 @@ async fn pre_connected(
     prepared: &Prepared,
     barrier: &Barrier,
     release: &OnceLock<Instant>,
-) -> WorkerSample {
+) -> Finished {
     let connection = tokio::time::timeout(CONNECT_TIMEOUT, http1::open(&prepared.template.target))
         .await
         .map_or_else(
@@ -241,13 +268,17 @@ async fn pre_connected(
 
     let mut sender = match connection {
         Ok(sender) => sender,
-        Err(error) => return failed(worker, None, 0, error),
+        Err(error) => return failed(worker, None, 0, error).into(),
     };
 
     let fired = Instant::now();
     let epoch = *release.get_or_init(|| fired);
     let dispatch_offset_us = Some(duration_us(fired.saturating_duration_since(epoch)));
-    let outcome = tokio::time::timeout(prepared.timeout, exchange(&mut sender, request)).await;
+    let outcome = tokio::time::timeout(
+        prepared.timeout,
+        exchange(&mut sender, request, prepared.preview_limit()),
+    )
+    .await;
     let latency_us = net::elapsed_us(fired);
     sample(
         worker,
@@ -266,7 +297,7 @@ async fn last_byte(
     prepared: &Prepared,
     barrier: &Barrier,
     release: &OnceLock<Instant>,
-) -> WorkerSample {
+) -> Finished {
     let request = prepared.request(worker);
     let wire = http1::encode(&request, &prepared.body);
     let staged = tokio::time::timeout(CONNECT_TIMEOUT, stage(&prepared.template.target, &wire))
@@ -283,14 +314,18 @@ async fn last_byte(
 
     let (mut connection, last, pending) = match staged {
         Ok(staged) => staged,
-        Err(error) => return failed(worker, None, 0, error),
+        Err(error) => return failed(worker, None, 0, error).into(),
     };
 
     let fired = Instant::now();
     let epoch = *release.get_or_init(|| fired);
     let dispatch_offset_us = Some(duration_us(fired.saturating_duration_since(epoch)));
     let written = connection.writer.write_all(&[last]).await;
-    let outcome = tokio::time::timeout(prepared.timeout, http1::exchange_pending(pending, 0)).await;
+    let outcome = tokio::time::timeout(
+        prepared.timeout,
+        http1::exchange_pending(pending, prepared.preview_limit()),
+    )
+    .await;
     let latency_us = net::elapsed_us(fired);
     drop(connection);
     // A server may answer and close before the final byte (431, 413); its response wins
@@ -337,27 +372,42 @@ fn sample(
     dispatch_offset_us: Option<u64>,
     latency_us: u64,
     outcome: Result<Result<http1::Received, String>, tokio::time::error::Elapsed>,
-) -> WorkerSample {
+) -> Finished {
     match outcome {
-        Ok(Ok(received)) => WorkerSample {
-            worker,
-            status: Some(received.status),
-            dispatch_offset_us,
-            ttfb_us: Some(duration_us(
-                received.head_at.saturating_duration_since(fired),
-            )),
-            latency_us,
-            bytes: received.bytes,
-            body_hash: Some(received.hash),
-            error: None,
-        },
-        Ok(Err(error)) => failed(worker, dispatch_offset_us, latency_us, error),
+        Ok(Ok(received)) => {
+            let complete = u64::try_from(received.preview.len()).ok() == Some(received.bytes);
+            let body = (prepared.contract.is_some() && complete).then_some(received.preview);
+            Finished {
+                sample: WorkerSample {
+                    worker,
+                    status: Some(received.status),
+                    dispatch_offset_us,
+                    ttfb_us: Some(duration_us(
+                        received.head_at.saturating_duration_since(fired),
+                    )),
+                    latency_us,
+                    bytes: received.bytes,
+                    body_hash: Some(received.hash),
+                    error: None,
+                    violations: Vec::new(),
+                },
+                body,
+            }
+        }
+        Ok(Err(error)) => failed(worker, dispatch_offset_us, latency_us, error).into(),
         Err(_) => failed(
             worker,
             dispatch_offset_us,
             latency_us,
             format!("timed out after {} ms", prepared.timeout.as_millis()),
-        ),
+        )
+        .into(),
+    }
+}
+
+impl From<WorkerSample> for Finished {
+    fn from(sample: WorkerSample) -> Self {
+        Self { sample, body: None }
     }
 }
 
@@ -368,8 +418,9 @@ fn connect_timeout() -> String {
 async fn exchange(
     sender: &mut SendRequest<Full<Bytes>>,
     request: Request<Full<Bytes>>,
+    preview_limit: usize,
 ) -> Result<http1::Received, String> {
-    http1::exchange(sender, request, 0)
+    http1::exchange(sender, request, preview_limit)
         .await
         .map_err(|err| err.to_string())
 }
@@ -389,6 +440,7 @@ fn failed(
         bytes: 0,
         body_hash: None,
         error: Some(error),
+        violations: Vec::new(),
     }
 }
 
@@ -470,6 +522,7 @@ fn analyze(meta: ReportMeta, samples: Vec<WorkerSample>) -> BurstReport {
         distinct_bodies: count_u32(distinct_bodies),
         expected_max_successes: meta.expected_max_successes,
         idempotency_key: meta.idempotency_key,
+        contract_violations: count_u32(samples.iter().filter(|s| !s.violations.is_empty()).count()),
         anomalies,
         samples,
     }
@@ -638,7 +691,94 @@ fn detect_anomalies(
         });
     }
 
+    anomalies.extend(contract_drift(samples));
     anomalies
+}
+
+/// Responses that broke the documented contract. Under concurrency the typical shape is a
+/// counter read before a concurrent commit and written back past its bound (a balance of
+/// `-1`), or a body assembled from a half-applied update. A drifted 2xx is a fault: the
+/// client took it as success. Drift on refusals alone (an undocumented 409) is a warning.
+fn contract_drift(samples: &[WorkerSample]) -> Option<Anomaly> {
+    let drifted: Vec<&WorkerSample> = samples
+        .iter()
+        .filter(|s| !s.violations.is_empty())
+        .collect();
+    if drifted.is_empty() {
+        return None;
+    }
+    let successes = drifted
+        .iter()
+        .filter(|s| s.status.is_some_and(|status| (200..300).contains(&status)))
+        .count();
+
+    // The most widespread violation, by location and expectation; offending values differ
+    // per worker (-1, -2, ...), so they are listed rather than grouped on.
+    let mut groups: BTreeMap<(Option<&str>, &str), DriftGroup<'_>> = BTreeMap::new();
+    for violation in drifted.iter().flat_map(|s| s.violations.iter()) {
+        let group = groups
+            .entry((violation.pointer.as_deref(), violation.expected.as_str()))
+            .or_default();
+        group.count += 1;
+        if !group.actuals.contains(&violation.actual.as_str()) {
+            group.actuals.push(violation.actual.as_str());
+        }
+    }
+    let headline = groups
+        .iter()
+        .max_by(|a, b| a.1.count.cmp(&b.1.count).then(b.0.cmp(a.0)))
+        .map(|((pointer, expected), group)| describe_drift(*pointer, expected, &group.actuals))
+        .unwrap_or_default();
+    let others = groups.len().saturating_sub(1);
+    let mut workers: Vec<u16> = drifted.iter().map(|s| s.worker).collect();
+    workers.sort_unstable();
+    Some(Anomaly {
+        kind: AnomalyKind::ContractDrift,
+        severity: if successes > 0 {
+            Severity::Fault
+        } else {
+            Severity::Warn
+        },
+        detail: format!(
+            "{} of {} responses broke the response contract, {successes} of them 2xx; {headline}{}",
+            drifted.len(),
+            samples.iter().filter(|s| s.status.is_some()).count(),
+            if others > 0 {
+                format!(
+                    " (+{others} other violation{})",
+                    if others == 1 { "" } else { "s" }
+                )
+            } else {
+                String::new()
+            }
+        ),
+        workers,
+    })
+}
+
+/// Occurrences of one (location, expectation) pair and the distinct values that broke it.
+#[derive(Default)]
+struct DriftGroup<'a> {
+    count: usize,
+    actuals: Vec<&'a str>,
+}
+
+fn describe_drift(pointer: Option<&str>, expected: &str, actuals: &[&str]) -> String {
+    const LISTED: usize = 4;
+    let mut values = actuals
+        .iter()
+        .take(LISTED)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if actuals.len() > LISTED {
+        values.push_str(", ...");
+    }
+    match pointer {
+        None => format!("status {values} not documented ({expected})"),
+        Some("") => format!("body: expected {expected}, got {values}"),
+        Some(pointer) => format!("{pointer}: expected {expected}, got {values}"),
+    }
 }
 
 /// A deduplicating handler answers every request carrying one key with the stored response
@@ -728,7 +868,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::engine::types::HeaderPair;
+    use crate::engine::types::{ContractViolation, ContractViolationKind, HeaderPair};
 
     async fn serve(router: Router) -> SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -748,6 +888,7 @@ mod tests {
             expected_max_successes: None,
             idempotency_mode: false,
             sync_mode: None,
+            contract: None,
         }
     }
 
@@ -761,7 +902,79 @@ mod tests {
             bytes: 10,
             body_hash: status.map(|_| hash.to_owned()),
             error: status.is_none().then(|| "connection refused".to_owned()),
+            violations: Vec::new(),
         }
+    }
+
+    fn drifted(
+        mut sample: WorkerSample,
+        pointer: Option<&str>,
+        expected: &str,
+        actual: &str,
+    ) -> WorkerSample {
+        sample.violations.push(ContractViolation {
+            kind: if pointer.is_some() {
+                ContractViolationKind::ConstraintViolation
+            } else {
+                ContractViolationKind::UndocumentedStatus
+            },
+            pointer: pointer.map(str::to_owned),
+            expected: expected.to_owned(),
+            actual: actual.to_owned(),
+        });
+        sample
+    }
+
+    #[test]
+    fn contract_drift_under_load() {
+        let mut samples = vec![sample(1, Some(200), 100, "a")];
+        samples.extend((2..=3).map(|w| {
+            drifted(
+                sample(w, Some(200), 100, &format!("b{w}")),
+                Some("/remainingUses"),
+                ">= 0",
+                &format!("-{}", w - 1),
+            )
+        }));
+        samples.extend((4..=10).map(|w| sample(w, Some(409), 100, "c")));
+        let report = analyze(meta(10), samples);
+        let drift = report
+            .anomalies
+            .iter()
+            .find(|a| a.kind == AnomalyKind::ContractDrift)
+            .expect("contract drift");
+        assert_eq!(drift.severity, Severity::Fault);
+        assert_eq!(drift.workers, [2, 3]);
+        assert_eq!(
+            drift.detail,
+            "2 of 10 responses broke the response contract, 2 of them 2xx; /remainingUses: expected >= 0, got -1, -2"
+        );
+        assert_eq!(report.contract_violations, 2);
+
+        // Only refusals drifted: the contract is incomplete, the service did not misbehave.
+        let mut refusals = vec![sample(1, Some(201), 100, "a")];
+        refusals.extend((2..=5).map(|w| {
+            drifted(
+                sample(w, Some(409), 100, "c"),
+                None,
+                "one of 201, 422",
+                "409",
+            )
+        }));
+        let report = analyze(meta(5), refusals);
+        assert_eq!(kinds(&report), [AnomalyKind::ContractDrift]);
+        assert_eq!(report.anomalies[0].severity, Severity::Warn);
+        assert_eq!(
+            report.anomalies[0].detail,
+            "4 of 5 responses broke the response contract, 0 of them 2xx; status 409 not documented (one of 201, 422)"
+        );
+
+        let clean = analyze(
+            meta(3),
+            (1..=3).map(|w| sample(w, Some(200), 1, "x")).collect(),
+        );
+        assert!(clean.anomalies.is_empty());
+        assert_eq!(clean.contract_violations, 0);
     }
 
     fn meta(workers: u16) -> ReportMeta {
@@ -1376,7 +1589,8 @@ mod tests {
         let sample = tokio::time::timeout(Duration::from_secs(5), worker)
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .sample;
         assert_eq!(sample.status, Some(200), "{sample:?}");
         assert_eq!(sample.bytes, 2);
         assert_eq!(sample.dispatch_offset_us, Some(0));

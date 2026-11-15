@@ -112,6 +112,8 @@ export interface BurstSpec {
   idempotencyMode: boolean;
   /** `null` is `preConnected`. */
   syncMode?: BurstSyncMode | null;
+  /** Documented responses of the targeted operation; every response is checked against it. */
+  contract?: ResponseContract | null;
 }
 
 export interface WorkerSample {
@@ -125,6 +127,8 @@ export interface WorkerSample {
   bytes: number;
   bodyHash: string | null;
   error: string | null;
+  /** Drift of this response from the spec's `contract`; empty without one. */
+  violations: ContractViolation[];
 }
 
 export interface StatusBucket {
@@ -151,7 +155,9 @@ export type AnomalyKind =
   | "statusDivergence"
   | "bodyDivergence"
   | "transportErrors"
-  | "idempotencyViolation";
+  | "idempotencyViolation"
+  /** Responses that broke the spec's contract under load; `fault` when a 2xx drifted. */
+  | "contractDrift";
 
 export type Severity = "warn" | "fault";
 
@@ -181,6 +187,8 @@ export interface BurstReport {
   expectedMaxSuccesses: number | null;
   /** Key every worker sent in idempotency mode. */
   idempotencyKey: string | null;
+  /** Responses that broke the spec's `contract`; 0 without one. */
+  contractViolations: number;
   anomalies: Anomaly[];
   samples: WorkerSample[];
 }
@@ -380,6 +388,32 @@ export interface ContractField {
   kinds: JsonKind[];
   /** Listed in the parent schema's `required`; nested fields are checked while the parent is present. */
   required: boolean;
+  /** Value constraints declared on the field's schema; `null` when it declares none. */
+  constraints?: ValueConstraints | null;
+}
+
+/** String formats the contract check validates; any other `format` is not checked. */
+export type StringFormat = "uuid" | "email" | "dateTime" | "date";
+
+export interface NumericBound {
+  value: number;
+  /** `exclusiveMinimum` / `exclusiveMaximum` (3.0 flag or 3.1 number). */
+  exclusive: boolean;
+}
+
+/** A scalar `enum` member. */
+export type EnumValue = string | number | boolean | null;
+
+/** Constraints on a field's value beyond its type; a `null` value is never judged against them. */
+export interface ValueConstraints {
+  minimum: NumericBound | null;
+  maximum: NumericBound | null;
+  /** String length in Unicode scalar values. */
+  minLength: number | null;
+  maxLength: number | null;
+  /** Members of an all-scalar `enum` (or a scalar `const`). */
+  enumValues: EnumValue[] | null;
+  format: StringFormat | null;
 }
 
 export interface ResponseContract {
@@ -394,7 +428,12 @@ export interface ResponseContract {
   fields: ContractField[];
 }
 
-export type ContractViolationKind = "undocumentedStatus" | "missingRequiredField" | "responseTypeMismatch";
+export type ContractViolationKind =
+  | "undocumentedStatus"
+  | "missingRequiredField"
+  | "responseTypeMismatch"
+  /** A correctly typed value outside its documented bounds, length, enum or format. */
+  | "constraintViolation";
 
 export interface ContractViolation {
   kind: ContractViolationKind;

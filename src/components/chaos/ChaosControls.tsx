@@ -106,6 +106,7 @@ export function ChaosControls(props: ChaosControlsProps) {
           onBody={props.onBurstBody}
           sampleBody={sampleBody}
           origin={props.burstOrigin}
+          contract={contractFor(route, target.method, target.path)}
         />
       )}
       {tab === "fuzzer" && (

@@ -600,15 +600,21 @@ async fn redeem(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
 
 /// The documented `Redemption` schema. Unprotected still emits the field under its
 /// pre-rename name, so `discountCents` is missing from the response.
+///
+/// `remainingUses` is derived from the grant count. Hardened grants at most the limit, so it
+/// never drops below 0; every extra winner of the unprotected race takes it one lower,
+/// which breaks the documented `minimum: 0` in the response itself.
 fn redeemed(mode: LabMode, granted: u32, outcome: &str) -> Response {
     let discount_key = match mode {
         LabMode::Unprotected => "discount",
         LabMode::Hardened => "discountCents",
     };
-    let mut body = Map::with_capacity(4);
+    let remaining = i64::from(COUPON_LIMIT) - i64::from(granted);
+    let mut body = Map::with_capacity(5);
     body.insert("status".to_owned(), json!("redeemed"));
     body.insert("code".to_owned(), json!(COUPON_CODE));
     body.insert(discount_key.to_owned(), json!(DISCOUNT_CENTS));
+    body.insert("remainingUses".to_owned(), json!(remaining));
     body.insert(
         "redemptionId".to_owned(),
         json!(format!("rdm-{granted:06}")),
@@ -1587,11 +1593,12 @@ pub fn openapi_document(base_url: Option<&str>) -> String {
                 },
                 "Redemption": {
                     "type": "object",
-                    "required": ["status", "code", "discountCents", "redemptionId"],
+                    "required": ["status", "code", "discountCents", "remainingUses", "redemptionId"],
                     "properties": {
                         "status": { "type": "string", "enum": ["redeemed"] },
                         "code": { "type": "string" },
                         "discountCents": { "type": "integer", "minimum": 0 },
+                        "remainingUses": { "type": "integer", "format": "int32", "minimum": 0 },
                         "redemptionId": { "type": "string" }
                     }
                 },
@@ -1631,9 +1638,10 @@ mod tests {
     use crate::engine::fuzzer::{self, FuzzerSlot};
     use crate::engine::proxy::ProxyManager;
     use crate::engine::types::{
-        AnomalyKind, BurstMethod, BurstSpec, ContractViolation, ContractViolationKind,
-        DisclosureKind, FuzzSpec, FuzzVerdict, HeaderPair, MutationClass, ProxyConfig,
-        ResponseContract, RouteContract, RouteMethod, Severity, TrafficFindingKind,
+        AnomalyKind, BurstMethod, BurstSpec, BurstSyncMode, ContractViolation,
+        ContractViolationKind, DisclosureKind, FuzzSpec, FuzzVerdict, HeaderPair, MutationClass,
+        ProxyConfig, ResponseContract, RouteContract, RouteMethod, Severity, TrafficFindingKind,
+        WorkerSample,
     };
     use crate::scanner::routes;
 
@@ -2026,6 +2034,7 @@ mod tests {
             expected_max_successes: Some(1),
             idempotency_mode: false,
             sync_mode: None,
+            contract: None,
         }
     }
 
@@ -2096,6 +2105,62 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn redeem_race_breaks_the_documented_balance_only_when_unprotected() {
+        let (hub, lab, base) = started(LabMode::Unprotected).await;
+        let burst = || BurstSpec {
+            sync_mode: Some(BurstSyncMode::LastByte),
+            contract: Some(lab_contract(
+                &base,
+                RouteMethod::Post,
+                "/api/v1/coupons/redeem",
+            )),
+            ..redeem_burst(&base)
+        };
+
+        let report = concurrency::run(burst(), &hub).await.unwrap();
+        assert_eq!(report.sync_mode, BurstSyncMode::LastByte);
+        let kinds: Vec<AnomalyKind> = report.anomalies.iter().map(|a| a.kind).collect();
+        assert!(kinds.contains(&AnomalyKind::RaceWindow), "{kinds:?}");
+        let drift = report
+            .anomalies
+            .iter()
+            .find(|a| a.kind == AnomalyKind::ContractDrift)
+            .expect("contract drift under the race");
+        assert_eq!(drift.severity, Severity::Fault);
+        let winners: Vec<&WorkerSample> = report
+            .samples
+            .iter()
+            .filter(|s| s.status == Some(200))
+            .collect();
+        assert!(winners.len() >= 2, "{:?}", report.status_histogram);
+        // Every winner carries the renamed field; every winner past the first also carries a
+        // balance below the documented minimum.
+        let negative: Vec<&str> = winners
+            .iter()
+            .flat_map(|s| s.violations.iter())
+            .filter(|v| {
+                v.kind == ContractViolationKind::ConstraintViolation
+                    && v.pointer.as_deref() == Some("/remainingUses")
+            })
+            .map(|v| v.actual.as_str())
+            .collect();
+        assert_eq!(negative.len(), winners.len() - 1, "{negative:?}");
+        assert!(negative.contains(&"-1"), "{negative:?}");
+        assert!(winners.iter().all(|s| s
+            .violations
+            .iter()
+            .any(|v| v.pointer.as_deref() == Some("/discountCents"))));
+        assert_eq!(report.contract_violations as usize, winners.len());
+
+        lab.set_mode(LabMode::Hardened).await;
+        let report = concurrency::run(burst(), &hub).await.unwrap();
+        assert!(report.anomalies.is_empty(), "{:?}", report.anomalies);
+        assert_eq!(report.contract_violations, 0);
+        assert!(report.samples.iter().all(|s| s.violations.is_empty()));
+        lab.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn checkout_replays_one_idempotency_key_only_when_hardened() {
         let (hub, lab, base) = started(LabMode::Unprotected).await;
         let burst = || BurstSpec {
@@ -2111,6 +2176,7 @@ mod tests {
             expected_max_successes: None,
             idempotency_mode: true,
             sync_mode: None,
+            contract: None,
         };
         let created = |report: &crate::engine::types::BurstReport| {
             report

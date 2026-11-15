@@ -12,7 +12,9 @@
 use serde_json::{json, Map, Number, Value};
 
 use crate::engine::contract;
-use crate::engine::types::{ContractField, JsonKind, ResponseContract};
+use crate::engine::types::{
+    ContractField, JsonKind, NumericBound, ResponseContract, StringFormat, ValueConstraints,
+};
 
 const MAX_DEPTH: usize = 8;
 const MAX_PROPERTIES: usize = 32;
@@ -23,6 +25,9 @@ const CONTRACT_DEPTH: usize = 3;
 const MAX_CONTRACT_FIELDS: usize = 96;
 /// Success statuses whose body schema becomes the field contract, in preference order.
 const BODY_STATUSES: [u16; 2] = [200, 201];
+/// Larger enums are not carried into the contract; a list that long is a lookup table, and
+/// every response would pay for the linear scan.
+const MAX_ENUM_MEMBERS: usize = 64;
 
 /// Pretty-printed JSON sample for the request body of `operation`; `root` is the whole
 /// document, used to resolve local `$ref`s. `None` when no JSON body is declared.
@@ -143,6 +148,7 @@ fn contract_fields(root: &Value, schema: &Value) -> Vec<ContractField> {
         pointer: String::new(),
         kinds: schema_kinds(root, schema, 0),
         required: true,
+        constraints: value_constraints(schema),
     }];
     collect_properties(root, schema, "", 0, &mut fields);
     fields
@@ -179,11 +185,66 @@ fn collect_properties(
             pointer: pointer.clone(),
             kinds,
             required: required.contains(&name.as_str()),
+            constraints: value_constraints(resolved),
         });
         if nested {
             collect_properties(root, resolved, &pointer, depth + 1, out);
         }
     }
+}
+
+/// Constraints declared directly on a resolved schema. Composed schemas (`allOf` parts,
+/// `oneOf` variants) contribute none: which branch a value took is not known here.
+fn value_constraints(schema: &Value) -> Option<ValueConstraints> {
+    let bound = |inclusive: &str, exclusive: &str| match schema.get(exclusive) {
+        // 3.1: the exclusive keyword carries the bound itself.
+        Some(Value::Number(value)) => Some(NumericBound {
+            value: value.clone(),
+            exclusive: true,
+        }),
+        // 3.0: a flag on the inclusive keyword.
+        flag => schema
+            .get(inclusive)
+            .and_then(Value::as_number)
+            .map(|value| NumericBound {
+                value: value.clone(),
+                exclusive: flag.and_then(Value::as_bool) == Some(true),
+            }),
+    };
+    let length = |key: &str| {
+        schema
+            .get(key)
+            .and_then(Value::as_u64)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+    };
+    let scalar = |value: &Value| !matches!(value, Value::Array(_) | Value::Object(_));
+    let enum_values = match (schema.get("const"), schema.get("enum")) {
+        (Some(value), _) if scalar(value) => Some(vec![value.clone()]),
+        (_, Some(Value::Array(members)))
+            if !members.is_empty()
+                && members.len() <= MAX_ENUM_MEMBERS
+                && members.iter().all(scalar) =>
+        {
+            Some(members.clone())
+        }
+        _ => None,
+    };
+    let format = match schema.get("format").and_then(Value::as_str) {
+        Some("uuid") => Some(StringFormat::Uuid),
+        Some("email") => Some(StringFormat::Email),
+        Some("date-time") => Some(StringFormat::DateTime),
+        Some("date") => Some(StringFormat::Date),
+        _ => None,
+    };
+    let constraints = ValueConstraints {
+        minimum: bound("minimum", "exclusiveMinimum"),
+        maximum: bound("maximum", "exclusiveMaximum"),
+        min_length: length("minLength"),
+        max_length: length("maxLength"),
+        enum_values,
+        format,
+    };
+    (constraints != ValueConstraints::default()).then_some(constraints)
 }
 
 /// Properties and `required` names of an object schema with its `allOf` parts merged. A
@@ -710,6 +771,88 @@ mod tests {
         let open = contract(&root, "/open", "get").unwrap();
         assert!(open.has_default && open.statuses.is_empty());
         assert_eq!(contract(&root, "/bare", "get"), None);
+    }
+
+    #[test]
+    fn response_contracts_carry_value_constraints() {
+        let root = json!({
+            "openapi": "3.1.0",
+            "paths": { "/r": { "post": { "responses": { "200": { "content": { "application/json": { "schema": {
+                "type": "object",
+                "properties": {
+                    "remainingUses": { "type": "integer", "minimum": 0 },
+                    "ratio": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+                    "legacy": { "type": "number", "minimum": 5, "exclusiveMinimum": true },
+                    "status": { "type": "string", "enum": ["redeemed", "pending"] },
+                    "kind": { "const": "coupon" },
+                    "tags": { "type": "array", "enum": [[1], [2]] },
+                    "code": { "type": "string", "minLength": 3, "maxLength": 8, "format": "uuid" },
+                    "at": { "type": "string", "format": "date-time" },
+                    "site": { "type": "string", "format": "uri" },
+                    "plain": { "type": "string" }
+                }
+            } } } } } } } }
+        });
+        let fields = contract(&root, "/r", "post").unwrap().fields;
+        let constraints = |pointer: &str| {
+            fields
+                .iter()
+                .find(|f| f.pointer == pointer)
+                .and_then(|f| f.constraints.clone())
+        };
+        let bound = |value: i64, exclusive: bool| {
+            Some(NumericBound {
+                value: Number::from(value),
+                exclusive,
+            })
+        };
+        assert_eq!(
+            constraints("/remainingUses"),
+            Some(ValueConstraints {
+                minimum: bound(0, false),
+                ..ValueConstraints::default()
+            })
+        );
+        assert_eq!(
+            constraints("/ratio"),
+            Some(ValueConstraints {
+                minimum: bound(0, true),
+                maximum: bound(1, false),
+                ..ValueConstraints::default()
+            })
+        );
+        assert_eq!(
+            constraints("/legacy").and_then(|c| c.minimum),
+            bound(5, true)
+        );
+        assert_eq!(
+            constraints("/status").and_then(|c| c.enum_values),
+            Some(vec![json!("redeemed"), json!("pending")])
+        );
+        assert_eq!(
+            constraints("/kind").and_then(|c| c.enum_values),
+            Some(vec![json!("coupon")])
+        );
+        assert_eq!(
+            constraints("/tags"),
+            None,
+            "non-scalar enums are not carried"
+        );
+        assert_eq!(
+            constraints("/code"),
+            Some(ValueConstraints {
+                min_length: Some(3),
+                max_length: Some(8),
+                format: Some(StringFormat::Uuid),
+                ..ValueConstraints::default()
+            })
+        );
+        assert_eq!(
+            constraints("/at").and_then(|c| c.format),
+            Some(StringFormat::DateTime)
+        );
+        assert_eq!(constraints("/site"), None, "unchecked formats are dropped");
+        assert_eq!(constraints("/plain"), None);
     }
 
     #[test]

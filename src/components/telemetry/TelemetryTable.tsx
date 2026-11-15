@@ -246,10 +246,11 @@ function toRow(event: TelemetryEvent): Row {
       };
     case "burstSample": {
       const { sample } = event;
+      const drift = summarizeViolations(sample.violations);
       return {
         ...base,
         kind: "BURST",
-        kindTone: "muted",
+        kindTone: drift === null ? "muted" : "warn",
         target: `worker ${sample.worker}`,
         result: sample.status === null ? "ERR" : String(sample.status),
         resultTone: sample.status === null ? "fault" : httpStatusTone(sample.status),
@@ -257,6 +258,7 @@ function toRow(event: TelemetryEvent): Row {
         detail:
           sample.error ??
           [
+            drift === null ? null : `drift ${drift}`,
             sample.ttfbUs === null ? null : `ttfb ${formatLatency(sample.ttfbUs)}`,
             sample.dispatchOffsetUs === null ? null : `dispatch +${formatLatency(sample.dispatchOffsetUs)}`,
             formatBytes(sample.bytes),

@@ -140,6 +140,9 @@ pub struct BurstSpec {
     pub idempotency_mode: bool,
     /// `None` is `PreConnected`.
     pub sync_mode: Option<BurstSyncMode>,
+    /// Documented responses of the targeted operation; every response is checked against it
+    /// once all workers finished, outside the timed section.
+    pub contract: Option<ResponseContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -159,6 +162,8 @@ pub struct WorkerSample {
     /// exceeds `Number.MAX_SAFE_INTEGER`.
     pub body_hash: Option<String>,
     pub error: Option<String>,
+    /// Drift of this response from the spec's `contract`; empty without one.
+    pub violations: Vec<ContractViolation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -196,6 +201,9 @@ pub enum AnomalyKind {
     /// 2xx responses to one `Idempotency-Key` with distinct bodies: the key was not
     /// deduplicated and the operation ran more than once.
     IdempotencyViolation,
+    /// Responses that broke the spec's `contract` under concurrent load. A `Fault` when a 2xx
+    /// response drifted (a balance below its documented minimum), else a `Warn`.
+    ContractDrift,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -236,6 +244,8 @@ pub struct BurstReport {
     pub expected_max_successes: Option<u16>,
     /// Key every worker sent in idempotency mode.
     pub idempotency_key: Option<String>,
+    /// Responses that broke the spec's `contract`; 0 without one.
+    pub contract_violations: u32,
     pub anomalies: Vec<Anomaly>,
     pub samples: Vec<WorkerSample>,
 }
@@ -535,6 +545,43 @@ pub struct ContractField {
     /// Listed in the parent schema's `required`. A nested field is only checked while its
     /// parent object is present.
     pub required: bool,
+    /// Value constraints declared on the field's schema; `None` when it declares none.
+    pub constraints: Option<ValueConstraints>,
+}
+
+/// String formats the contract check validates; any other `format` is not checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StringFormat {
+    Uuid,
+    Email,
+    /// RFC 3339 `date-time`.
+    DateTime,
+    /// RFC 3339 `full-date`.
+    Date,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NumericBound {
+    pub value: serde_json::Number,
+    /// `exclusiveMinimum` / `exclusiveMaximum`, in either the 3.0 flag or the 3.1 number form.
+    pub exclusive: bool,
+}
+
+/// Constraints on a field's value beyond its type. A `null` value is never judged against
+/// them; nullability is a type question.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ValueConstraints {
+    pub minimum: Option<NumericBound>,
+    pub maximum: Option<NumericBound>,
+    /// String length in Unicode scalar values, as JSON Schema counts it.
+    pub min_length: Option<u32>,
+    pub max_length: Option<u32>,
+    /// Members of an all-scalar `enum` (or a scalar `const`).
+    pub enum_values: Option<Vec<serde_json::Value>>,
+    pub format: Option<StringFormat>,
 }
 
 /// Response side of one OpenAPI operation.
@@ -560,6 +607,8 @@ pub enum ContractViolationKind {
     UndocumentedStatus,
     MissingRequiredField,
     ResponseTypeMismatch,
+    /// A correctly typed value outside its documented bounds, length, enum or format.
+    ConstraintViolation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -1,11 +1,19 @@
 import { useMemo, useState } from "react";
 import { Zap } from "lucide-react";
 import type { BurstControl } from "../../hooks/useBurst";
+import { contractSummary, summarizeViolations } from "../../lib/contract";
 import { formatBytes, formatLatency, formatPercent } from "../../lib/format";
 import { joinTarget, parseHeaders, type RequestOrigin } from "../../lib/request";
 import { pathParams, type RequestTarget } from "../../lib/routes";
 import { httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
-import type { Anomaly, AnomalyKind, BurstReport, BurstSyncMode, LatencyStats } from "../../lib/types";
+import type {
+  Anomaly,
+  AnomalyKind,
+  BurstReport,
+  BurstSyncMode,
+  LatencyStats,
+  ResponseContract,
+} from "../../lib/types";
 import { Section, StatusSquare } from "../shell/PanelHeader";
 import { ErrorLine } from "./ErrorLine";
 import { Field, MethodPicker, Metric, OriginRow, PathField, SampleHint } from "./RequestFields";
@@ -20,6 +28,7 @@ const ANOMALY_LABEL: Record<AnomalyKind, string> = {
   bodyDivergence: "Body divergence",
   transportErrors: "Transport",
   idempotencyViolation: "Idempotency violation",
+  contractDrift: "Contract drift",
 };
 
 const SYNC_MODES: ReadonlyArray<{ mode: BurstSyncMode; label: string; title: string }> = [
@@ -47,6 +56,8 @@ interface BurstPanelProps {
   sampleBody: string | null;
   /** Set while the body is a replayed fuzz case; editing the body clears it. */
   origin: string | null;
+  /** OpenAPI response contract of the targeted operation; every worker's response is checked. */
+  contract: ResponseContract | null;
 }
 
 export function BurstPanel({
@@ -59,6 +70,7 @@ export function BurstPanel({
   onBody: setBody,
   sampleBody,
   origin: bodyOrigin,
+  contract,
 }: BurstPanelProps) {
   const { method, path } = request;
   const [workers, setWorkers] = useState(20);
@@ -88,6 +100,7 @@ export function BurstPanel({
       expectedMaxSuccesses: maxSuccesses === 0 ? null : maxSuccesses,
       idempotencyMode: replaying,
       syncMode,
+      contract,
     });
   };
 
@@ -142,6 +155,11 @@ export function BurstPanel({
               onChange={setIdempotencyMode}
             />
           </div>
+          <div className="num truncate pt-1 text-2xs text-fg-faint" title={contract === null ? undefined : contractSummary(contract)}>
+            {contract === null
+              ? "No response contract; select an OpenAPI route to check every worker's response"
+              : `response contract: ${contractSummary(contract)}`}
+          </div>
         </Section>
 
         {burst.report !== null && <ReportView report={burst.report} />}
@@ -186,11 +204,16 @@ function ReportView({ report }: { report: BurstReport }) {
           </span>
         }
       >
-        <div className="num mb-2 grid grid-cols-4 gap-px border border-line bg-line text-xs">
+        <div className="num mb-2 grid grid-cols-5 gap-px border border-line bg-line text-xs">
           <Metric label="spread" value={report.dispatchSpreadUs === null ? "-" : formatLatency(report.dispatchSpreadUs)} />
           <Metric label="wall" value={formatLatency(report.wallUs)} />
           <Metric label="bodies" value={String(report.distinctBodies)} />
           <Metric label="errors" value={String(errors)} tone={errors > 0 ? "fault" : undefined} />
+          <Metric
+            label="drift"
+            value={String(report.contractViolations)}
+            tone={report.contractViolations > 0 ? "fault" : undefined}
+          />
         </div>
         {report.idempotencyKey !== null && (
           <div className="num mb-1.5 flex min-w-0 items-center gap-1.5 text-2xs" title={report.idempotencyKey}>
@@ -249,7 +272,38 @@ function ReportView({ report }: { report: BurstReport }) {
           </div>
         )}
       </Section>
+
+      {report.contractViolations > 0 && <DriftedWorkers report={report} />}
     </>
+  );
+}
+
+/** One line per drifted worker: status and the first violation of its response. */
+function DriftedWorkers({ report }: { report: BurstReport }) {
+  const drifted = report.samples.filter((sample) => sample.violations.length > 0);
+  const listed = drifted.slice(0, MAX_LISTED_WORKERS);
+  return (
+    <Section
+      title="Contract Drift"
+      aside={<span className="num text-2xs text-fg-faint">{`${drifted.length}/${report.samples.length}`}</span>}
+    >
+      <div className="num flex flex-col border-t border-line/60 text-xs">
+        {listed.map((sample) => (
+          <div
+            key={sample.worker}
+            className="grid h-5 grid-cols-[36px_32px_minmax(0,1fr)] items-center gap-1.5 border-b border-line/60"
+            title={sample.violations.map((v) => `${v.pointer ?? "status"}: ${v.expected} <- ${v.actual}`).join("\n")}
+          >
+            <span className="text-2xs text-fg-faint">{`w${sample.worker}`}</span>
+            <span className={TONE_TEXT[httpStatusTone(sample.status)]}>{sample.status ?? "ERR"}</span>
+            <span className="truncate text-fg-dim">{summarizeViolations(sample.violations)}</span>
+          </div>
+        ))}
+      </div>
+      {drifted.length > listed.length && (
+        <div className="num pt-1 text-2xs text-fg-faint">+{drifted.length - listed.length} more workers</div>
+      )}
+    </Section>
   );
 }
 
