@@ -360,6 +360,8 @@ pub struct DiscoveredRoute {
     /// Relative to the scan root, `/`-separated on every platform.
     pub file: String,
     pub line: u32,
+    /// Normalized mount prefix resolved within the declaring file; already part of `path`.
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

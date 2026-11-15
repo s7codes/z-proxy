@@ -102,11 +102,13 @@ fn app_route(segments: &[String], source: &Source) -> Vec<RawRoute> {
     });
     found
         .into_iter()
-        .map(|(method, at)| RawRoute {
-            method,
-            path: path.clone(),
-            source: RouteSource::NextAppRouter,
-            line: source.lines.line(at),
+        .map(|(method, at)| {
+            RawRoute::new(
+                method,
+                path.clone(),
+                RouteSource::NextAppRouter,
+                source.lines.line(at),
+            )
         })
         .collect()
 }
@@ -163,11 +165,13 @@ fn pages_api(segments: &[String], stem: &str, source: &Source) -> Vec<RawRoute> 
 
     found
         .into_iter()
-        .map(|(method, at)| RawRoute {
-            method,
-            path: path.clone(),
-            source: RouteSource::NextPagesApi,
-            line: source.lines.line(at),
+        .map(|(method, at)| {
+            RawRoute::new(
+                method,
+                path.clone(),
+                RouteSource::NextPagesApi,
+                source.lines.line(at),
+            )
         })
         .collect()
 }

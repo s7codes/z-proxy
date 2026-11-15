@@ -134,9 +134,20 @@ A JS/TS call counts only when its receiver is a server object: declared in the f
 Declarations inside comments, string literals and Rust `#[cfg(test)]` modules are ignored.
 
 Paths are normalized to one template form: `:id`, `[id]` and `{id}` become `{id}`; catch-alls
-(`*`, `[...slug]`, `{path...}`, `{*rest}`) become `{*name}`. Mount prefixes applied at runtime
-(`app.use("/api", router)`, `Router::nest`, Hono `basePath`, gin groups) are not resolved; a
-route is reported as written at its declaration.
+(`*`, `[...slug]`, `{path...}`, `{*rest}`) become `{*name}`.
+
+Mount prefixes are resolved when the mount and the mounted router are declared in the same
+file. The prefix is joined into `path` and reported separately in `prefix`:
+
+| Framework | Resolved mounts                                                                 |
+|-----------|---------------------------------------------------------------------------------|
+| Express   | `parent.use("/p", child)`, including middleware arguments and arrays (`[auth, router]`); chains such as `app.use("/api", api)` + `api.use("/admin", admin)` compose |
+| Hono      | `new Hono().basePath("/p")`, derived `const v1 = app.basePath("/v1")`, `parent.route("/p", subApp)` |
+| Axum      | `.nest("/p", r)` where `r` is built inline, bound with `let r = ..;`, or returned by a local `fn r()` / `self::r()`; nested nests compose |
+
+A router mounted under several prefixes is reported once per prefix (at most 16). Routers
+mounted from another file or module (`require("./users")`, `other::routes()`), Fastify
+`register(.., { prefix })` and gin groups keep the path written at their declaration.
 
 Selecting a route loads its method and path into the Burst and Fuzzer panels and adds an
 endpoint node to the topology. Requests stay blocked while the path contains unresolved

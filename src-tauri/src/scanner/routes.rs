@@ -1,9 +1,10 @@
 //! Filesystem route scanner.
 //!
 //! Walks a project tree and extracts HTTP route declarations with per-framework lexical
-//! extractors. Static extraction cannot observe runtime composition, so mount prefixes
-//! (`app.use("/api", router)`, `Router::nest`, Hono `basePath`, gin groups) are not applied:
-//! a route is reported exactly as written at its declaration site.
+//! extractors. Mount prefixes are resolved when the mount and the router it mounts are
+//! declared in the same file (`app.use("/api", router)`, Hono `basePath` and
+//! `.route("/p", sub)`, Axum `.nest("/p", ..)`); composition across files is invisible to a
+//! lexical pass, so such routes are reported as written at their declaration site.
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -47,9 +48,34 @@ const MAX_ISSUES: usize = 100;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawRoute {
     pub method: RouteMethod,
+    /// Full path, mount prefix included.
     pub path: String,
     pub source: RouteSource,
     pub line: u32,
+    /// Mount prefix resolved within the file and already joined into `path`.
+    pub prefix: Option<String>,
+}
+
+impl RawRoute {
+    pub fn new(method: RouteMethod, path: String, source: RouteSource, line: u32) -> Self {
+        Self {
+            method,
+            path,
+            source,
+            line,
+            prefix: None,
+        }
+    }
+
+    /// Re-roots the route under `prefix`; an empty or `/` prefix leaves it unchanged.
+    pub fn mounted(mut self, prefix: &str) -> Self {
+        if prefix.trim_matches('/').is_empty() {
+            return self;
+        }
+        self.path = format!("{prefix}{}", self.path);
+        self.prefix = Some(prefix.to_owned());
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,20 +223,28 @@ impl Scan {
 
         match extract(kind, &components, src) {
             Ok(raw) => {
-                for route in raw {
-                    let (path, params) = normalize_path(&route.path);
-                    self.routes.push(DiscoveredRoute {
-                        method: route.method,
-                        path,
-                        params,
-                        source: route.source,
-                        file: file.clone(),
-                        line: route.line,
-                    });
-                }
+                self.routes
+                    .extend(raw.into_iter().map(|route| discovered(route, &file)));
             }
             Err(reason) => self.issue(file, reason),
         }
+    }
+}
+
+pub fn discovered(route: RawRoute, file: &str) -> DiscoveredRoute {
+    let (path, params) = normalize_path(&route.path);
+    let prefix = route
+        .prefix
+        .map(|prefix| normalize_path(&prefix).0)
+        .filter(|prefix| prefix != "/");
+    DiscoveredRoute {
+        method: route.method,
+        path,
+        params,
+        source: route.source,
+        file: file.to_owned(),
+        line: route.line,
+        prefix,
     }
 }
 
@@ -546,6 +580,22 @@ mod tests {
             .unwrap();
         assert_eq!(orders.params, ["id"]);
         assert_eq!(orders.source, RouteSource::NextAppRouter);
+    }
+
+    #[test]
+    fn mount_prefixes_reach_the_report_normalized() {
+        let fx = Fixture::new();
+        fx.write(
+            "api/server.js",
+            "const app = express();\nconst users = express.Router();\nusers.get('/:id', show);\napp.use('/orgs/:org/users/', users);\n",
+        );
+        let report = fx.scan();
+        assert_eq!(report.routes.len(), 1);
+        let route = &report.routes[0];
+        assert_eq!(route.path, "/orgs/{org}/users/{id}");
+        assert_eq!(route.params, ["org", "id"]);
+        assert_eq!(route.prefix.as_deref(), Some("/orgs/{org}/users"));
+        assert_eq!((route.file.as_str(), route.line), ("api/server.js", 3));
     }
 
     #[test]

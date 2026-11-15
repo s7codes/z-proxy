@@ -33,12 +33,12 @@ pub fn extract(source: &Source) -> Vec<RawRoute> {
         |caps: &regex::Captures<'_>| caps.get(0).is_some_and(|m| !source.in_string(m.start()));
     let mut routes = Vec::new();
     let mut push = |method: RouteMethod, path: &str, at: usize| {
-        routes.push(RawRoute {
+        routes.push(RawRoute::new(
             method,
-            path: path.to_owned(),
-            source: RouteSource::Go,
-            line: lines.line(at),
-        });
+            path.to_owned(),
+            RouteSource::Go,
+            lines.line(at),
+        ));
     };
 
     if let Some(re) = HANDLE.as_ref() {

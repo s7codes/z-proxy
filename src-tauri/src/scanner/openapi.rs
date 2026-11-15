@@ -50,12 +50,12 @@ pub fn from_json(src: &str) -> Result<Vec<RawRoute>, String> {
                 .and_then(|from| find_key(src, key, from))
                 .or(path_at)
                 .unwrap_or(paths_at);
-            routes.push(RawRoute {
+            routes.push(RawRoute::new(
                 method,
-                path: format!("{base}{path}"),
-                source: RouteSource::OpenApi,
-                line: lines.line(at),
-            });
+                format!("{base}{path}"),
+                RouteSource::OpenApi,
+                lines.line(at),
+            ));
         }
     }
     routes.sort_by_key(|route| route.line);
@@ -94,12 +94,12 @@ pub fn from_yaml(src: &str) -> Result<Vec<RawRoute>, String> {
                 continue;
             };
             if let Some(method) = operation(name) {
-                routes.push(RawRoute {
+                routes.push(RawRoute::new(
                     method,
-                    path: format!("{base}{path}"),
-                    source: RouteSource::OpenApi,
-                    line: op_key.line,
-                });
+                    format!("{base}{path}"),
+                    RouteSource::OpenApi,
+                    op_key.line,
+                ));
             }
         }
     }

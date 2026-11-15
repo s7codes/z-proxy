@@ -174,24 +174,45 @@ const RouteRow = memo(function RouteRow({
         <span className="num w-9 shrink-0 border border-line text-center text-2xs leading-[14px] text-fg-dim">
           {METHOD_BADGE[route.method]}
         </span>
-        <PathText path={route.path} />
+        <PathText path={route.path} prefix={route.prefix} />
       </div>
       <div className="num flex min-w-0 items-center gap-2 pl-[42px] text-2xs text-fg-faint">
         <span className="truncate" title={`${route.file}:${route.line}`}>
           {fileLabel(route.file, route.line)}
         </span>
+        {route.prefix !== null && (
+          <span className="truncate" title={`Mount prefix resolved in ${route.file}`}>
+            mount {route.prefix}
+          </span>
+        )}
         <span className="ml-auto shrink-0">{SOURCE_LABEL[route.source]}</span>
       </div>
     </div>
   );
 });
 
-function PathText({ path }: { path: string }) {
+/** Parameters render dimmed; a resolved mount prefix renders faint so the segment written at
+ * the declaration site stays the visually dominant part. */
+function PathText({ path, prefix }: { path: string; prefix: string | null }) {
+  const mounted = prefix !== null && path.startsWith(prefix) ? prefix.length : 0;
   const parts: ReactNode[] = [];
   let last = 0;
+  const literal = (from: number, to: number) => {
+    if (from < mounted) {
+      const split = Math.min(to, mounted);
+      parts.push(
+        <span key={`m${from}`} className="text-fg-faint">
+          {path.slice(from, split)}
+        </span>,
+      );
+      if (split < to) parts.push(path.slice(split, to));
+    } else if (from < to) {
+      parts.push(path.slice(from, to));
+    }
+  };
   for (const match of path.matchAll(/\{[^{}]+\}/g)) {
     const at = match.index;
-    if (at > last) parts.push(path.slice(last, at));
+    literal(last, at);
     parts.push(
       <span key={at} className="text-fg-dim">
         {match[0]}
@@ -199,7 +220,7 @@ function PathText({ path }: { path: string }) {
     );
     last = at + match[0].length;
   }
-  if (last < path.length) parts.push(path.slice(last));
+  literal(last, path.length);
   return (
     <span className="num truncate text-xs text-fg-bright" title={path}>
       {parts}

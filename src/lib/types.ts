@@ -239,6 +239,8 @@ export interface DiscoveredRoute {
   /** Relative to the scan root, `/`-separated. */
   file: string;
   line: number;
+  /** Normalized mount prefix resolved within the declaring file; already part of `path`. */
+  prefix: string | null;
 }
 
 export interface ScanIssue {
