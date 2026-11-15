@@ -4692,6 +4692,7 @@ version = "1.0.0"
 dependencies = [
  "axum",
  "fastrand",
+ "flate2",
  "http-body-util",
  "hyper",
  "hyper-util",

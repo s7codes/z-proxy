@@ -46,6 +46,9 @@ walkdir = "2.5"
 yaml-rust2 = { version = "0.13", default-features = false }
 # Invoked from Rust only (pick_project_root); the webview is granted no dialog permission.
 tauri-plugin-dialog = "2.8"
+# Inflates gzip / deflate response bodies for the passive audit, into a capped buffer.
+# miniz_oxide backend: pure Rust, no zlib or C toolchain on Windows.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "net", "macros"] }

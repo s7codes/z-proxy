@@ -644,10 +644,17 @@ pub enum TrafficFindingKind {
     /// A JSON collection above the item limit without pagination metadata, or a JSON body
     /// above 1 MiB.
     UnboundedCollection,
-    /// Content-Type, CORS or Cache-Control headers that contradict the response.
+    /// Content-Type, Content-Encoding, CORS or Cache-Control headers that contradict the
+    /// response.
     HeaderMisconfiguration,
     /// Stack trace or database error in a proxied response.
     PassiveDisclosure,
+    /// One exact request (method, path and query) repeated 10 or more times inside 250 ms:
+    /// an effect that re-runs on every render, or a retry loop without backoff.
+    RetryStorm,
+    /// A 2xx upstream latency at least 4x the route template's rolling median and at least
+    /// 250 ms.
+    LatencyRegression,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

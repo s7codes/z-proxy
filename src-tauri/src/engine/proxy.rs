@@ -423,13 +423,29 @@ impl ProxyContext {
     }
 
     fn publish(&self, mut record: Exchange) {
-        // Every GET counts, whatever its fate: a fan-out is client behaviour, and a dropped or
-        // injected response does not make it less of one.
+        // Every request counts, whatever its fate: fan-outs and retry storms are client
+        // behaviour, and a dropped or injected response does not make them less of one.
         if let Some(burst) = self
             .linter
             .track(record.started, &record.method, &record.path)
         {
             record.findings.push(burst);
+        }
+        if let Some(storm) = self
+            .linter
+            .repeat(record.started, &record.method, &record.path)
+        {
+            record.findings.push(storm);
+        }
+        // Upstream time excludes injected delay, so armed latency faults never read as a
+        // service regression.
+        if let (Some(status), Some(upstream_us)) = (record.status, record.upstream_latency_us) {
+            if let Some(slow) =
+                self.linter
+                    .latency(&record.method, &record.path, status, upstream_us)
+            {
+                record.findings.push(slow);
+            }
         }
         self.hub.publish(TelemetryEvent::ProxyExchange {
             seq: self.hub.next_seq(),
@@ -599,23 +615,27 @@ async fn proxy_handler(
                 Ok((mut reply, upstream_latency_us)) => {
                     record.upstream_latency_us = Some(upstream_latency_us);
                     // Only upstream answers are judged: an injected status or a 502 from the proxy
-                    // itself says nothing about the service's contract.
-                    if let Some(bound) = contract {
-                        record.violations = contract::check(
-                            &bound.contract,
-                            reply.status.as_u16(),
-                            Some(&reply.body),
-                        );
-                        record.contract = Some(bound.label.clone());
+                    // itself says nothing about the service's contract. The client receives
+                    // the encoded bytes untouched; only the checks read the inflated copy.
+                    {
+                        let decoded = linter::decode(&reply.headers, &reply.body);
+                        if let Some(bound) = contract {
+                            record.violations = contract::check(
+                                &bound.contract,
+                                reply.status.as_u16(),
+                                decoded.bytes(),
+                            );
+                            record.contract = Some(bound.label.clone());
+                        }
+                        record.findings = linter::inspect(&ResponseView {
+                            method: &record.method,
+                            path: &record.path,
+                            credentialed,
+                            status: reply.status.as_u16(),
+                            headers: &reply.headers,
+                            body: &decoded,
+                        });
                     }
-                    record.findings = linter::inspect(&ResponseView {
-                        method: &record.method,
-                        path: &record.path,
-                        credentialed,
-                        status: reply.status.as_u16(),
-                        headers: &reply.headers,
-                        body: &reply.body,
-                    });
                     if record.injected_delay_us > 0 {
                         reply.headers.insert(
                             HeaderName::from_static(DELAY_HEADER),
@@ -1284,6 +1304,86 @@ mod tests {
             .unwrap();
         assert!(full.headers().get(FAULT_HEADER).is_none());
         assert!(full.bytes().await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compressed_responses_and_retry_storms_are_audited() {
+        use std::io::Write;
+
+        use crate::engine::types::TrafficFindingKind;
+
+        let trace = b"TypeError: Cannot read properties of undefined (reading 'id')\n    at loadCart (/srv/app/cart.js:12:9)";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(trace).unwrap();
+        let compressed = Bytes::from(encoder.finish().unwrap());
+        let served = compressed.clone();
+        let router = Router::new().fallback(move || {
+            let body = served.clone();
+            async move {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("content-type", "text/plain"), ("content-encoding", "gzip")],
+                    body,
+                )
+            }
+        });
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let hub = Arc::new(TelemetryHub::new());
+        let mut events = hub.subscribe();
+        let manager = ProxyManager::with_seed(hub, 3).unwrap();
+        let proxy = manager
+            .start(ProxyConfig {
+                upstream: format!("http://127.0.0.1:{}", upstream.port()),
+                listen_port: 0,
+            })
+            .await
+            .unwrap()
+            .listener
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        // A cart widget refetching in a render loop: twelve identical requests back to back.
+        for _ in 0..12 {
+            let response = client
+                .get(format!("http://{proxy}/cart?user=7"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                response.bytes().await.unwrap(),
+                compressed,
+                "forwarded encoded"
+            );
+        }
+        let mut leaks = 0;
+        let mut storms = Vec::new();
+        let mut exchanges = 0;
+        while exchanges < 12 {
+            let event = tokio::time::timeout(EVENT_TIMEOUT, events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let TelemetryEvent::ProxyExchange { findings, .. } = event {
+                exchanges += 1;
+                leaks += findings
+                    .iter()
+                    .filter(|f| f.kind == TrafficFindingKind::PassiveDisclosure)
+                    .count();
+                storms.extend(
+                    findings
+                        .into_iter()
+                        .filter(|f| f.kind == TrafficFindingKind::RetryStorm),
+                );
+            }
+        }
+        assert_eq!(leaks, 12, "the inflated body is scanned on every exchange");
+        assert_eq!(storms.len(), 1, "{storms:?}");
+        assert_eq!(storms[0].evidence.as_deref(), Some("GET /cart?user=7"));
+        manager.stop().await;
     }
 
     #[tokio::test]
