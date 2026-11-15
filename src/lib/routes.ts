@@ -17,6 +17,18 @@ export const SOURCE_LABEL: Record<RouteSource, string> = {
   openApi: "openapi",
 };
 
+// Same abbreviations HTTP clients use, so every badge fits one fixed column.
+export const METHOD_BADGE: Record<RouteMethod, string> = {
+  GET: "GET",
+  POST: "POST",
+  PUT: "PUT",
+  PATCH: "PATCH",
+  DELETE: "DEL",
+  HEAD: "HEAD",
+  OPTIONS: "OPT",
+  ANY: "ANY",
+};
+
 const BURST_METHODS: ReadonlySet<string> = new Set<BurstMethod>(["GET", "POST", "PUT", "PATCH", "DELETE"]);
 
 function isBurstMethod(method: RouteMethod): method is BurstMethod {

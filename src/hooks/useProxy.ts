@@ -3,12 +3,13 @@ import {
   getProxyStatus,
   ipcAvailable,
   setFaultProfile,
+  setFaultRules,
   startProxy,
   stopProxy,
   type IpcResult,
   type TransportError,
 } from "../lib/ipc";
-import type { EngineError, FaultProfile, ProxyStatus, TelemetryEventOf } from "../lib/types";
+import type { EngineError, FaultProfile, FaultRule, ProxyStatus, TelemetryEventOf } from "../lib/types";
 
 export interface ProxyControl {
   /** Engine-side truth; `null` until the first status arrives. */
@@ -18,6 +19,7 @@ export interface ProxyControl {
   start: (upstream: string, listenPort: number) => void;
   stop: () => void;
   applyFaults: (armed: boolean, profile: FaultProfile) => void;
+  applyRules: (rules: FaultRule[]) => void;
 }
 
 export function useProxy(latest: TelemetryEventOf<"proxyStateChanged"> | null): ProxyControl {
@@ -63,20 +65,32 @@ export function useProxy(latest: TelemetryEventOf<"proxyStateChanged"> | null): 
     void stopProxy().then(settle);
   }, [settle]);
 
-  // Fault updates do not toggle `busy`: they are pushed while the operator drags sliders
-  // and must not disable the controls being dragged.
-  const applyFaults = useCallback((armed: boolean, profile: FaultProfile) => {
-    void setFaultProfile(armed, profile).then((result) => {
-      if (result.ok) {
-        setStatus(result.value);
-        setError(null);
-      } else {
-        setError(result.error);
-      }
-    });
+  const adopt = useCallback((result: IpcResult<ProxyStatus>) => {
+    if (result.ok) {
+      setStatus(result.value);
+      setError(null);
+    } else {
+      setError(result.error);
+    }
   }, []);
 
-  return { status, busy, error, start, stop, applyFaults };
+  // Fault updates do not toggle `busy`: they are pushed while the operator drags sliders
+  // and must not disable the controls being dragged.
+  const applyFaults = useCallback(
+    (armed: boolean, profile: FaultProfile) => {
+      void setFaultProfile(armed, profile).then(adopt);
+    },
+    [adopt],
+  );
+
+  const applyRules = useCallback(
+    (rules: FaultRule[]) => {
+      void setFaultRules(rules).then(adopt);
+    },
+    [adopt],
+  );
+
+  return { status, busy, error, start, stop, applyFaults, applyRules };
 }
 
 export function sameProfile(a: FaultProfile, b: FaultProfile): boolean {

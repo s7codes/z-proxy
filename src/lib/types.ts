@@ -41,6 +41,15 @@ export interface FaultProfile {
   mutationRate: number;
 }
 
+/** Binds a profile to one route, matched against the path the upstream receives. */
+export interface FaultRule {
+  /** `null` or `ANY` matches every method. */
+  method: RouteMethod | null;
+  /** Scanner template syntax: `{name}` one segment, `{*name}` the remainder (last segment). */
+  pathPattern: string;
+  profile: FaultProfile;
+}
+
 export interface ProxyConfig {
   upstream: string;
   /** `0` binds an ephemeral port. */
@@ -53,6 +62,8 @@ export interface ProxyStatus {
   upstream: string | null;
   armed: boolean;
   profile: FaultProfile;
+  /** Evaluated in order before the global profile; the first match wins. */
+  rules: FaultRule[];
 }
 
 export type FaultKind = "statusMutation" | "connectionDrop";
@@ -310,6 +321,8 @@ export type TelemetryEvent =
       injectedDelayUs: number;
       upstreamLatencyUs: number | null;
       fault: FaultKind | null;
+      /** Route rule that supplied the fault profile, as `METHOD /pattern`. */
+      rule: string | null;
       requestBytes: number;
       responseBytes: number;
       error: string | null;
@@ -397,6 +410,7 @@ export type EngineErrorCode =
   | "LISTENER_BIND_FAILED"
   | "PROXY_LOOP"
   | "INVALID_FAULT_PROFILE"
+  | "INVALID_FAULT_RULE"
   | "INVALID_BURST_SPEC"
   | "INVALID_FUZZ_SPEC"
   | "FUZZER_BUSY"
@@ -413,6 +427,7 @@ export type EngineError =
   | { code: "LISTENER_BIND_FAILED"; message: string; addr: string }
   | { code: "PROXY_LOOP"; message: string; addr: string }
   | { code: "INVALID_FAULT_PROFILE"; message: string; field: string }
+  | { code: "INVALID_FAULT_RULE"; message: string; index: number }
   | { code: "INVALID_BURST_SPEC"; message: string; field: string }
   | { code: "INVALID_FUZZ_SPEC"; message: string; field: string }
   | { code: "FUZZER_BUSY"; message: string }

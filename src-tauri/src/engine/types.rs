@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::fault::FaultProfile;
+use super::fault::{FaultProfile, FaultRule};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,6 +73,8 @@ pub struct ProxyStatus {
     pub upstream: Option<String>,
     pub armed: bool,
     pub profile: FaultProfile,
+    /// Evaluated in order before the global profile; the first match wins.
+    pub rules: Vec<FaultRule>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -321,7 +323,7 @@ pub struct FuzzReport {
 
 // ---- route scanner --------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum RouteMethod {
     Get,
@@ -439,6 +441,8 @@ pub enum TelemetryEvent {
         injected_delay_us: u64,
         upstream_latency_us: Option<u64>,
         fault: Option<FaultKind>,
+        /// Route rule that supplied the fault profile, as `METHOD /pattern`.
+        rule: Option<String>,
         request_bytes: u64,
         response_bytes: u64,
         error: Option<String>,

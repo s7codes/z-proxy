@@ -1,19 +1,24 @@
 //! Fault decision model.
 //!
 //! Pure and synchronous so the proxy can take a decision under a short lock and tests can
-//! replay exact sequences from a seeded RNG.
+//! replay exact sequences from a seeded RNG. A request is matched against the route rules in
+//! order; the first match supplies the profile, otherwise the global profile applies.
 
 use std::time::Duration;
 
 use axum::http::StatusCode;
 use fastrand::Rng;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::error::{EngineError, EngineResult};
+use super::types::RouteMethod;
 
 pub const MAX_LATENCY_MS: u32 = 30_000;
 pub const MAX_JITTER_MS: u32 = 10_000;
 const MAX_RATE: u8 = 100;
+pub const MAX_RULES: usize = 64;
+const MAX_PATTERN_LEN: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum StatusMutation {
@@ -75,10 +80,145 @@ impl FaultProfile {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Binds a profile to one route. Matched against the path the upstream receives (upstream
+/// base path included), which is the path the route scanner reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FaultRule {
+    /// `None` or `ANY` matches every method.
+    pub method: Option<RouteMethod>,
+    /// Route template in scanner syntax: literal segments, `{name}` for one segment (also
+    /// embedded, as in `{id}.json`), `{*name}` for the remainder as the last segment.
+    pub path_pattern: String,
+    pub profile: FaultProfile,
+}
+
+/// Anchored regex compiled from a route template. Request paths are compared after
+/// collapsing empty segments, so `/orders/7/` and `//orders/7` match `/orders/{id}`.
+#[derive(Debug, Clone)]
+pub struct PathMatcher {
+    regex: Regex,
+}
+
+impl PathMatcher {
+    pub fn compile(pattern: &str) -> Result<Self, String> {
+        if !pattern.starts_with('/') {
+            return Err("must start with `/`".to_owned());
+        }
+        if pattern.len() > MAX_PATTERN_LEN {
+            return Err(format!("exceeds {MAX_PATTERN_LEN} bytes"));
+        }
+        let segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+        let mut source = String::from("^");
+        for (index, segment) in segments.iter().enumerate() {
+            if let Some(name) = segment.strip_prefix("{*").and_then(|s| s.strip_suffix('}')) {
+                if name.is_empty() || index + 1 != segments.len() {
+                    return Err(format!(
+                        "catch-all `{segment}` must be a named, final segment"
+                    ));
+                }
+                source.push_str("(?:/.*)?");
+                continue;
+            }
+            source.push('/');
+            let mut rest = *segment;
+            while let Some(open) = rest.find('{') {
+                let close = rest[open..]
+                    .find('}')
+                    .map(|offset| open + offset)
+                    .ok_or_else(|| format!("unclosed `{{` in `{segment}`"))?;
+                let name = &rest[open + 1..close];
+                if name.is_empty() || name.contains(['*', '{']) {
+                    return Err(format!("invalid parameter `{{{name}}}` in `{segment}`"));
+                }
+                source.push_str(&regex::escape(&rest[..open]));
+                source.push_str("[^/]+");
+                rest = &rest[close + 1..];
+            }
+            if rest.contains('}') {
+                return Err(format!("unmatched `}}` in `{segment}`"));
+            }
+            source.push_str(&regex::escape(rest));
+        }
+        if segments.is_empty() {
+            source.push('/');
+        }
+        source.push('$');
+        Regex::new(&source)
+            .map(|regex| Self { regex })
+            .map_err(|err| err.to_string())
+    }
+
+    pub fn matches(&self, path: &str) -> bool {
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        self.regex.is_match(&format!("/{}", segments.join("/")))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledRule {
+    pub rule: FaultRule,
+    matcher: PathMatcher,
+}
+
+impl CompiledRule {
+    pub fn matches(&self, method: &str, path: &str) -> bool {
+        let method_ok = match self.rule.method {
+            None | Some(RouteMethod::Any) => true,
+            Some(expected) => method_token(expected) == method,
+        };
+        method_ok && self.matcher.matches(path)
+    }
+
+    /// `POST /orders/{id}`, the form telemetry reports a match with.
+    pub fn label(&self) -> String {
+        let method = self.rule.method.map_or("ANY", method_token);
+        format!("{method} {}", self.rule.path_pattern)
+    }
+}
+
+fn method_token(method: RouteMethod) -> &'static str {
+    match method {
+        RouteMethod::Get => "GET",
+        RouteMethod::Post => "POST",
+        RouteMethod::Put => "PUT",
+        RouteMethod::Patch => "PATCH",
+        RouteMethod::Delete => "DELETE",
+        RouteMethod::Head => "HEAD",
+        RouteMethod::Options => "OPTIONS",
+        RouteMethod::Any => "ANY",
+    }
+}
+
+/// Validates and compiles a rule set; the whole set is rejected on the first invalid rule so
+/// a partially applied list never reaches traffic.
+pub fn compile_rules(rules: Vec<FaultRule>) -> EngineResult<Vec<CompiledRule>> {
+    if rules.len() > MAX_RULES {
+        return Err(EngineError::InvalidFaultRule {
+            index: MAX_RULES,
+            reason: format!("at most {MAX_RULES} rules"),
+        });
+    }
+    rules
+        .into_iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            let rejected = |reason: String| EngineError::InvalidFaultRule { index, reason };
+            rule.profile
+                .validate()
+                .map_err(|err| rejected(err.to_string()))?;
+            let matcher = PathMatcher::compile(&rule.path_pattern)
+                .map_err(|reason| rejected(format!("pathPattern {reason}")))?;
+            Ok(CompiledRule { rule, matcher })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct FaultState {
     pub armed: bool,
     pub profile: FaultProfile,
+    pub rules: Vec<CompiledRule>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,22 +232,32 @@ pub enum FaultAction {
 pub struct FaultPlan {
     pub delay: Duration,
     pub action: FaultAction,
+    /// Index of the route rule that supplied the profile; `None` for the global profile.
+    pub rule: Option<usize>,
 }
 
 impl FaultPlan {
     pub const PASSTHROUGH: Self = Self {
         delay: Duration::ZERO,
         action: FaultAction::Forward,
+        rule: None,
     };
 }
 
 /// Latency applies to every outcome, including drops: a connection that hangs and then
-/// resets is the failure shape clients most often mishandle.
-pub fn plan(state: &FaultState, rng: &mut Rng) -> FaultPlan {
+/// resets is the failure shape clients most often mishandle. Rules only apply while armed:
+/// the arm switch is the single control that stops all injection.
+pub fn plan(state: &FaultState, method: &str, path: &str, rng: &mut Rng) -> FaultPlan {
     if !state.armed {
         return FaultPlan::PASSTHROUGH;
     }
-    let profile = &state.profile;
+    let rule = state
+        .rules
+        .iter()
+        .position(|rule| rule.matches(method, path));
+    let profile = rule
+        .and_then(|index| state.rules.get(index))
+        .map_or(&state.profile, |matched| &matched.rule.profile);
     let delay = Duration::from_millis(jittered_ms(profile.latency_ms, profile.jitter_ms, rng));
 
     let action = if roll(profile.drop_rate, rng) {
@@ -119,7 +269,11 @@ pub fn plan(state: &FaultState, rng: &mut Rng) -> FaultPlan {
         }
     };
 
-    FaultPlan { delay, action }
+    FaultPlan {
+        delay,
+        action,
+        rule,
+    }
 }
 
 fn jittered_ms(base: u32, jitter: u32, rng: &mut Rng) -> u64 {
@@ -148,7 +302,186 @@ mod tests {
         FaultState {
             armed: true,
             profile,
+            rules: Vec::new(),
         }
+    }
+
+    /// Global-profile decision for tests that do not exercise route rules.
+    fn plan(state: &FaultState, rng: &mut Rng) -> FaultPlan {
+        super::plan(state, "GET", "/", rng)
+    }
+
+    fn rule(method: Option<RouteMethod>, pattern: &str, profile: FaultProfile) -> FaultRule {
+        FaultRule {
+            method,
+            path_pattern: pattern.to_owned(),
+            profile,
+        }
+    }
+
+    fn mutating(status: StatusMutation) -> FaultProfile {
+        FaultProfile {
+            status_mutation: status,
+            mutation_rate: 100,
+            ..FaultProfile::default()
+        }
+    }
+
+    #[test]
+    fn path_templates_match_segments_and_catch_alls() {
+        let cases: [(&str, &[&str], &[&str]); 6] = [
+            (
+                "/orders/{id}",
+                &["/orders/7", "/orders/7/", "//orders//abc"],
+                &["/orders", "/orders/7/items", "/Orders/7"],
+            ),
+            (
+                "/reports/{id}.json",
+                &["/reports/q3.json"],
+                &["/reports/q3.xml", "/reports/.json"],
+            ),
+            (
+                "/files/{*rest}",
+                &["/files", "/files/a", "/files/a/b/c.txt"],
+                &["/filesystem", "/"],
+            ),
+            ("/", &["/", ""], &["/a"]),
+            ("/{*all}", &["/", "/a/b"], &[]),
+            (
+                "/api/v1/coupons/redeem",
+                &["/api/v1/coupons/redeem"],
+                &["/api/v1/coupons/redeem/x", "/api/v1/coupons"],
+            ),
+        ];
+        for (pattern, hits, misses) in cases {
+            let matcher = PathMatcher::compile(pattern).unwrap();
+            for path in hits {
+                assert!(matcher.matches(path), "{pattern} should match {path}");
+            }
+            for path in misses {
+                assert!(!matcher.matches(path), "{pattern} should not match {path}");
+            }
+        }
+        assert!(PathMatcher::compile("/a.b/(x)+")
+            .unwrap()
+            .matches("/a.b/(x)+"));
+        assert!(!PathMatcher::compile("/a.b").unwrap().matches("/aXb"));
+    }
+
+    #[test]
+    fn invalid_templates_are_rejected() {
+        for pattern in [
+            "orders",
+            "/files/{*rest}/tail",
+            "/files/{*}",
+            "/a/{id",
+            "/a/id}",
+            "/a/{}",
+            "/a/x{*rest}",
+        ] {
+            assert!(PathMatcher::compile(pattern).is_err(), "{pattern}");
+        }
+        assert!(PathMatcher::compile(&format!("/{}", "a".repeat(MAX_PATTERN_LEN))).is_err());
+    }
+
+    #[test]
+    fn first_matching_rule_supplies_the_profile() {
+        let rules = compile_rules(vec![
+            rule(
+                Some(RouteMethod::Post),
+                "/orders/{id}",
+                mutating(StatusMutation::ServiceUnavailable),
+            ),
+            rule(
+                None,
+                "/orders/{*rest}",
+                mutating(StatusMutation::BadGateway),
+            ),
+            rule(
+                Some(RouteMethod::Any),
+                "/health",
+                mutating(StatusMutation::TooManyRequests),
+            ),
+        ])
+        .unwrap();
+        let state = FaultState {
+            armed: true,
+            profile: mutating(StatusMutation::InternalServerError),
+            rules,
+        };
+        let mut rng = Rng::with_seed(9);
+        let decide = |method: &str, path: &str, rng: &mut Rng| {
+            let plan = super::plan(&state, method, path, rng);
+            (plan.rule, plan.action)
+        };
+        let status = |code: StatusCode| FaultAction::Mutate(code);
+        assert_eq!(
+            decide("POST", "/orders/7", &mut rng),
+            (Some(0), status(StatusCode::SERVICE_UNAVAILABLE))
+        );
+        assert_eq!(
+            decide("GET", "/orders/7", &mut rng),
+            (Some(1), status(StatusCode::BAD_GATEWAY))
+        );
+        assert_eq!(
+            decide("DELETE", "/health", &mut rng),
+            (Some(2), status(StatusCode::TOO_MANY_REQUESTS))
+        );
+        assert_eq!(
+            decide("GET", "/users", &mut rng),
+            (None, status(StatusCode::INTERNAL_SERVER_ERROR))
+        );
+        assert_eq!(state.rules[1].label(), "ANY /orders/{*rest}");
+        assert_eq!(state.rules[0].label(), "POST /orders/{id}");
+
+        let disarmed = FaultState {
+            armed: false,
+            ..state.clone()
+        };
+        assert_eq!(
+            super::plan(&disarmed, "POST", "/orders/7", &mut rng),
+            FaultPlan::PASSTHROUGH
+        );
+    }
+
+    #[test]
+    fn rule_sets_are_validated_as_a_whole() {
+        let reject = |rules: Vec<FaultRule>| match compile_rules(rules) {
+            Err(EngineError::InvalidFaultRule { index, reason }) => (index, reason),
+            other => panic!("expected rejection, got {other:?}"),
+        };
+        let ok = rule(None, "/a", FaultProfile::default());
+        let (index, reason) = reject(vec![ok.clone(), rule(None, "b", FaultProfile::default())]);
+        assert_eq!(index, 1);
+        assert!(
+            reason.starts_with("pathPattern must start with"),
+            "{reason}"
+        );
+        let (index, reason) = reject(vec![rule(
+            None,
+            "/a",
+            FaultProfile {
+                drop_rate: 101,
+                ..FaultProfile::default()
+            },
+        )]);
+        assert_eq!(index, 0);
+        assert!(reason.contains("dropRate"), "{reason}");
+        let (index, _) = reject(vec![ok.clone(); MAX_RULES + 1]);
+        assert_eq!(index, MAX_RULES);
+        assert_eq!(compile_rules(vec![ok; MAX_RULES]).unwrap().len(), MAX_RULES);
+        assert!(compile_rules(Vec::new()).unwrap().is_empty());
+
+        let parsed: FaultRule = serde_json::from_str(
+            r#"{"method":"POST","pathPattern":"/x/{id}","profile":{"latencyMs":0,"jitterMs":0,"dropRate":0,"statusMutation":"503","mutationRate":100}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.method, Some(RouteMethod::Post));
+        let any: FaultRule = serde_json::from_str(
+            r#"{"method":null,"pathPattern":"/","profile":{"latencyMs":0,"jitterMs":0,"dropRate":0,"statusMutation":"none","mutationRate":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(any.method, None);
     }
 
     #[test]
@@ -162,6 +495,7 @@ mod tests {
                 status_mutation: StatusMutation::BadGateway,
                 mutation_rate: 100,
             },
+            rules: Vec::new(),
         };
         let mut rng = Rng::with_seed(7);
         for _ in 0..100 {

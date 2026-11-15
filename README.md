@@ -87,6 +87,19 @@ Forwarded responses that were delayed carry `x-chaosproxy-injected-delay-us`. Up
 failures return 502, response timeouts 504, both with `x-chaosproxy-error`. The profile can be
 changed while the listener runs and survives listener restarts.
 
+Route rules (`set_fault_rules`) bind a profile to one route:
+`FaultRule { method: RouteMethod | null, pathPattern, profile }`. Patterns use the scanner's
+template syntax: literal segments, `{name}` for one segment (also embedded, as in
+`{id}.json`), `{*name}` for the remainder as the final segment. Rules are matched in order
+against the path the upstream receives, upstream base path included, so a scanned route
+template applies as reported; empty segments are collapsed before matching. The first match
+supplies the profile; unmatched requests use the global profile. Rules apply only while faults
+are armed. A set is validated as a whole (at most 64 rules, each profile range-checked);
+an invalid rule returns `INVALID_FAULT_RULE` with its `index` and leaves the active set in
+place. `proxyExchange` events name the matching rule as `METHOD /pattern`. In the Faults tab,
+"Bind profile to" snapshots the current sliders onto the selected route (or the Burst/Fuzzer
+request target); binding the same route again replaces its rule.
+
 ## Concurrency burst
 
 Fires N identical requests (1-100) at one loopback `http` target. Each worker opens and
@@ -233,6 +246,7 @@ affected mutation cases in `disclosures`; a disclosing baseline is reported as a
 | `stop_proxy`             | none                                        | `ProxyStatus`      |
 | `get_proxy_status`       | none                                        | `ProxyStatus`      |
 | `set_fault_profile`      | `armed: boolean, profile: FaultProfile`     | `ProxyStatus`      |
+| `set_fault_rules`        | `rules: FaultRule[]`                        | `ProxyStatus`      |
 | `run_concurrency_burst`  | `spec: BurstSpec`                           | `BurstReport`      |
 | `run_fuzzer_suite`       | `spec: FuzzSpec`                            | `FuzzReport`       |
 | `cancel_fuzzer_suite`    | none                                        | `boolean`          |

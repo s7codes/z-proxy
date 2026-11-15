@@ -1,13 +1,13 @@
 import { useState } from "react";
-import { Play, Power, RotateCcw, Square } from "lucide-react";
+import { Link2, Play, Power, RotateCcw, Square, X } from "lucide-react";
 import type { BurstControl } from "../../hooks/useBurst";
 import type { EngineLink } from "../../hooks/useEngineStatus";
 import type { FuzzerControl } from "../../hooks/useFuzzer";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import type { ProxyControl } from "../../hooks/useProxy";
 import type { FuzzerProgress } from "../../hooks/useTelemetry";
-import type { RequestTarget } from "../../lib/routes";
-import type { FaultProfile, StatusMutation } from "../../lib/types";
+import { METHOD_BADGE, type RequestTarget } from "../../lib/routes";
+import type { DiscoveredRoute, FaultProfile, FaultRule, RouteMethod, StatusMutation } from "../../lib/types";
 import { PanelHeader, Section, StatusSquare, ToolButton } from "../shell/PanelHeader";
 import { BurstPanel } from "./BurstPanel";
 import { ErrorLine } from "./ErrorLine";
@@ -46,11 +46,18 @@ interface ChaosControlsProps {
   onFuzzPayload: (payload: string) => void;
   /** OpenAPI sample of the selected route, offered by both payload fields. */
   sampleBody: string | null;
+  route: DiscoveredRoute | null;
 }
 
 export function ChaosControls(props: ChaosControlsProps) {
-  const { tab, onTab, link, guard, target, onTarget, sampleBody } = props;
+  const { tab, onTab, link, guard, target, onTarget, sampleBody, route } = props;
   const online = link.state === "online";
+  // A selected route binds with its own method (ANY stays method-agnostic); without one the
+  // Burst/Fuzzer request target is the route being exercised.
+  const ruleTarget: RuleTarget =
+    route !== null
+      ? { method: route.method === "ANY" ? null : route.method, path: route.path }
+      : { method: target.method, path: target.path };
 
   return (
     <div className="flex h-full flex-col bg-panel">
@@ -60,7 +67,14 @@ export function ChaosControls(props: ChaosControlsProps) {
         <ToolButton label="Fuzzer" active={tab === "fuzzer"} onClick={() => onTab("fuzzer")} />
       </PanelHeader>
       {tab === "faults" && (
-        <FaultsTab profile={props.profile} onChange={props.onChange} link={link} guard={guard} proxy={props.proxy} />
+        <FaultsTab
+          profile={props.profile}
+          onChange={props.onChange}
+          link={link}
+          guard={guard}
+          proxy={props.proxy}
+          ruleTarget={ruleTarget}
+        />
       )}
       {tab === "burst" && (
         <BurstPanel
@@ -91,19 +105,26 @@ export function ChaosControls(props: ChaosControlsProps) {
   );
 }
 
+interface RuleTarget {
+  method: RouteMethod | null;
+  path: string;
+}
+
 interface FaultsTabProps {
   profile: FaultProfile;
   onChange: (profile: FaultProfile) => void;
   link: EngineLink;
   guard: GuardState;
   proxy: ProxyControl;
+  ruleTarget: RuleTarget;
 }
 
-function FaultsTab({ profile, onChange, link, guard, proxy }: FaultsTabProps) {
+function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget }: FaultsTabProps) {
   const [listenPort, setListenPort] = useState(DEFAULT_LISTEN_PORT);
   const online = link.state === "online" && proxy.status !== null;
   const running = proxy.status?.running ?? false;
   const armed = proxy.status?.armed ?? false;
+  const rules = proxy.status?.rules ?? [];
   const upstream = guard.phase === "accepted" ? guard.target.normalized : null;
   const set = <K extends keyof FaultProfile>(key: K, value: FaultProfile[K]) => onChange({ ...profile, [key]: value });
 
@@ -208,6 +229,14 @@ function FaultsTab({ profile, onChange, link, guard, proxy }: FaultsTabProps) {
           />
         </Section>
 
+        <RouteRules
+          rules={rules}
+          target={ruleTarget}
+          profile={profile}
+          disabled={!online}
+          onApply={proxy.applyRules}
+        />
+
         <Section title="Engine Profile">
           <pre className="num overflow-x-auto rounded-xs border border-line bg-bg p-2 text-2xs leading-4 text-fg-dim">
             {proxy.status === null ? "engine unavailable" : JSON.stringify({ armed, ...proxy.status.profile }, null, 2)}
@@ -217,8 +246,14 @@ function FaultsTab({ profile, onChange, link, guard, proxy }: FaultsTabProps) {
 
       <div className="flex h-9 shrink-0 items-center gap-2 border-t border-line px-2.5">
         <StatusSquare className={armed ? "bg-warn" : "bg-muted"} />
-        <span className="text-2xs text-fg-faint">
-          {armed ? (running ? "Injecting on every proxied request" : "Armed; starts injecting when the listener runs") : "Disarmed; traffic passes through"}
+        <span className="min-w-0 truncate text-2xs text-fg-faint">
+          {armed
+            ? running
+              ? rules.length > 0
+                ? `Injecting; ${rules.length} route rule${rules.length === 1 ? "" : "s"} before the global profile`
+                : "Injecting on every proxied request"
+              : "Armed; starts injecting when the listener runs"
+            : "Disarmed; traffic passes through"}
         </span>
         <button
           type="button"
@@ -236,5 +271,100 @@ function FaultsTab({ profile, onChange, link, guard, proxy }: FaultsTabProps) {
         </button>
       </div>
     </>
+  );
+}
+
+export function summarizeProfile(profile: FaultProfile): string {
+  const parts: string[] = [];
+  if (profile.latencyMs > 0 || profile.jitterMs > 0) {
+    parts.push(profile.jitterMs > 0 ? `${profile.latencyMs}±${profile.jitterMs}ms` : `${profile.latencyMs}ms`);
+  }
+  if (profile.dropRate > 0) parts.push(`rst ${profile.dropRate}%`);
+  if (profile.statusMutation !== "none" && profile.mutationRate > 0) {
+    parts.push(`${profile.statusMutation}@${profile.mutationRate}%`);
+  }
+  return parts.length === 0 ? "passthrough" : parts.join(" ");
+}
+
+function sameRoute(rule: FaultRule, target: RuleTarget): boolean {
+  return rule.method === target.method && rule.pathPattern === target.path;
+}
+
+/** Rules bind a snapshot of the slider profile; re-binding the same route replaces it. */
+function RouteRules({
+  rules,
+  target,
+  profile,
+  disabled,
+  onApply,
+}: {
+  rules: readonly FaultRule[];
+  target: RuleTarget;
+  profile: FaultProfile;
+  disabled: boolean;
+  onApply: (rules: FaultRule[]) => void;
+}) {
+  const bound = rules.some((rule) => sameRoute(rule, target));
+  const bind = () => {
+    const rule: FaultRule = { method: target.method, pathPattern: target.path, profile };
+    onApply(bound ? rules.map((r) => (sameRoute(r, target) ? rule : r)) : [...rules, rule]);
+  };
+  const label = `${target.method === null ? "ANY" : METHOD_BADGE[target.method]} ${target.path}`;
+
+  return (
+    <Section
+      title="Route Rules"
+      aside={
+        rules.length > 0 ? (
+          <ToolButton label="Clear" disabled={disabled} onClick={() => onApply([])} />
+        ) : (
+          <span className="num text-2xs text-fg-faint">first match wins</span>
+        )
+      }
+    >
+      {rules.length > 0 && (
+        <div className="mb-2 flex flex-col border-t border-line/60">
+          {rules.map((rule, index) => (
+            <div
+              key={`${rule.method ?? "ANY"} ${rule.pathPattern}`}
+              className="grid h-6 grid-cols-[14px_36px_minmax(0,1fr)_auto_18px] items-center gap-1.5 border-b border-line/60 text-xs"
+            >
+              <span className="num text-2xs text-fg-faint">{index + 1}</span>
+              <span className="num border border-line text-center text-2xs leading-[14px] text-fg-dim">
+                {rule.method === null ? "ANY" : METHOD_BADGE[rule.method]}
+              </span>
+              <span className="num truncate text-fg" title={rule.pathPattern}>
+                {rule.pathPattern}
+              </span>
+              <span className="num text-2xs text-warn">{summarizeProfile(rule.profile)}</span>
+              <button
+                type="button"
+                aria-label={`Remove rule ${index + 1}`}
+                title="Remove rule"
+                disabled={disabled}
+                onClick={() => onApply(rules.filter((_, i) => i !== index))}
+                className="flex size-[18px] items-center justify-center text-fg-faint hover:text-fg disabled:opacity-40"
+              >
+                <X size={11} strokeWidth={1.5} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <button
+        type="button"
+        disabled={disabled || target.path.trim() === ""}
+        onClick={bind}
+        title={`Bind ${summarizeProfile(profile)} to ${label}`}
+        className="flex h-6 w-full min-w-0 items-center gap-1.5 rounded-xs border border-line px-2 text-xs text-fg-dim hover:border-line-strong hover:bg-active hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        <Link2 size={11} strokeWidth={1.5} className="shrink-0" />
+        <span className="shrink-0">{bound ? "Rebind" : "Bind"} profile to</span>
+        <span className="num truncate text-fg">{label}</span>
+      </button>
+      <div className="pt-1 text-2xs text-fg-faint">
+        Matched against the upstream path while armed; unmatched requests use the global profile.
+      </div>
+    </Section>
   );
 }

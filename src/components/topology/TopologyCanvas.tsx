@@ -148,7 +148,10 @@ function buildNodeData(
         ["version", online ? link.status.version : "-"],
         ["subscribers", online ? String(link.status.telemetrySubscribers) : "-"],
         ["proxy", proxy?.listener ?? "offline"],
-        ["faults", proxy === null ? "-" : proxy.armed ? "armed" : "off"],
+        [
+          "faults",
+          proxy === null ? "-" : `${proxy.armed ? "armed" : "off"}${proxy.rules.length > 0 ? ` +${proxy.rules.length} rules` : ""}`,
+        ],
       ],
     },
     guard: {

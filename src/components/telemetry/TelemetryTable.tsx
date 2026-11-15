@@ -173,7 +173,11 @@ function toRow(event: TelemetryEvent): Row {
         result: status.running ? "LISTEN" : "STOPPED",
         resultTone: status.running ? "ok" : "muted",
         latency: "-",
-        detail: [status.upstream === null ? null : `-> ${status.upstream}`, describeFaults(status.armed, status.profile)]
+        detail: [
+          status.upstream === null ? null : `-> ${status.upstream}`,
+          describeFaults(status.armed, status.profile),
+          status.rules.length === 0 ? null : `${status.rules.length} route rule${status.rules.length === 1 ? "" : "s"}`,
+        ]
           .filter((part) => part !== null)
           .join("  "),
       };
@@ -190,6 +194,7 @@ function toRow(event: TelemetryEvent): Row {
         detail: [
           event.fault === "statusMutation" ? "injected status" : null,
           event.fault === "connectionDrop" ? "injected reset" : null,
+          event.rule === null ? null : `rule ${event.rule}`,
           event.injectedDelayUs > 0 ? `+${formatLatency(event.injectedDelayUs)} delay` : null,
           event.upstreamLatencyUs === null ? null : `upstream ${formatLatency(event.upstreamLatencyUs)}`,
           `req ${formatBytes(event.requestBytes)}`,

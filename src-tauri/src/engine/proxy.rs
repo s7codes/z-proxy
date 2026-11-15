@@ -28,7 +28,7 @@ use url::Url;
 use uuid::Uuid;
 
 use super::error::{EngineError, EngineResult};
-use super::fault::{self, FaultAction, FaultPlan, FaultProfile, FaultState};
+use super::fault::{self, FaultAction, FaultPlan, FaultProfile, FaultRule, FaultState};
 use super::guard::{self, GuardedTarget};
 use super::net;
 use super::types::{FaultKind, ProxyConfig, ProxyStatus, TelemetryEvent};
@@ -173,12 +173,26 @@ impl ProxyManager {
         profile: FaultProfile,
     ) -> EngineResult<ProxyStatus> {
         profile.validate()?;
-        self.faults.send_replace(FaultState { armed, profile });
+        self.faults.send_modify(|state| {
+            state.armed = armed;
+            state.profile = profile;
+        });
+        Ok(self.changed().await)
+    }
+
+    /// Replaces the route rule set atomically; an invalid rule leaves the active set intact.
+    pub async fn set_rules(&self, rules: Vec<FaultRule>) -> EngineResult<ProxyStatus> {
+        let compiled = fault::compile_rules(rules)?;
+        self.faults.send_modify(|state| state.rules = compiled);
+        Ok(self.changed().await)
+    }
+
+    async fn changed(&self) -> ProxyStatus {
         let running = self.running.lock().await;
         let status = self.snapshot(running.as_ref());
         drop(running);
         self.publish_state(&status);
-        Ok(status)
+        status
     }
 
     pub async fn status(&self) -> ProxyStatus {
@@ -187,13 +201,14 @@ impl ProxyManager {
     }
 
     fn snapshot(&self, running: Option<&RunningProxy>) -> ProxyStatus {
-        let faults = self.faults.borrow().clone();
+        let faults = self.faults.borrow();
         ProxyStatus {
             running: running.is_some(),
             listener: running.map(|r| r.listener.to_string()),
             upstream: running.map(|r| r.upstream.clone()),
             armed: faults.armed,
-            profile: faults.profile,
+            profile: faults.profile.clone(),
+            rules: faults.rules.iter().map(|rule| rule.rule.clone()).collect(),
         }
     }
 
@@ -319,10 +334,18 @@ struct ProxyContext {
 }
 
 impl ProxyContext {
-    fn plan(&self) -> FaultPlan {
+    /// Decision plus the label of the rule that supplied it. Rules address routes as the
+    /// service sees them, so matching uses the upstream path (base path included).
+    fn plan(&self, method: &str, path_and_query: &str) -> (FaultPlan, Option<String>) {
+        let upstream = upstream_url(&self.upstream.url, path_and_query);
         let state = self.faults.borrow();
         let mut rng = self.rng.lock().unwrap_or_else(PoisonError::into_inner);
-        fault::plan(&state, &mut rng)
+        let plan = fault::plan(&state, method, upstream.path(), &mut rng);
+        let label = plan
+            .rule
+            .and_then(|index| state.rules.get(index))
+            .map(|rule| rule.label());
+        (plan, label)
     }
 
     fn finish(&self, mut record: Exchange, reply: Reply) -> Response {
@@ -345,6 +368,7 @@ impl ProxyContext {
             injected_delay_us: record.injected_delay_us,
             upstream_latency_us: record.upstream_latency_us,
             fault: record.fault,
+            rule: record.rule,
             request_bytes: record.request_bytes,
             response_bytes: record.response_bytes,
             error: record.error,
@@ -361,6 +385,7 @@ struct Exchange {
     injected_delay_us: u64,
     upstream_latency_us: Option<u64>,
     fault: Option<FaultKind>,
+    rule: Option<String>,
     request_bytes: u64,
     response_bytes: u64,
     error: Option<String>,
@@ -398,11 +423,13 @@ async fn proxy_handler(
         injected_delay_us: 0,
         upstream_latency_us: None,
         fault: None,
+        rule: None,
         request_bytes: 0,
         response_bytes: 0,
         error: None,
     };
-    let plan = ctx.plan();
+    let (plan, rule) = ctx.plan(&record.method, &record.path);
+    record.rule = rule;
 
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
@@ -644,6 +671,7 @@ mod tests {
 
     use super::*;
     use crate::engine::fault::StatusMutation;
+    use crate::engine::types::RouteMethod;
 
     const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1128,6 +1156,105 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.code(), "PROXY_LOOP", "{upstream}");
         }
+    }
+
+    #[tokio::test]
+    async fn route_rules_override_the_global_profile_per_upstream_path() {
+        let hub = Arc::new(TelemetryHub::new());
+        let mut events = hub.subscribe();
+        let (upstream, hits) = spawn_upstream().await;
+        let manager = ProxyManager::with_seed(hub, 0x5eed).unwrap();
+        // Upstream base path `/api`: rules address the path the service receives.
+        let proxy = manager
+            .start(ProxyConfig {
+                upstream: format!("http://127.0.0.1:{}/api", upstream.port()),
+                listen_port: 0,
+            })
+            .await
+            .unwrap()
+            .listener
+            .unwrap();
+        let rule = |method, pattern: &str, status| FaultRule {
+            method,
+            path_pattern: pattern.to_owned(),
+            profile: FaultProfile {
+                status_mutation: status,
+                mutation_rate: 100,
+                ..FaultProfile::default()
+            },
+        };
+        let status = manager
+            .set_rules(vec![
+                rule(
+                    Some(RouteMethod::Post),
+                    "/api/orders/{id}",
+                    StatusMutation::ServiceUnavailable,
+                ),
+                rule(None, "/api/health", StatusMutation::TooManyRequests),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(status.rules.len(), 2);
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let send = |method: reqwest::Method, path: &str| {
+            client
+                .request(method, format!("http://{proxy}{path}"))
+                .send()
+        };
+        let code = |response: reqwest::Response| response.status().as_u16();
+
+        // Rules are inert until armed.
+        assert_eq!(
+            code(send(reqwest::Method::POST, "/orders/7").await.unwrap()),
+            200
+        );
+        let status = manager
+            .set_faults(true, FaultProfile::default())
+            .await
+            .unwrap();
+        assert_eq!(status.rules.len(), 2, "arming keeps the rule set");
+
+        let mutated = send(reqwest::Method::POST, "/orders/7").await.unwrap();
+        assert_eq!(mutated.headers()[FAULT_HEADER], "status-503");
+        assert_eq!(code(mutated), 503);
+        assert_eq!(
+            code(send(reqwest::Method::GET, "/orders/7").await.unwrap()),
+            200
+        );
+        assert_eq!(
+            code(send(reqwest::Method::POST, "/orders").await.unwrap()),
+            200
+        );
+        assert_eq!(
+            code(send(reqwest::Method::DELETE, "/health/").await.unwrap()),
+            429
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        let mut rules = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let TelemetryEvent::ProxyExchange { status, rule, .. } = event {
+                rules.push((status, rule));
+            }
+        }
+        assert_eq!(
+            rules,
+            [
+                (Some(200), None),
+                (Some(503), Some("POST /api/orders/{id}".to_owned())),
+                (Some(200), None),
+                (Some(200), None),
+                (Some(429), Some("ANY /api/health".to_owned())),
+            ]
+        );
+
+        let err = manager
+            .set_rules(vec![rule(None, "orders", StatusMutation::BadGateway)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "INVALID_FAULT_RULE");
+        assert_eq!(manager.status().await.rules.len(), 2);
     }
 
     #[tokio::test]

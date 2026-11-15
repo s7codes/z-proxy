@@ -3,24 +3,12 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { FolderOpen, FolderTree, LoaderCircle, RefreshCw, Search } from "lucide-react";
 import type { RouteScanControl } from "../../hooks/useRouteScan";
 import { formatLatency } from "../../lib/format";
-import { fileLabel, SOURCE_LABEL } from "../../lib/routes";
-import type { DiscoveredRoute, RouteMethod, RouteScanReport, RouteSource } from "../../lib/types";
+import { fileLabel, METHOD_BADGE, SOURCE_LABEL } from "../../lib/routes";
+import type { DiscoveredRoute, RouteScanReport, RouteSource } from "../../lib/types";
 import { ErrorLine } from "../chaos/ErrorLine";
 
 const ROW_HEIGHT = 34;
 const MAX_LISTED_ISSUES = 20;
-
-// Same abbreviations HTTP clients use, so every badge fits one fixed column.
-const METHOD_BADGE: Record<RouteMethod, string> = {
-  GET: "GET",
-  POST: "POST",
-  PUT: "PUT",
-  PATCH: "PATCH",
-  DELETE: "DEL",
-  HEAD: "HEAD",
-  OPTIONS: "OPT",
-  ANY: "ANY",
-};
 
 interface RouteListProps {
   scan: RouteScanControl;

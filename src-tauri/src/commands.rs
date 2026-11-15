@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::engine::concurrency;
 use crate::engine::error::EngineError;
-use crate::engine::fault::FaultProfile;
+use crate::engine::fault::{FaultProfile, FaultRule};
 use crate::engine::fuzzer;
 use crate::engine::guard;
 use crate::engine::net;
@@ -125,6 +125,15 @@ pub async fn set_fault_profile(
     profile: FaultProfile,
 ) -> Result<ProxyStatus, EngineError> {
     state.proxy.set_faults(armed, profile).await
+}
+
+/// Replaces the route rule set; rules apply while faults are armed, first match first.
+#[tauri::command]
+pub async fn set_fault_rules(
+    state: State<'_, AppState>,
+    rules: Vec<FaultRule>,
+) -> Result<ProxyStatus, EngineError> {
+    state.proxy.set_rules(rules).await
 }
 
 #[tauri::command]

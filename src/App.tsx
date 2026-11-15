@@ -249,6 +249,7 @@ export function App() {
             fuzzPayload={fuzzPayload}
             onFuzzPayload={setFuzzPayload}
             sampleBody={selectedRoute?.sampleBody ?? null}
+            route={selectedRoute}
           />
         }
         telemetry={<TelemetryTable store={telemetry} />}

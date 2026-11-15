@@ -6,6 +6,7 @@ import type {
   EngineErrorCode,
   EngineStatus,
   FaultProfile,
+  FaultRule,
   FuzzReport,
   FuzzSpec,
   ProxyConfig,
@@ -35,6 +36,7 @@ const ENGINE_CODES: ReadonlySet<string> = new Set<EngineErrorCode>([
   "LISTENER_BIND_FAILED",
   "PROXY_LOOP",
   "INVALID_FAULT_PROFILE",
+  "INVALID_FAULT_RULE",
   "INVALID_BURST_SPEC",
   "INVALID_FUZZ_SPEC",
   "FUZZER_BUSY",
@@ -96,6 +98,11 @@ export function getProxyStatus(): Promise<IpcResult<ProxyStatus>> {
 
 export function setFaultProfile(armed: boolean, profile: FaultProfile): Promise<IpcResult<ProxyStatus>> {
   return call<ProxyStatus>("set_fault_profile", { armed, profile });
+}
+
+/** Replaces the whole rule set; an invalid rule rejects the set and keeps the active one. */
+export function setFaultRules(rules: FaultRule[]): Promise<IpcResult<ProxyStatus>> {
+  return call<ProxyStatus>("set_fault_rules", { rules });
 }
 
 export function runConcurrencyBurst(spec: BurstSpec): Promise<IpcResult<BurstReport>> {
