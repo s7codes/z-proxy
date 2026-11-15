@@ -4,7 +4,7 @@ import type { GuardState } from "../../hooks/useGuardValidator";
 import type { LabControl } from "../../hooks/useLab";
 import type { RouteScanControl } from "../../hooks/useRouteScan";
 import { TONE_TEXT } from "../../lib/tone";
-import type { DiscoveredRoute } from "../../lib/types";
+import type { DiscoveredRoute, RouteRiskKind } from "../../lib/types";
 import { PanelHeader, Section } from "../shell/PanelHeader";
 import { GuardValidator } from "./GuardValidator";
 import { LAB_MODE_TONE, LabPanel, type LabRouting } from "./LabPanel";
@@ -21,6 +21,7 @@ interface TargetInspectorProps {
   scan: RouteScanControl;
   selectedRoute: DiscoveredRoute | null;
   onSelectRoute: (route: DiscoveredRoute) => void;
+  onAutoTarget: (route: DiscoveredRoute, kind: RouteRiskKind) => void;
   lab: LabControl;
   onLoadLab: () => void;
   labRouting: LabRouting;
@@ -37,6 +38,7 @@ export function TargetInspector({
   scan,
   selectedRoute,
   onSelectRoute,
+  onAutoTarget,
   lab,
   onLoadLab,
   labRouting,
@@ -95,7 +97,13 @@ export function TargetInspector({
           <span className="label-caps text-fg-faint">Routes</span>
           <span className="num ml-auto text-2xs text-fg-faint">{scan.report?.routes.length ?? 0}</span>
         </div>
-        <RouteList scan={scan} selected={selectedRoute} onSelect={onSelectRoute} online={online} />
+        <RouteList
+          scan={scan}
+          selected={selectedRoute}
+          onSelect={onSelectRoute}
+          onAutoTarget={onAutoTarget}
+          online={online}
+        />
       </section>
     </div>
   );

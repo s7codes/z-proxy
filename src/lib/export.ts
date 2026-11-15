@@ -222,7 +222,7 @@ function buildContracts(inputs: AuditInputs): AuditContracts {
 
 function buildRoutes(report: RouteScanReport | null): AuditRoutes | null {
   if (report === null) return null;
-  const counts: Record<RouteRiskKind, number> = { unvalidatedMutation: 0, unboundedQuery: 0, floatingAsync: 0 };
+  const counts = Object.fromEntries(RISK_KINDS.map((kind) => [kind, 0])) as Record<RouteRiskKind, number>;
   const risks: AuditRouteRisk[] = [];
   for (const route of report.routes) {
     for (const risk of route.risks) {
@@ -231,7 +231,8 @@ function buildRoutes(report: RouteScanReport | null): AuditRoutes | null {
         kind: risk.kind,
         method: route.method,
         path: route.path,
-        file: route.file,
+        // An imported handler's evidence line belongs to its own module.
+        file: risk.file ?? route.file,
         line: risk.line,
         evidence: risk.evidence,
         detail: risk.detail,

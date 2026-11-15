@@ -6,6 +6,7 @@ import { contractSummary, describeViolation, VIOLATION_LABEL } from "../../lib/c
 import { DISCLOSURE_LABEL } from "../../lib/disclosure";
 import { formatBytes, formatLatency } from "../../lib/format";
 import { materializeFuzzCase } from "../../lib/ipc";
+import type { FuzzPreset } from "../../lib/risk";
 import { joinTarget, parseHeaders, type RequestOrigin } from "../../lib/request";
 import { pathParams, type RequestTarget } from "../../lib/routes";
 import { httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
@@ -81,6 +82,8 @@ interface FuzzerPanelProps {
   contract: ResponseContract | null;
   /** Replays a case body through the burst runner: same method and path, N workers. */
   onSendToBurst: (target: RequestTarget, body: string, origin: string) => void;
+  /** Initial mutation classes from an auto-targeted route risk. */
+  preset: FuzzPreset | null;
 }
 
 export function FuzzerPanel({
@@ -95,10 +98,13 @@ export function FuzzerPanel({
   sampleBody,
   contract,
   onSendToBurst,
+  preset,
 }: FuzzerPanelProps) {
   const { method, path } = request;
   const [headerText, setHeaderText] = useState("");
-  const [selected, setSelected] = useState<ReadonlySet<MutationClass>>(() => new Set(CLASSES.map((c) => c.id)));
+  const [selected, setSelected] = useState<ReadonlySet<MutationClass>>(
+    () => new Set(preset?.classes ?? CLASSES.map((c) => c.id)),
+  );
   const [timeoutMs, setTimeoutMs] = useState(5_000);
 
   const parsed = useMemo(() => parseHeaders(headerText), [headerText]);

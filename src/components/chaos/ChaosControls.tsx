@@ -9,6 +9,7 @@ import type { FuzzerProgress, TrafficAudit } from "../../hooks/useTelemetry";
 import { contractFor } from "../../lib/contract";
 import type { RequestOrigin } from "../../lib/request";
 import { METHOD_BADGE, type RequestTarget } from "../../lib/routes";
+import type { BurstPreset, FuzzPreset } from "../../lib/risk";
 import { DEFAULT_LISTEN_PORT, summarizeProfile } from "../../lib/rules";
 import { AUDIT_KINDS, AUDIT_LABEL, type AuditKind } from "../../lib/traffic";
 import type { DiscoveredRoute, FaultProfile, FaultRule, RouteMethod, StatusMutation } from "../../lib/types";
@@ -64,6 +65,17 @@ interface ChaosControlsProps {
   audit: TrafficAudit;
   /** Narrows the telemetry table to one audit category (`null`: every audited exchange). */
   onAuditFilter: (kind: AuditKind | null) => void;
+  /**
+   * Setup an auto-targeted route risk opens the Burst or Fuzzer tab with. A new `nonce`
+   * remounts the panel, so the preset replaces whatever was configured.
+   */
+  preset: ChaosPreset | null;
+}
+
+export interface ChaosPreset {
+  nonce: number;
+  burst: BurstPreset | null;
+  fuzz: FuzzPreset | null;
 }
 
 export function ChaosControls(props: ChaosControlsProps) {
@@ -97,6 +109,8 @@ export function ChaosControls(props: ChaosControlsProps) {
       )}
       {tab === "burst" && (
         <BurstPanel
+          key={props.preset?.burst === null ? 0 : (props.preset?.nonce ?? 0)}
+          preset={props.preset?.burst ?? null}
           requestOrigin={props.requestOrigin}
           burst={props.burst}
           online={online}
@@ -111,6 +125,8 @@ export function ChaosControls(props: ChaosControlsProps) {
       )}
       {tab === "fuzzer" && (
         <FuzzerPanel
+          key={props.preset?.fuzz === null ? 0 : (props.preset?.nonce ?? 0)}
+          preset={props.preset?.fuzz ?? null}
           requestOrigin={props.requestOrigin}
           fuzzer={props.fuzzer}
           progress={props.fuzzerProgress}

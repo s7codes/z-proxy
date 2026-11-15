@@ -6,6 +6,7 @@
 //! `.route("/p", sub)`, Axum `.nest("/p", ..)`); composition across files is invisible to a
 //! lexical pass, so such routes are reported as written at their declaration site.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Instant;
@@ -14,8 +15,9 @@ use regex::Regex;
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 
+use super::audit::{self, Project};
 use super::lex::{Lang, Source};
-use super::{audit, axum, go, next, node, openapi};
+use super::{axum, go, next, node, openapi};
 use crate::engine::error::{EngineError, EngineResult};
 use crate::engine::types::{
     DiscoveredRoute, ResponseContract, RouteMethod, RouteRisk, RouteScanReport, RouteSource,
@@ -42,7 +44,7 @@ pub const SKIP_DIRS: [&str; 14] = [
 ];
 const LOCKFILES: [&str; 3] = ["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml"];
 const MAX_FILES: u32 = 50_000;
-const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
+pub(super) const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_SPEC_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ROUTES: usize = 5_000;
 const MAX_ISSUES: usize = 100;
@@ -192,6 +194,8 @@ struct Scan {
     truncated: bool,
     routes: Vec<DiscoveredRoute>,
     issues: Vec<ScanIssue>,
+    /// Express major version by source directory, from the nearest `package.json`.
+    express: HashMap<PathBuf, Option<u32>>,
 }
 
 impl Scan {
@@ -242,8 +246,18 @@ impl Scan {
         self.files_parsed += 1;
         let src = src.strip_prefix('\u{feff}').unwrap_or(&src);
         let components: Vec<String> = file.split('/').map(str::to_owned).collect();
+        let dir = entry.path().parent().unwrap_or(root);
+        let express_native_async = kind == FileKind::Js
+            && self
+                .express_major(root, dir)
+                .is_some_and(|major| major >= 5);
+        let project = Project {
+            root,
+            dir,
+            express_native_async,
+        };
 
-        match extract(kind, &components, src) {
+        match extract(kind, &components, src, Some(&project)) {
             Ok(raw) => {
                 self.routes
                     .extend(raw.into_iter().map(|route| discovered(route, &file)));
@@ -251,6 +265,55 @@ impl Scan {
             Err(reason) => self.issue(file, reason),
         }
     }
+
+    /// Express major version the nearest `package.json` at or above `dir` declares. A
+    /// manifest without Express defers to the next one up (a workspace package inside a
+    /// monorepo whose root declares it).
+    fn express_major(&mut self, root: &Path, dir: &Path) -> Option<u32> {
+        if let Some(known) = self.express.get(dir) {
+            return *known;
+        }
+        let mut found = None;
+        for ancestor in dir.ancestors() {
+            if !ancestor.starts_with(root) {
+                break;
+            }
+            if let Some(known) = self.express.get(ancestor) {
+                found = *known;
+                break;
+            }
+            if let Some(major) = declared_express_major(&ancestor.join("package.json")) {
+                found = Some(major);
+                break;
+            }
+        }
+        self.express.insert(dir.to_path_buf(), found);
+        found
+    }
+}
+
+fn declared_express_major(manifest: &Path) -> Option<u32> {
+    let meta = std::fs::metadata(manifest).ok()?;
+    if !meta.is_file() || meta.len() > MAX_SOURCE_BYTES {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest).ok()?).ok()?;
+    ["dependencies", "devDependencies", "peerDependencies"]
+        .iter()
+        .find_map(|section| value.get(section)?.get("express")?.as_str())
+        .and_then(express_range_major)
+}
+
+/// Major version a dependency range starts at: `^5.1.0`, `~5`, `>=5 <6`, `5.0.0-beta.3`,
+/// `npm:express@5.1.0`. Tags and workspace links (`latest`, `workspace:*`) yield `None`.
+fn express_range_major(range: &str) -> Option<u32> {
+    let range = range.rsplit_once('@').map_or(range, |(_, version)| version);
+    let digits: String = range
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// Routes of an in-memory OpenAPI JSON document, reported like a one-file scan rooted at
@@ -304,25 +367,30 @@ pub fn discovered(route: RawRoute, file: &str) -> DiscoveredRoute {
     }
 }
 
-fn extract(kind: FileKind, components: &[String], src: &str) -> Result<Vec<RawRoute>, String> {
+fn extract(
+    kind: FileKind,
+    components: &[String],
+    src: &str,
+    project: Option<&Project<'_>>,
+) -> Result<Vec<RawRoute>, String> {
     match kind {
         FileKind::Js => {
             let source = Source::new(src, Lang::Js);
             let mut routes = next::extract(components, &source);
             routes.extend(node::extract(&source));
-            audit::annotate(&source, Lang::Js, &mut routes);
+            audit::annotate(&source, Lang::Js, &mut routes, project);
             Ok(routes)
         }
         FileKind::Rust => {
             let source = Source::new(src, Lang::Rust);
             let mut routes = axum::extract(&source);
-            audit::annotate(&source, Lang::Rust, &mut routes);
+            audit::annotate(&source, Lang::Rust, &mut routes, project);
             Ok(routes)
         }
         FileKind::Go => {
             let source = Source::new(src, Lang::Go);
             let mut routes = go::extract(&source);
-            audit::annotate(&source, Lang::Go, &mut routes);
+            audit::annotate(&source, Lang::Go, &mut routes, project);
             Ok(routes)
         }
         FileKind::Json => openapi::from_json(src),
@@ -395,7 +463,7 @@ pub fn display_path(path: &Path) -> String {
     raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_owned()
 }
 
-fn relative(root: &Path, path: &Path) -> String {
+pub(super) fn relative(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .components()
@@ -545,6 +613,119 @@ mod tests {
     fn patterns_compile() {
         assert!(COLON_PARAM.is_some());
         assert!(BRACE_PARAM.is_some());
+    }
+
+    fn risks(report: &RouteScanReport) -> Vec<String> {
+        report
+            .routes
+            .iter()
+            .flat_map(|route| {
+                let method = serde_json::to_value(route.method).unwrap();
+                route.risks.iter().map(move |risk| {
+                    format!(
+                        "{} {}: {:?}@{}:{}",
+                        method.as_str().unwrap_or_default(),
+                        route.path,
+                        risk.kind,
+                        risk.file.as_deref().unwrap_or(&route.file),
+                        risk.line
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn imported_handlers_are_audited_in_their_own_module() {
+        let fx = Fixture::new();
+        fx.write("package.json", r#"{"dependencies":{"express":"^4.21.2"}}"#)
+            .write(
+                "src/routes/orders.js",
+                "const express = require(\"express\");\nconst router = express.Router();\nconst { createOrder } = require(\"../controllers/orders\");\nimport * as users from \"../controllers/users.js\";\n\nrouter.post(\"/orders\", createOrder);\nrouter.put(\"/users/:id\", users.update);\n\nmodule.exports = router;\n",
+            )
+            .write(
+                "src/controllers/orders.js",
+                "exports.createOrder = async (req, res) => {\n  const order = await db.order.create({ data: req.body });\n  await db.coupon.update({ where: { code: req.body.code }, data: { used: 1 } });\n  res.status(201).json(order);\n};\n",
+            )
+            .write(
+                "src/controllers/users.ts",
+                "export async function update(req, res, next) {\n  try {\n    const { name } = req.body;\n    const rows = await pool.query(`UPDATE users SET name = '${name}' WHERE id = ${req.params.id}`);\n    res.json(rows);\n  } catch (err) {\n    next(err);\n  }\n}\n",
+            );
+        assert_eq!(
+            risks(&fx.scan()),
+            [
+                "POST /orders: UnvalidatedMutation@src/controllers/orders.js:2",
+                "POST /orders: FloatingAsync@src/controllers/orders.js:1",
+                "POST /orders: NonAtomicMultiWrite@src/controllers/orders.js:2",
+                "PUT /users/{id}: UnvalidatedMutation@src/controllers/users.ts:3",
+                "PUT /users/{id}: UnsafeSqlInterpolation@src/controllers/users.ts:4",
+            ]
+        );
+
+        // Express 5 forwards the rejected promise to the error middleware by itself.
+        fx.write("package.json", r#"{"dependencies":{"express":"^5.1.0"}}"#);
+        let report = fx.scan();
+        assert!(
+            risks(&report)
+                .iter()
+                .all(|risk| !risk.contains("FloatingAsync")),
+            "{:?}",
+            risks(&report)
+        );
+        assert_eq!(risks(&report).len(), 4);
+    }
+
+    #[test]
+    fn imports_never_leave_the_scan_root() {
+        let handler = |name: &str| {
+            format!("exports.{name} = async (req, res, next) => {{\n  try {{\n    await db.a.create({{ data: req.body }});\n    await db.b.create({{ data: req.body }});\n  }} catch (err) {{\n    next(err);\n  }}\n}};\n")
+        };
+        let outside = Fixture::new();
+        outside.write("handlers.js", &handler("leak"));
+        let fx = Fixture::new();
+        let escape = format!(
+            "{}/handlers",
+            outside.root.to_string_lossy().replace('\\', "/")
+        );
+        let relative_escape = pathdiff_up(&fx.root, &escape);
+        fx.write("handlers.js", &handler("local")).write(
+            "server.js",
+            &format!(
+                "const {{ leak }} = require(\"{relative_escape}\");\nconst {{ local }} = require(\"./handlers\");\napp.post(\"/x\", leak);\napp.post(\"/y\", local);\n"
+            ),
+        );
+        // The same handler is audited inside the root and ignored outside it.
+        assert_eq!(
+            risks(&fx.scan()),
+            [
+                "POST /y: UnvalidatedMutation@handlers.js:3",
+                "POST /y: NonAtomicMultiWrite@handlers.js:3",
+            ]
+        );
+    }
+
+    /// `../../...` from `root` to the absolute `target` (forward slashes).
+    fn pathdiff_up(root: &Path, target: &str) -> String {
+        let depth = root.components().count();
+        let target = target
+            .trim_start_matches(|c: char| c != '/')
+            .trim_start_matches('/');
+        format!("{}{}", "../".repeat(depth), target)
+    }
+
+    #[test]
+    fn express_ranges_resolve_to_a_major() {
+        for (range, major) in [
+            ("^5.1.0", Some(5)),
+            ("~4.21.2", Some(4)),
+            (">=5 <6", Some(5)),
+            ("5.0.0-beta.3", Some(5)),
+            ("npm:express@5.1.0", Some(5)),
+            ("latest", None),
+            ("workspace:*", None),
+        ] {
+            assert_eq!(express_range_major(range), major, "{range}");
+        }
     }
 
     #[test]

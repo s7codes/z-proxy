@@ -20,7 +20,12 @@ import {
   Trash2,
   Waypoints,
 } from "lucide-react";
-import { ChaosControls, DEFAULT_FAULT_PROFILE, type ChaosTab } from "./components/chaos/ChaosControls";
+import {
+  ChaosControls,
+  DEFAULT_FAULT_PROFILE,
+  type ChaosPreset,
+  type ChaosTab,
+} from "./components/chaos/ChaosControls";
 import type { LabRouting } from "./components/inspector/LabPanel";
 import { TargetInspector } from "./components/inspector/TargetInspector";
 import { CommandPalette, type PaletteCommand } from "./components/shell/CommandPalette";
@@ -42,10 +47,11 @@ import { routeContracts } from "./lib/contract";
 import type { AuditKind } from "./lib/traffic";
 import { ipcAvailable } from "./lib/ipc";
 import { originOf, type RequestOrigin } from "./lib/request";
+import { AUTO_TARGET } from "./lib/risk";
 import { toBurstMethod, type RequestTarget } from "./lib/routes";
 import { DEFAULT_LISTEN_PORT } from "./lib/rules";
 import { TONE_TEXT } from "./lib/tone";
-import type { DiscoveredRoute, FaultProfile } from "./lib/types";
+import type { DiscoveredRoute, FaultProfile, RouteRiskKind } from "./lib/types";
 
 // Slider drags emit a value per pixel; one IPC round trip per settled position is enough.
 const PROFILE_PUSH_MS = 150;
@@ -72,6 +78,7 @@ export function App() {
   const [burstBody, setBurstBody] = useState("");
   const [burstOrigin, setBurstOrigin] = useState<string | null>(null);
   const [fuzzPayload, setFuzzPayload] = useState("");
+  const [chaosPreset, setChaosPreset] = useState<ChaosPreset | null>(null);
 
   const { status: proxyStatus, applyFaults, stop: stopProxy, applyContracts } = proxy;
 
@@ -117,6 +124,24 @@ export function App() {
   const inspectorRef = useRef<PanelImperativeHandle | null>(null);
   const chaosRef = useRef<PanelImperativeHandle | null>(null);
   const telemetryRef = useRef<PanelImperativeHandle | null>(null);
+
+  // Auto-target: a static finding becomes a live test of the same handler. The route is
+  // selected (method, path, sample body, contract) and the matching tab opens preset for the
+  // finding's failure mode.
+  const autoTarget = useCallback(
+    (route: DiscoveredRoute, kind: RouteRiskKind) => {
+      selectRoute(route);
+      const plan = AUTO_TARGET[kind];
+      setChaosPreset((current) => ({
+        nonce: (current?.nonce ?? 0) + 1,
+        burst: plan.tab === "burst" ? plan.burst : null,
+        fuzz: plan.tab === "fuzzer" ? plan.fuzz : null,
+      }));
+      chaosRef.current?.expand();
+      setChaosTab(plan.tab);
+    },
+    [selectRoute],
+  );
 
   // Fuzz-to-burst escalation: the payload that broke one request is fired from N
   // pre-connected workers, which separates a deterministic crash from one that only
@@ -435,6 +460,7 @@ export function App() {
             scan={routeScan}
             selectedRoute={selectedRoute}
             onSelectRoute={selectRoute}
+            onAutoTarget={autoTarget}
             lab={lab}
             onLoadLab={loadLabTarget}
             labRouting={labRouting}
@@ -470,6 +496,7 @@ export function App() {
             onReplayInBurst={replayInBurst}
             audit={telemetry.audit}
             onAuditFilter={showAudit}
+            preset={chaosPreset}
           />
         }
         telemetry={<TelemetryTable store={telemetry} />}

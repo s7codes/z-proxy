@@ -3,9 +3,9 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { FolderOpen, FolderTree, LoaderCircle, RefreshCw, Search } from "lucide-react";
 import type { RouteScanControl } from "../../hooks/useRouteScan";
 import { formatLatency } from "../../lib/format";
-import { RISK_KINDS, RISK_LABEL, RISK_SHORT } from "../../lib/risk";
+import { AUTO_TARGET, RISK_KINDS, RISK_LABEL, RISK_SHORT } from "../../lib/risk";
 import { fileLabel, METHOD_BADGE, SOURCE_LABEL } from "../../lib/routes";
-import type { DiscoveredRoute, RouteRiskKind, RouteScanReport, RouteSource } from "../../lib/types";
+import type { DiscoveredRoute, RouteRisk, RouteRiskKind, RouteScanReport, RouteSource } from "../../lib/types";
 import { ErrorLine } from "../chaos/ErrorLine";
 
 const ROW_HEIGHT = 34;
@@ -18,14 +18,21 @@ interface RouteListProps {
   scan: RouteScanControl;
   selected: DiscoveredRoute | null;
   onSelect: (route: DiscoveredRoute) => void;
+  /** Selects the route and opens the Burst or Fuzzer tab preset for the finding. */
+  onAutoTarget: (route: DiscoveredRoute, kind: RouteRiskKind) => void;
   online: boolean;
+}
+
+function autoTargetTitle(risk: RouteRisk): string {
+  const plan = AUTO_TARGET[risk.kind];
+  return `${RISK_LABEL[risk.kind]}: ${risk.detail}\nAuto-target: ${plan.tab === "burst" ? "Burst" : "Fuzzer"}, ${plan.reason}`;
 }
 
 export function routeKey(route: DiscoveredRoute): string {
   return `${route.method} ${route.path} ${route.file}:${route.line}`;
 }
 
-export function RouteList({ scan, selected, onSelect, online }: RouteListProps) {
+export function RouteList({ scan, selected, onSelect, onAutoTarget, online }: RouteListProps) {
   const [filter, setFilter] = useState("");
   const [riskFilter, setRiskFilter] = useState<RiskFilter>("all");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -136,14 +143,21 @@ export function RouteList({ scan, selected, onSelect, online }: RouteListProps) 
               if (route === undefined) return null;
               const key = routeKey(route);
               return (
-                <RouteRow key={key} route={route} top={item.start} selected={key === selectedKey} onSelect={onSelect} />
+                <RouteRow
+                  key={key}
+                  route={route}
+                  top={item.start}
+                  selected={key === selectedKey}
+                  onSelect={onSelect}
+                  onAutoTarget={onAutoTarget}
+                />
               );
             })}
           </div>
         )}
       </div>
 
-      {selected !== null && selected.risks.length > 0 && <SelectedRisks route={selected} />}
+      {selected !== null && selected.risks.length > 0 && <SelectedRisks route={selected} onAutoTarget={onAutoTarget} />}
       {report !== null && report.issues.length > 0 && <Issues report={report} />}
     </div>
   );
@@ -195,18 +209,32 @@ function RiskFilters({
   );
 }
 
-function SelectedRisks({ route }: { route: DiscoveredRoute }) {
+function SelectedRisks({
+  route,
+  onAutoTarget,
+}: {
+  route: DiscoveredRoute;
+  onAutoTarget: (route: DiscoveredRoute, kind: RouteRiskKind) => void;
+}) {
   return (
-    <div className="max-h-36 shrink-0 overflow-y-auto border-t border-line px-2.5 py-1.5">
+    <div className="max-h-44 shrink-0 overflow-y-auto border-t border-line px-2.5 py-1.5">
       <div className="label-caps pb-1 text-fg-faint">Static risks</div>
       <div className="flex flex-col gap-1.5">
         {route.risks.map((risk) => (
-          <div key={`${risk.kind}:${risk.line}`} className="border-l border-warn pl-2">
-            <div className="num flex items-center gap-1.5 text-2xs">
-              <span className="label-caps text-warn">{RISK_LABEL[risk.kind]}</span>
-              <span className="ml-auto truncate text-fg-faint" title={`${route.file}:${risk.line}`}>
-                {fileLabel(route.file, risk.line)}
+          <div key={`${risk.kind}:${risk.file ?? ""}:${risk.line}`} className="border-l border-warn pl-2">
+            <div className="num flex min-w-0 items-center gap-1.5 text-2xs">
+              <span className="label-caps shrink-0 text-warn">{RISK_LABEL[risk.kind]}</span>
+              <span className="min-w-0 truncate text-fg-faint" title={`${risk.file ?? route.file}:${risk.line}`}>
+                {fileLabel(risk.file ?? route.file, risk.line)}
               </span>
+              <button
+                type="button"
+                onClick={() => onAutoTarget(route, risk.kind)}
+                title={`Open ${AUTO_TARGET[risk.kind].tab === "burst" ? "Burst" : "Fuzzer"}: ${AUTO_TARGET[risk.kind].reason}`}
+                className="ml-auto shrink-0 rounded-xs border border-line px-1 text-2xs text-fg-dim hover:border-warn/60 hover:text-warn"
+              >
+                {AUTO_TARGET[risk.kind].tab === "burst" ? "burst" : "fuzz"}
+              </button>
             </div>
             <div className="text-xs text-fg">{risk.detail}</div>
             <div className="num truncate text-2xs text-fg-dim select-text" title={risk.evidence}>
@@ -224,11 +252,13 @@ const RouteRow = memo(function RouteRow({
   top,
   selected,
   onSelect,
+  onAutoTarget,
 }: {
   route: DiscoveredRoute;
   top: number;
   selected: boolean;
   onSelect: (route: DiscoveredRoute) => void;
+  onAutoTarget: (route: DiscoveredRoute, kind: RouteRiskKind) => void;
 }) {
   return (
     <div
@@ -269,9 +299,19 @@ const RouteRow = memo(function RouteRow({
           </span>
         )}
         {route.risks.map((risk) => (
-          <span key={risk.kind} className="shrink-0 text-warn" title={`${RISK_LABEL[risk.kind]}: ${risk.detail}`}>
+          <button
+            key={risk.kind}
+            type="button"
+            title={autoTargetTitle(risk)}
+            onClick={(e) => {
+              // The row would select the route a second time without the preset.
+              e.stopPropagation();
+              onAutoTarget(route, risk.kind);
+            }}
+            className="shrink-0 text-warn underline-offset-2 hover:underline"
+          >
             {RISK_SHORT[risk.kind]}
-          </span>
+          </button>
         ))}
         <span className="ml-auto shrink-0">{SOURCE_LABEL[route.source]}</span>
       </div>

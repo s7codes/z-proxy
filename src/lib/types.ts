@@ -349,15 +349,24 @@ export interface DiscoveredRoute {
 }
 
 /** Declaration order is report order. */
-export type RouteRiskKind = "unvalidatedMutation" | "unboundedQuery" | "floatingAsync";
+export type RouteRiskKind =
+  | "unvalidatedMutation"
+  | "unboundedQuery"
+  | "floatingAsync"
+  /** Two or more database writes in one handler with no transaction in sight. */
+  | "nonAtomicMultiWrite"
+  /** SQL text built by interpolation (`${...}`, concatenation, `format!`, `fmt.Sprintf`). */
+  | "unsafeSqlInterpolation";
 
 export interface RouteRisk {
   kind: RouteRiskKind;
-  /** 1-based line of the evidence in the route's file. */
+  /** 1-based line of the evidence, in `file` when set, else in the route's file. */
   line: number;
   /** The evidence line, trimmed to 120 characters. */
   evidence: string;
   detail: string;
+  /** Scan-root-relative module holding the evidence when the handler was imported; `null` otherwise. */
+  file: string | null;
 }
 
 export interface ScanIssue {

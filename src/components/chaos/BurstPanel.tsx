@@ -3,6 +3,7 @@ import { Zap } from "lucide-react";
 import type { BurstControl } from "../../hooks/useBurst";
 import { contractSummary, summarizeViolations } from "../../lib/contract";
 import { formatBytes, formatLatency, formatPercent } from "../../lib/format";
+import type { BurstPreset } from "../../lib/risk";
 import { joinTarget, parseHeaders, type RequestOrigin } from "../../lib/request";
 import { pathParams, type RequestTarget } from "../../lib/routes";
 import { httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
@@ -58,6 +59,8 @@ interface BurstPanelProps {
   origin: string | null;
   /** OpenAPI response contract of the targeted operation; every worker's response is checked. */
   contract: ResponseContract | null;
+  /** Initial dispatch setup from an auto-targeted route risk. */
+  preset: BurstPreset | null;
 }
 
 export function BurstPanel({
@@ -71,14 +74,15 @@ export function BurstPanel({
   sampleBody,
   origin: bodyOrigin,
   contract,
+  preset,
 }: BurstPanelProps) {
   const { method, path } = request;
-  const [workers, setWorkers] = useState(20);
+  const [workers, setWorkers] = useState(preset?.workers ?? 20);
   const [timeoutMs, setTimeoutMs] = useState(5_000);
   // 0 means no quota; the engine receives `null`.
   const [maxSuccesses, setMaxSuccesses] = useState(0);
   const [idempotencyMode, setIdempotencyMode] = useState(false);
-  const [syncMode, setSyncMode] = useState<BurstSyncMode>("preConnected");
+  const [syncMode, setSyncMode] = useState<BurstSyncMode>(preset?.syncMode ?? "preConnected");
   const [headerText, setHeaderText] = useState("");
 
   const parsed = useMemo(() => parseHeaders(headerText), [headerText]);

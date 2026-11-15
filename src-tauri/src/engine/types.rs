@@ -485,17 +485,26 @@ pub enum RouteRiskKind {
     /// A side-effecting async call whose promise or error is dropped, or an async Express
     /// handler with no error path.
     FloatingAsync,
+    /// Two or more database writes in one handler with no transaction in sight: a failure
+    /// or a concurrent request between them leaves partial state.
+    NonAtomicMultiWrite,
+    /// SQL text built by interpolating values (`${...}`, concatenation, `format!`,
+    /// `fmt.Sprintf`) instead of binding parameters.
+    UnsafeSqlInterpolation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteRisk {
     pub kind: RouteRiskKind,
-    /// 1-based line of the evidence in the route's file.
+    /// 1-based line of the evidence, in `file` when set, else in the route's file.
     pub line: u32,
     /// The evidence line, trimmed to 120 characters.
     pub evidence: String,
     pub detail: String,
+    /// Scan-root-relative path of the module holding the evidence when the handler was
+    /// imported from another file; `None` when the evidence is in the route's file.
+    pub file: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -73,6 +73,22 @@ impl Source {
         let span = *self.strings.get(next.checked_sub(1)?)?;
         (at < span.1).then_some(span)
     }
+
+    /// Spans of the string literals that open inside `range`, in source order.
+    pub fn strings_in(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let first = self
+            .strings
+            .partition_point(|&(start, _)| start < range.start);
+        self.strings
+            .get(first..)
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .take_while(move |&(start, _)| start < range.end)
+    }
 }
 
 /// Replaces every comment byte with a space (newlines kept) and records string literal spans.
