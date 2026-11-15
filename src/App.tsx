@@ -199,6 +199,8 @@ export function App() {
     proxy: proxyStatus,
     burst: burst.report,
     fuzz: fuzzer.report,
+    traffic: telemetry.audit,
+    routes: routeScan.report,
   });
   const { save: saveReport, copy: copyReport } = audit;
 

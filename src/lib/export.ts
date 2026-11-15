@@ -1,9 +1,15 @@
 import type { GuardState } from "../hooks/useGuardValidator";
+import type { AuditRecord, TrafficAudit } from "../hooks/useTelemetry";
+import { describeViolation } from "./contract";
 import { formatBytes, formatLatency, formatPercent } from "./format";
+import { RISK_KINDS, RISK_LABEL } from "./risk";
 import type { RequestOrigin } from "./request";
 import { ruleLabel, summarizeProfile } from "./rules";
+import { AUDIT_KINDS, AUDIT_LABEL, type AuditKind } from "./traffic";
 import type {
+  Anomaly,
   BurstReport,
+  ContractViolation,
   ClassSummary,
   EngineStatus,
   FaultProfile,
@@ -20,9 +26,13 @@ import type {
   ProxyStatus,
   ReportFormat,
   RouteMethod,
+  RouteRiskKind,
+  RouteScanReport,
 } from "./types";
 
-export const AUDIT_SCHEMA = "z-proxy.audit/1";
+/** Version 2 added the passive traffic audit, contract drift, static route risks and the
+ * idempotency replay summary. */
+export const AUDIT_SCHEMA = "z-proxy.audit/2";
 /** Findings listed in Markdown; the JSON rendering carries all of them. */
 const MARKDOWN_FINDINGS = 200;
 
@@ -38,6 +48,10 @@ export interface AuditInputs {
   proxy: ProxyStatus | null;
   burst: BurstReport | null;
   fuzz: FuzzReport | null;
+  /** Passive findings and contract drift folded from proxied exchanges. */
+  traffic: TrafficAudit;
+  /** Route list in view: a project scan or the lab document. */
+  routes: RouteScanReport | null;
 }
 
 export interface AuditRule {
@@ -67,6 +81,60 @@ export interface AuditFuzz {
   summary: ClassSummary[];
   /** Cases with a severity, faults first. */
   findings: FuzzCaseResult[];
+}
+
+export interface AuditTraffic {
+  exchanges: number;
+  counts: Record<AuditKind, number>;
+  faults: number;
+  /** Passive findings, faults first; contract drift is listed under `contracts`. */
+  findings: AuditRecord[];
+  /** Counters exceed the retained records; the oldest were dropped. */
+  truncated: boolean;
+}
+
+export interface AuditFuzzDrift {
+  index: number;
+  label: string;
+  status: number | null;
+  violations: ContractViolation[];
+}
+
+export interface AuditContracts {
+  /** Contracts the proxy checked forwarded responses against. */
+  proxyContracts: number;
+  proxied: AuditRecord[];
+  /** Requests of the last fuzz suite, baseline included, whose response drifted. */
+  fuzzRequests: number;
+  fuzzCases: AuditFuzzDrift[];
+}
+
+export interface AuditRouteRisk {
+  kind: RouteRiskKind;
+  method: RouteMethod;
+  path: string;
+  file: string;
+  line: number;
+  evidence: string;
+  detail: string;
+}
+
+export interface AuditRoutes {
+  root: string;
+  routes: number;
+  atRisk: number;
+  counts: Record<RouteRiskKind, number>;
+  risks: AuditRouteRisk[];
+}
+
+export interface AuditIdempotency {
+  key: string;
+  target: string;
+  workers: number;
+  successes: number;
+  distinctBodies: number;
+  /** `null` when every 2xx response replayed one body. */
+  violation: Anomaly | null;
 }
 
 /** Versioned, self-describing snapshot; the JSON export is this object verbatim. */
@@ -106,11 +174,90 @@ export interface AuditReport {
     rules: AuditRule[];
   } | null;
   burst: BurstReport | null;
+  idempotency: AuditIdempotency | null;
   fuzz: AuditFuzz | null;
+  traffic: AuditTraffic;
+  contracts: AuditContracts;
+  routes: AuditRoutes | null;
 }
 
 function severityRank(result: FuzzCaseResult): number {
   return result.severity === "fault" ? 0 : 1;
+}
+
+function buildTraffic(traffic: TrafficAudit): AuditTraffic {
+  const findings = traffic.records
+    .filter((record) => record.kind !== "contractDrift")
+    .sort((a, b) => (a.severity === b.severity ? a.seq - b.seq : a.severity === "fault" ? -1 : 1));
+  const counted = AUDIT_KINDS.reduce((sum, kind) => sum + traffic.counts[kind], 0);
+  return {
+    exchanges: traffic.exchanges,
+    counts: { ...traffic.counts },
+    faults: traffic.faults,
+    findings,
+    truncated: counted > traffic.records.length,
+  };
+}
+
+function buildContracts(inputs: AuditInputs): AuditContracts {
+  const { fuzz } = inputs;
+  const fuzzCases =
+    fuzz === null
+      ? []
+      : [fuzz.baseline, ...fuzz.cases]
+          .filter((result) => result.violations.length > 0)
+          .map((result) => ({
+            index: result.index,
+            label: result.label,
+            status: result.status,
+            violations: result.violations,
+          }));
+  return {
+    proxyContracts: inputs.proxy?.contracts ?? 0,
+    proxied: inputs.traffic.records.filter((record) => record.kind === "contractDrift"),
+    fuzzRequests: fuzz?.contractViolations ?? 0,
+    fuzzCases,
+  };
+}
+
+function buildRoutes(report: RouteScanReport | null): AuditRoutes | null {
+  if (report === null) return null;
+  const counts: Record<RouteRiskKind, number> = { unvalidatedMutation: 0, unboundedQuery: 0, floatingAsync: 0 };
+  const risks: AuditRouteRisk[] = [];
+  for (const route of report.routes) {
+    for (const risk of route.risks) {
+      counts[risk.kind] += 1;
+      risks.push({
+        kind: risk.kind,
+        method: route.method,
+        path: route.path,
+        file: route.file,
+        line: risk.line,
+        evidence: risk.evidence,
+        detail: risk.detail,
+      });
+    }
+  }
+  return {
+    root: report.root,
+    routes: report.routes.length,
+    atRisk: report.routes.filter((route) => route.risks.length > 0).length,
+    counts,
+    risks,
+  };
+}
+
+function buildIdempotency(burst: BurstReport | null): AuditIdempotency | null {
+  if (burst === null || burst.idempotencyKey === null) return null;
+  const successes = burst.samples.filter((s) => s.status !== null && s.status >= 200 && s.status < 300);
+  return {
+    key: burst.idempotencyKey,
+    target: burst.target,
+    workers: burst.workers,
+    successes: successes.length,
+    distinctBodies: new Set(successes.map((s) => s.bodyHash)).size,
+    violation: burst.anomalies.find((anomaly) => anomaly.kind === "idempotencyViolation") ?? null,
+  };
 }
 
 export function buildAuditReport(inputs: AuditInputs): AuditReport {
@@ -163,6 +310,10 @@ export function buildAuditReport(inputs: AuditInputs): AuditReport {
             })),
           },
     burst: inputs.burst,
+    idempotency: buildIdempotency(inputs.burst),
+    traffic: buildTraffic(inputs.traffic),
+    contracts: buildContracts(inputs),
+    routes: buildRoutes(inputs.routes),
     fuzz:
       fuzz === null
         ? null
@@ -292,6 +443,44 @@ function overview(report: AuditReport): string[][] {
       ),
     ]);
   }
+  const { idempotency } = report;
+  if (idempotency !== null) {
+    rows.push([
+      "Idempotency replay",
+      idempotency.violation === null
+        ? cell(`held: ${count(idempotency.successes, "2xx response")} replayed one body`)
+        : cell(`violated (fault): ${idempotency.violation.detail}`),
+    ]);
+  }
+  const { traffic, contracts, routes } = report;
+  rows.push([
+    "Passive traffic audit",
+    traffic.exchanges === 0
+      ? "no proxied traffic"
+      : cell(
+          `${count(traffic.findings.length, "finding")} (${count(traffic.faults, "fault")}) across ${count(traffic.exchanges, "exchange")}${
+            traffic.findings.length === 0
+              ? ""
+              : `: ${AUDIT_KINDS.filter((k) => k !== "contractDrift" && traffic.counts[k] > 0)
+                  .map((k) => `${traffic.counts[k]} ${AUDIT_LABEL[k].toLowerCase()}`)
+                  .join(", ")}`
+          }`,
+        ),
+  ]);
+  rows.push([
+    "Contract drift",
+    contracts.proxyContracts === 0 && contracts.fuzzCases.length === 0
+      ? "no response contracts in use"
+      : cell(
+          `${count(contracts.proxied.length, "proxied violation")}, ${count(contracts.fuzzRequests, "fuzz request")} with drift`,
+        ),
+  ]);
+  rows.push([
+    "Static route audit",
+    routes === null
+      ? "no route scan"
+      : cell(`${routes.atRisk} of ${count(routes.routes, "route")} at risk, ${count(routes.risks.length, "finding")}`),
+  ]);
   const proxy = report.proxy;
   rows.push([
     "Fault injection",
@@ -413,6 +602,7 @@ function renderMarkdown(report: AuditReport): string {
         ["Request", `${burst.method} ${code(burst.target)}`],
         ["Workers", String(burst.workers)],
         ["Success quota", burst.expectedMaxSuccesses === null ? "none" : `at most ${burst.expectedMaxSuccesses} 2xx`],
+        ["Idempotency-Key", burst.idempotencyKey === null ? "not replayed" : `${code(burst.idempotencyKey)} from every worker`],
         ["Wall time", formatLatency(burst.wallUs)],
         ["Dispatch spread", burst.dispatchSpreadUs === null ? "-" : formatLatency(burst.dispatchSpreadUs)],
         ["Distinct bodies", String(burst.distinctBodies)],
@@ -503,7 +693,7 @@ function renderMarkdown(report: AuditReport): string {
     push(
       "### Findings",
       fuzz.findings.length === 0
-        ? `None: no 5xx, transport failures or leaked traces across ${fuzz.executed} cases.`
+        ? `None: no 5xx, transport failures, leaked traces or contract drift across ${fuzz.executed} cases.`
         : table(
             ["#", "Class", "Case", "Status", "Severity", "Latency", "Disclosure"],
             listed.map((f) => [
@@ -513,7 +703,11 @@ function renderMarkdown(report: AuditReport): string {
               f.status === null ? cell(f.verdict) : String(f.status),
               f.severity ?? "-",
               f.latencyUs === 0 ? "-" : formatLatency(f.latencyUs),
-              f.disclosure === null ? cell(f.error) : cell(`${f.disclosure.kind}: ${f.disclosure.evidence}`),
+              f.disclosure !== null
+                ? cell(`${f.disclosure.kind}: ${f.disclosure.evidence}`)
+                : f.violations[0] !== undefined
+                  ? cell(`drift ${describeViolation(f.violations[0])}`)
+                  : cell(f.error),
             ]),
           ),
     );
@@ -522,5 +716,131 @@ function renderMarkdown(report: AuditReport): string {
     }
   }
 
+  renderTraffic(report.traffic, push);
+  renderContracts(report.contracts, push);
+  renderRoutes(report.routes, push);
+
   return `${out.join("\n").trimEnd()}\n`;
+}
+
+type Push = (...blocks: string[]) => void;
+
+function requestCell(record: AuditRecord): string {
+  return code(`${record.method} ${record.path}`);
+}
+
+function renderTraffic(traffic: AuditTraffic, push: Push): void {
+  push("## Passive traffic audit");
+  if (traffic.exchanges === 0) {
+    push("No traffic passed through the proxy in this session.");
+    return;
+  }
+  push(
+    fields([
+      ["Exchanges audited", String(traffic.exchanges)],
+      ...AUDIT_KINDS.filter((kind) => kind !== "contractDrift").map(
+        (kind) => [AUDIT_LABEL[kind], String(traffic.counts[kind])] as [string, string],
+      ),
+    ]),
+  );
+  const listed = traffic.findings.slice(0, MARKDOWN_FINDINGS);
+  push(
+    "### Findings",
+    listed.length === 0
+      ? `None across ${count(traffic.exchanges, "exchange")}.`
+      : table(
+          ["Seq", "Request", "Status", "Kind", "Severity", "Detail", "Evidence"],
+          listed.map((f) => [
+            String(f.seq),
+            requestCell(f),
+            f.status === null ? "RST" : String(f.status),
+            code(f.kind),
+            f.severity,
+            cell(f.detail),
+            code(f.evidence),
+          ]),
+        ),
+  );
+  if (traffic.findings.length > listed.length || traffic.truncated) {
+    push("Further findings are counted above; the JSON export lists every retained record.");
+  }
+}
+
+function renderContracts(contracts: AuditContracts, push: Push): void {
+  push("## Contract drift");
+  if (contracts.proxyContracts === 0 && contracts.fuzzCases.length === 0 && contracts.proxied.length === 0) {
+    push("No OpenAPI response contracts were in use: scan an OpenAPI document or load the lab target.");
+    return;
+  }
+  push(
+    fields([
+      ["Proxy contracts", String(contracts.proxyContracts)],
+      ["Proxied violations", String(contracts.proxied.length)],
+      ["Fuzz requests with drift", String(contracts.fuzzRequests)],
+    ]),
+  );
+  if (contracts.proxied.length > 0) {
+    push(
+      "### Proxied responses",
+      table(
+        ["Seq", "Request", "Status", "Contract", "Violation"],
+        contracts.proxied.slice(0, MARKDOWN_FINDINGS).map((record) => [
+          String(record.seq),
+          requestCell(record),
+          record.status === null ? "RST" : String(record.status),
+          code(record.contract),
+          cell(record.violation === null ? record.detail : describeViolation(record.violation)),
+        ]),
+      ),
+    );
+  }
+  if (contracts.fuzzCases.length > 0) {
+    push(
+      "### Fuzzer cases",
+      table(
+        ["#", "Case", "Status", "Violations"],
+        contracts.fuzzCases.slice(0, MARKDOWN_FINDINGS).map((drift) => [
+          String(drift.index),
+          code(drift.label.length > 120 ? `${drift.label.slice(0, 120)}...` : drift.label),
+          drift.status === null ? "-" : String(drift.status),
+          cell(drift.violations.map(describeViolation).join("; ")),
+        ]),
+      ),
+    );
+  }
+}
+
+function renderRoutes(routes: AuditRoutes | null, push: Push): void {
+  push("## Static route audit");
+  if (routes === null) {
+    push("No route scan in this session.");
+    return;
+  }
+  push(
+    fields([
+      ["Root", code(routes.root)],
+      ["Routes", String(routes.routes)],
+      ["At risk", String(routes.atRisk)],
+      ...RISK_KINDS.map((kind) => [RISK_LABEL[kind], String(routes.counts[kind])] as [string, string]),
+    ]),
+  );
+  if (routes.risks.length === 0) {
+    push("No unvalidated mutations, unbounded queries or floating async calls found.");
+    return;
+  }
+  push(
+    table(
+      ["Kind", "Route", "Location", "Evidence", "Detail"],
+      routes.risks.slice(0, MARKDOWN_FINDINGS).map((risk) => [
+        code(risk.kind),
+        code(`${risk.method} ${risk.path}`),
+        code(`${risk.file}:${risk.line}`),
+        code(risk.evidence),
+        cell(risk.detail),
+      ]),
+    ),
+  );
+  if (routes.risks.length > MARKDOWN_FINDINGS) {
+    push(`${routes.risks.length - MARKDOWN_FINDINGS} further risks are listed in the JSON export.`);
+  }
 }
