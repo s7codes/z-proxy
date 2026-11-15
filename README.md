@@ -8,10 +8,9 @@ is created.
 
 ## Status
 
-Milestone 2: loopback reverse proxy with fault injection, barrier-synchronized concurrency burst
-runner with anomaly detection.
-Not implemented yet: WebSocket proxying, TLS upstreams, per-route fault rules, payload fuzzer,
-route scanner.
+Milestone 3 (in progress): loopback reverse proxy with fault injection, barrier-synchronized
+concurrency burst runner with anomaly detection, filesystem route scanner.
+Not implemented yet: WebSocket proxying, TLS upstreams, per-route fault rules, payload fuzzer.
 
 ## Layout
 
@@ -33,6 +32,9 @@ src-tauri/
   src/engine/concurrency.rs  Burst runner and report analysis
   src/engine/error.rs      EngineError, serialized as { code, message, ... }
   src/engine/types.rs      IPC DTOs and TelemetryEvent
+  src/scanner/routes.rs    Project walk, path normalization, scan report
+  src/scanner/lex.rs       Comment masking, string spans, bracket matching
+  src/scanner/{next,node,axum,go,openapi}.rs  Per-framework extractors
 ```
 
 ## Loopback guard
@@ -102,6 +104,43 @@ spread (latest minus earliest release), and anomalies:
 
 One 2xx plus conflicts is treated as correct serialization and is not reported.
 
+## Route scanner
+
+Walks a local project root (absolute path; filesystem roots are refused) and extracts route
+declarations lexically. Symlinks are not followed. Skipped directories: `node_modules`, `.git`,
+`target`, `dist`, `.next`, `.turbo`, `.vercel`, `.svelte-kit`, `.output`, `coverage`,
+`vendor`, `.venv`, `__tests__`, `__mocks__`. Skipped files: `*.d.ts`, `*.min.*`, `*.test.*`,
+`*.spec.*`, `*_test.go`, lockfiles. Limits: 50 000 files, 1 MiB per source file, 8 MiB per
+spec, 5 000 routes; hitting a limit sets `truncated`.
+
+| Source            | Recognized                                                                   |
+|-------------------|------------------------------------------------------------------------------|
+| Next.js App Router| `app/**/route.{ts,tsx,js,jsx,mjs}` exporting `GET`/`POST`/... (function, const, export list) |
+| Next.js Pages API | `pages/api/**`; methods from `req.method` comparisons and `case` labels, else `ANY` |
+| Express           | `<server>.get/post/put/patch/delete/all(path, handler)`, `.route(path).get(..)` chains |
+| Fastify           | Shorthand methods, `route({ method, url })`                                  |
+| Hono              | Shorthand methods including chained `app.get(..).post(..)`                   |
+| Axum              | `.route("/path", get(h).post(h))`, `routing::*`, `on(MethodFilter::X, h)`    |
+| Go                | net/http (`"GET /path"` patterns), gorilla `.Methods(..)`, gin/echo, chi     |
+| OpenAPI / Swagger | `paths` in `.json`/`.yaml`/`.yml`; `basePath` or `servers[0].url` path prefixed |
+
+A JS/TS call counts only when its receiver is a server object: declared in the file from
+`express()`, `Router()`, `Fastify()` or `new Hono()`, or named like one (`app`, `router`,
+`server`, `fastify`, `*Router`, ...). Receivers initialized from HTTP clients (`axios`,
+`ky`, `got`, `supertest`) are excluded, and the path argument must be followed by a handler.
+Declarations inside comments, string literals and Rust `#[cfg(test)]` modules are ignored.
+
+Paths are normalized to one template form: `:id`, `[id]` and `{id}` become `{id}`; catch-alls
+(`*`, `[...slug]`, `{path...}`, `{*rest}`) become `{*name}`. Mount prefixes applied at runtime
+(`app.use("/api", router)`, `Router::nest`, Hono `basePath`, gin groups) are not resolved; a
+route is reported as written at its declaration.
+
+Selecting a route loads its method and path into the Burst panel and adds an endpoint node to
+the topology. Requests stay blocked while the path contains unresolved `{param}` segments.
+
+The folder picker (`pick_project_root`) is opened from Rust through `tauri-plugin-dialog`; the
+webview capability set remains `core:default`.
+
 ## IPC
 
 | Command                  | Arguments                                   | Returns            |
@@ -115,10 +154,13 @@ One 2xx plus conflicts is treated as correct serialization and is not reported.
 | `get_proxy_status`       | none                                        | `ProxyStatus`      |
 | `set_fault_profile`      | `armed: boolean, profile: FaultProfile`     | `ProxyStatus`      |
 | `run_concurrency_burst`  | `spec: BurstSpec`                           | `BurstReport`      |
+| `scan_project_routes`    | `root: string`                              | `RouteScanReport`  |
+| `pick_project_root`      | none                                        | `string \| null`   |
 
 Telemetry is pushed over `tauri::ipc::Channel<TelemetryEvent>`; the UI does not poll.
 Event kinds: `engineHeartbeat` (1 Hz), `guardDecision`, `probeCompleted`,
-`proxyStateChanged`, `proxyExchange`, `burstStarted`, `burstSample`, `burstCompleted`.
+`proxyStateChanged`, `proxyExchange`, `burstStarted`, `burstSample`, `burstCompleted`,
+`routeScanCompleted`.
 
 ## Requirements
 

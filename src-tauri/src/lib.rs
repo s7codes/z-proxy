@@ -1,5 +1,6 @@
 mod commands;
 mod engine;
+mod scanner;
 mod state;
 mod telemetry;
 
@@ -12,6 +13,7 @@ pub fn run() {
     init_tracing();
 
     let result = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let state = AppState::new()?;
             let hub = state.hub.clone();
@@ -31,6 +33,8 @@ pub fn run() {
             commands::get_proxy_status,
             commands::set_fault_profile,
             commands::run_concurrency_burst,
+            commands::scan_project_routes,
+            commands::pick_project_root,
         ])
         .run(tauri::generate_context!());
 

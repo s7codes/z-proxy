@@ -195,6 +195,70 @@ pub struct BurstReport {
     pub samples: Vec<WorkerSample>,
 }
 
+// ---- route scanner --------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum RouteMethod {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+    Head,
+    Options,
+    /// Declared without a method constraint (`app.all`, net/http without a method prefix,
+    /// a Pages API handler with no `req.method` checks).
+    Any,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RouteSource {
+    NextAppRouter,
+    NextPagesApi,
+    Express,
+    Fastify,
+    Hono,
+    Axum,
+    Go,
+    OpenApi,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredRoute {
+    pub method: RouteMethod,
+    /// Normalized template: parameters as `{name}`, catch-alls as `{*name}`.
+    pub path: String,
+    pub params: Vec<String>,
+    pub source: RouteSource,
+    /// Relative to the scan root, `/`-separated on every platform.
+    pub file: String,
+    pub line: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanIssue {
+    pub file: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteScanReport {
+    pub id: Uuid,
+    pub root: String,
+    pub files_visited: u32,
+    pub files_parsed: u32,
+    pub elapsed_us: u64,
+    /// File or route cap reached; the route list is a prefix of the full result.
+    pub truncated: bool,
+    pub routes: Vec<DiscoveredRoute>,
+    pub issues: Vec<ScanIssue>,
+}
+
 // ---- telemetry ------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
@@ -273,5 +337,15 @@ pub enum TelemetryEvent {
         dispatch_spread_us: Option<u64>,
         anomalies: u32,
         errors: u32,
+    },
+    RouteScanCompleted {
+        seq: u64,
+        id: Uuid,
+        ts_us: u64,
+        root: String,
+        routes: u32,
+        files_visited: u32,
+        elapsed_us: u64,
+        truncated: bool,
     },
 }

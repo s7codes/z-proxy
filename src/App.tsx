@@ -1,12 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PanelImperativeHandle } from "react-resizable-panels";
 import {
   Crosshair,
+  FolderOpen,
   PanelBottom,
   PanelLeft,
   PanelRight,
   Pause,
   Power,
+  RefreshCw,
   RotateCcw,
   Square,
   Trash2,
@@ -23,8 +25,10 @@ import { useBurst } from "./hooks/useBurst";
 import { useEngineStatus } from "./hooks/useEngineStatus";
 import { useGuardValidator } from "./hooks/useGuardValidator";
 import { sameProfile, useProxy } from "./hooks/useProxy";
+import { useRouteScan } from "./hooks/useRouteScan";
 import { useTelemetry } from "./hooks/useTelemetry";
-import type { FaultProfile } from "./lib/types";
+import { toBurstMethod, type RequestTarget } from "./lib/routes";
+import type { DiscoveredRoute, FaultProfile } from "./lib/types";
 
 // Slider drags emit a value per pixel; one IPC round trip per settled position is enough.
 const PROFILE_PUSH_MS = 150;
@@ -39,8 +43,16 @@ export function App() {
   const guard = useGuardValidator(targetInput);
   const proxy = useProxy(telemetry.latestProxyState);
   const burst = useBurst();
+  const routeScan = useRouteScan();
+  const [selectedRoute, setSelectedRoute] = useState<DiscoveredRoute | null>(null);
+  const [requestTarget, setRequestTarget] = useState<RequestTarget>({ method: "POST", path: "/" });
 
   const { status: proxyStatus, applyFaults, stop: stopProxy } = proxy;
+
+  const selectRoute = useCallback((route: DiscoveredRoute) => {
+    setSelectedRoute(route);
+    setRequestTarget((current) => ({ method: toBurstMethod(route.method) ?? current.method, path: route.path }));
+  }, []);
 
   // Adopt the engine profile once so a webview reload does not replace an armed profile
   // with the frontend defaults.
@@ -74,6 +86,7 @@ export function App() {
   }, []);
 
   const { setPaused, paused, clear } = telemetry;
+  const { scan: scanRoutes, browse: browseRoot, root: scanRoot } = routeScan;
   const commands = useMemo<PaletteCommand[]>(() => {
     const toggle = (ref: React.RefObject<PanelImperativeHandle | null>) => () => {
       const panel = ref.current;
@@ -92,6 +105,19 @@ export function App() {
           requestAnimationFrame(() => targetRef.current?.select());
         },
       },
+      {
+        id: "browse-root",
+        group: "Routes",
+        label: "Browse project root",
+        icon: FolderOpen,
+        run: () => {
+          inspectorRef.current?.expand();
+          browseRoot();
+        },
+      },
+      ...(scanRoot.trim() === ""
+        ? []
+        : [{ id: "scan-routes", group: "Routes", label: "Rescan project routes", icon: RefreshCw, run: () => scanRoutes() }]),
       { id: "pause", group: "Telemetry", label: paused ? "Resume stream" : "Pause stream", icon: Pause, run: () => setPaused(!paused) },
       { id: "clear", group: "Telemetry", label: "Clear buffer", icon: Trash2, run: clear },
       { id: "reset-fault", group: "Fault Injection", label: "Reset fault profile", icon: RotateCcw, run: () => setFaultProfile(DEFAULT_FAULT_PROFILE) },
@@ -113,7 +139,7 @@ export function App() {
       { id: "toggle-chaos", group: "Layout", label: "Toggle chaos panel", icon: PanelRight, run: toggle(chaosRef) },
       { id: "toggle-telemetry", group: "Layout", label: "Toggle telemetry panel", icon: PanelBottom, run: toggle(telemetryRef) },
     ];
-  }, [paused, setPaused, clear, proxyStatus, applyFaults, stopProxy, faultProfile]);
+  }, [paused, setPaused, clear, proxyStatus, applyFaults, stopProxy, faultProfile, scanRoot, scanRoutes, browseRoot]);
 
   return (
     <div className="flex h-full flex-col bg-bg text-fg">
@@ -138,11 +164,29 @@ export function App() {
       <Workspace
         panelRefs={{ inspector: inspectorRef, chaos: chaosRef, telemetry: telemetryRef }}
         inspector={
-          <TargetInspector input={targetInput} onInput={setTargetInput} guard={guard} link={link} inputRef={targetRef} />
+          <TargetInspector
+            input={targetInput}
+            onInput={setTargetInput}
+            guard={guard}
+            link={link}
+            inputRef={targetRef}
+            scan={routeScan}
+            selectedRoute={selectedRoute}
+            onSelectRoute={selectRoute}
+          />
         }
-        topology={<TopologyCanvas link={link} guard={guard} proxy={proxyStatus} />}
+        topology={<TopologyCanvas link={link} guard={guard} proxy={proxyStatus} route={selectedRoute} />}
         chaos={
-          <ChaosControls profile={faultProfile} onChange={setFaultProfile} link={link} guard={guard} proxy={proxy} burst={burst} />
+          <ChaosControls
+            profile={faultProfile}
+            onChange={setFaultProfile}
+            link={link}
+            guard={guard}
+            proxy={proxy}
+            burst={burst}
+            target={requestTarget}
+            onTarget={setRequestTarget}
+          />
         }
         telemetry={<TelemetryTable store={telemetry} />}
       />

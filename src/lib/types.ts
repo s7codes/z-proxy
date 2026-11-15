@@ -130,6 +130,47 @@ export interface BurstReport {
   samples: WorkerSample[];
 }
 
+// ---- route scanner --------------------------------------------------------------------
+
+export type RouteMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "ANY";
+
+export type RouteSource =
+  | "nextAppRouter"
+  | "nextPagesApi"
+  | "express"
+  | "fastify"
+  | "hono"
+  | "axum"
+  | "go"
+  | "openApi";
+
+export interface DiscoveredRoute {
+  method: RouteMethod;
+  /** Normalized template: parameters as `{name}`, catch-alls as `{*name}`. */
+  path: string;
+  params: string[];
+  source: RouteSource;
+  /** Relative to the scan root, `/`-separated. */
+  file: string;
+  line: number;
+}
+
+export interface ScanIssue {
+  file: string;
+  reason: string;
+}
+
+export interface RouteScanReport {
+  id: string;
+  root: string;
+  filesVisited: number;
+  filesParsed: number;
+  elapsedUs: number;
+  truncated: boolean;
+  routes: DiscoveredRoute[];
+  issues: ScanIssue[];
+}
+
 // ---- telemetry ------------------------------------------------------------------------
 
 export type TelemetryEvent =
@@ -208,6 +249,17 @@ export type TelemetryEvent =
       dispatchSpreadUs: number | null;
       anomalies: number;
       errors: number;
+    }
+  | {
+      kind: "routeScanCompleted";
+      seq: number;
+      id: string;
+      tsUs: number;
+      root: string;
+      routes: number;
+      filesVisited: number;
+      elapsedUs: number;
+      truncated: boolean;
     };
 
 export type TelemetryKind = TelemetryEvent["kind"];
@@ -226,7 +278,9 @@ export type EngineErrorCode =
   | "LISTENER_BIND_FAILED"
   | "PROXY_LOOP"
   | "INVALID_FAULT_PROFILE"
-  | "INVALID_BURST_SPEC";
+  | "INVALID_BURST_SPEC"
+  | "INVALID_SCAN_ROOT"
+  | "INTERNAL_TASK_FAILED";
 
 export type EngineError =
   | { code: "NON_LOOPBACK_TARGET_REJECTED"; message: string; host: string }
@@ -238,4 +292,6 @@ export type EngineError =
   | { code: "LISTENER_BIND_FAILED"; message: string; addr: string }
   | { code: "PROXY_LOOP"; message: string; addr: string }
   | { code: "INVALID_FAULT_PROFILE"; message: string; field: string }
-  | { code: "INVALID_BURST_SPEC"; message: string; field: string };
+  | { code: "INVALID_BURST_SPEC"; message: string; field: string }
+  | { code: "INVALID_SCAN_ROOT"; message: string; path: string }
+  | { code: "INTERNAL_TASK_FAILED"; message: string };

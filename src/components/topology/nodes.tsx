@@ -41,8 +41,11 @@ export function TopoNodeView({ data, selected }: NodeProps<TopoNode>) {
           ))}
         </dl>
       </div>
-      {data.inbound && <Handle type="target" position={Position.Left} isConnectable={false} />}
-      {data.outbound && <Handle type="source" position={Position.Right} isConnectable={false} />}
+      {/* Both handles always mount: React Flow registers handles when a node is measured, so
+          one added later (the upstream outlet once a route is selected) would leave its edge
+          unrendered. Unused handles are hidden instead. */}
+      <Handle type="target" position={Position.Left} isConnectable={false} className={data.inbound ? "" : "invisible"} />
+      <Handle type="source" position={Position.Right} isConnectable={false} className={data.outbound ? "" : "invisible"} />
     </div>
   );
 }

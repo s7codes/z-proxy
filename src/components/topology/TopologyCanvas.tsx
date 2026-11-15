@@ -10,11 +10,12 @@ import {
   type FitViewOptions,
   type ReactFlowInstance,
 } from "@xyflow/react";
-import { Cpu, MonitorDot, Server, ShieldCheck } from "lucide-react";
+import { Cpu, MonitorDot, Route, Server, ShieldCheck } from "lucide-react";
 import type { EngineLink } from "../../hooks/useEngineStatus";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import { formatLatency } from "../../lib/format";
-import type { ProxyStatus } from "../../lib/types";
+import { fileLabel, SOURCE_LABEL } from "../../lib/routes";
+import type { DiscoveredRoute, ProxyStatus } from "../../lib/types";
 import { guardTone, TONE_HEX, type Tone } from "../../lib/tone";
 import { PanelHeader } from "../shell/PanelHeader";
 import { nodeTypes, type TopoNode, type TopoNodeData } from "./nodes";
@@ -23,17 +24,19 @@ interface TopologyCanvasProps {
   link: EngineLink;
   guard: GuardState;
   proxy: ProxyStatus | null;
+  route: DiscoveredRoute | null;
 }
 
 const FIT_VIEW: FitViewOptions = { padding: 0.25, maxZoom: 1 };
 
-type NodeId = "client" | "engine" | "guard" | "upstream";
+type NodeId = "client" | "engine" | "guard" | "upstream" | "endpoint";
 
 const POSITIONS: Record<NodeId, { x: number; y: number }> = {
   client: { x: 0, y: 40 },
   engine: { x: 260, y: 40 },
   guard: { x: 520, y: 40 },
   upstream: { x: 780, y: 40 },
+  endpoint: { x: 1040, y: 40 },
 };
 
 const INITIAL_NODES: TopoNode[] = (Object.keys(POSITIONS) as NodeId[]).map((id) => ({
@@ -43,7 +46,7 @@ const INITIAL_NODES: TopoNode[] = (Object.keys(POSITIONS) as NodeId[]).map((id) 
   data: placeholderData(id),
 }));
 
-export function TopologyCanvas({ link, guard, proxy }: TopologyCanvasProps) {
+export function TopologyCanvas({ link, guard, proxy, route }: TopologyCanvasProps) {
   const [nodes, , onNodesChange] = useNodesState<TopoNode>(INITIAL_NODES);
   const containerRef = useRef<HTMLDivElement>(null);
   const flowRef = useRef<ReactFlowInstance<TopoNode, Edge> | null>(null);
@@ -69,16 +72,26 @@ export function TopologyCanvas({ link, guard, proxy }: TopologyCanvasProps) {
     };
   }, []);
 
-  const dataById = useMemo(() => buildNodeData(link, guard, proxy), [link, guard, proxy]);
+  // The endpoint node appears and disappears with the route selection; refit so it is not
+  // left outside the viewport.
+  const hasRoute = route !== null;
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      void flowRef.current?.fitView(FIT_VIEW);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [hasRoute]);
+
+  const dataById = useMemo(() => buildNodeData(link, guard, proxy, route), [link, guard, proxy, route]);
   const displayNodes = useMemo(
-    () => nodes.map((n) => ({ ...n, data: dataById[n.id as NodeId] })),
-    [nodes, dataById],
+    () => nodes.map((n) => ({ ...n, hidden: n.id === "endpoint" && !hasRoute, data: dataById[n.id as NodeId] })),
+    [nodes, dataById, hasRoute],
   );
-  const edges = useMemo(() => buildEdges(link, guard, proxy), [link, guard, proxy]);
+  const edges = useMemo(() => buildEdges(link, guard, proxy, route), [link, guard, proxy, route]);
 
   return (
     <div className="flex h-full flex-col">
-      <PanelHeader title="Topology" meta="4 nodes / 3 links" />
+      <PanelHeader title="Topology" meta={`${hasRoute ? 5 : 4} nodes / ${edges.length} links`} />
       <div ref={containerRef} className="relative min-h-0 flex-1">
         <ReactFlow<TopoNode, Edge>
           nodes={displayNodes}
@@ -105,7 +118,12 @@ export function TopologyCanvas({ link, guard, proxy }: TopologyCanvasProps) {
   );
 }
 
-function buildNodeData(link: EngineLink, guard: GuardState, proxy: ProxyStatus | null): Record<NodeId, TopoNodeData> {
+function buildNodeData(
+  link: EngineLink,
+  guard: GuardState,
+  proxy: ProxyStatus | null,
+  route: DiscoveredRoute | null,
+): Record<NodeId, TopoNodeData> {
   const online = link.state === "online";
   const engineTone: Tone = online ? "ok" : link.state === "connecting" ? "muted" : "fault";
   const tone = guardTone(guard);
@@ -149,21 +167,40 @@ function buildNodeData(link: EngineLink, guard: GuardState, proxy: ProxyStatus |
               ? "no target"
               : "unvalidated",
       lines: upstreamLines(guard),
+      outbound: route !== null,
     },
+    endpoint:
+      route === null
+        ? placeholderData("endpoint")
+        : {
+            ...placeholderData("endpoint"),
+            title: route.path,
+            tone: guard.phase === "accepted" ? "ok" : "muted",
+            state: route.method,
+            lines: [
+              ["source", SOURCE_LABEL[route.source]],
+              ["file", fileLabel(route.file, route.line)],
+              ["params", route.params.length === 0 ? "-" : route.params.join(", ")],
+            ],
+          },
   };
 }
 
-function buildEdges(link: EngineLink, guard: GuardState, proxy: ProxyStatus | null): Edge[] {
+function buildEdges(link: EngineLink, guard: GuardState, proxy: ProxyStatus | null, route: DiscoveredRoute | null): Edge[] {
   const online = link.state === "online";
   const proxying = online && proxy?.running === true;
   const tone = guardTone(guard);
   const ipcTone: Tone = online ? "ok" : "muted";
 
-  return [
+  const edges = [
     edge("client", "engine", ipcTone, online ? "invoke / channel" : undefined),
     edge("engine", "guard", ipcTone, proxying ? (proxy?.armed === true ? "proxy + faults" : "proxy") : undefined),
     edge("guard", "upstream", tone, upstreamEdgeLabel(guard), guard.phase === "rejected"),
   ];
+  if (route !== null) {
+    edges.push(edge("upstream", "endpoint", guard.phase === "accepted" ? "ok" : "muted", route.method));
+  }
+  return edges;
 }
 
 function edge(source: NodeId, target: NodeId, tone: Tone, label: string | undefined, dashed = false): Edge {
@@ -273,6 +310,17 @@ function placeholderData(id: NodeId): TopoNodeData {
         icon: Server,
         tone: "muted",
         state: "UNSET",
+        lines: [],
+        inbound: true,
+        outbound: false,
+      };
+    case "endpoint":
+      return {
+        title: "no route",
+        role: "endpoint",
+        icon: Route,
+        tone: "muted",
+        state: "-",
         lines: [],
         inbound: true,
         outbound: false,

@@ -35,6 +35,12 @@ pub enum EngineError {
 
     #[error("invalid burst spec field `{field}`: {reason}")]
     InvalidBurstSpec { field: &'static str, reason: String },
+
+    #[error("cannot scan `{path}`: {reason}")]
+    InvalidScanRoot { path: String, reason: String },
+
+    #[error("engine task failed: {reason}")]
+    InternalTask { reason: String },
 }
 
 impl EngineError {
@@ -50,6 +56,8 @@ impl EngineError {
             Self::ProxyLoop { .. } => "PROXY_LOOP",
             Self::InvalidFaultProfile { .. } => "INVALID_FAULT_PROFILE",
             Self::InvalidBurstSpec { .. } => "INVALID_BURST_SPEC",
+            Self::InvalidScanRoot { .. } => "INVALID_SCAN_ROOT",
+            Self::InternalTask { .. } => "INTERNAL_TASK_FAILED",
         }
     }
 }
@@ -72,7 +80,8 @@ impl Serialize for EngineError {
             Self::InvalidFaultProfile { field, .. } | Self::InvalidBurstSpec { field, .. } => {
                 s.serialize_field("field", field)?
             }
-            Self::ClientBuild(_) => {}
+            Self::InvalidScanRoot { path, .. } => s.serialize_field("path", path)?,
+            Self::ClientBuild(_) | Self::InternalTask { .. } => {}
         }
         s.end()
     }

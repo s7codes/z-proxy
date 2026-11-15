@@ -37,6 +37,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.29", features = ["v4", "serde"] }
 # Same WHATWG parser reqwest uses internally; needed directly for `url::Host` matching.
 url = "2.5"
+regex = "1.13"
+walkdir = "2.5"
+# Event-level parser: OpenAPI routes are reported with the line of their `paths` key, which
+# serde-based YAML crates discard. Encoding detection is not needed for UTF-8 specs.
+yaml-rust2 = { version = "0.13", default-features = false }
+# Invoked from Rust only (pick_project_root); the webview is granted no dialog permission.
+tauri-plugin-dialog = "2.8"
 
 [dev-dependencies]
 tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "net", "macros"] }

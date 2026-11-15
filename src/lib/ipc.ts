@@ -8,6 +8,7 @@ import type {
   FaultProfile,
   ProxyConfig,
   ProxyStatus,
+  RouteScanReport,
   TelemetryEvent,
   ValidatedTarget,
 } from "./types";
@@ -33,6 +34,8 @@ const ENGINE_CODES: ReadonlySet<string> = new Set<EngineErrorCode>([
   "PROXY_LOOP",
   "INVALID_FAULT_PROFILE",
   "INVALID_BURST_SPEC",
+  "INVALID_SCAN_ROOT",
+  "INTERNAL_TASK_FAILED",
 ]);
 
 export function isEngineError(value: unknown): value is EngineError {
@@ -93,6 +96,15 @@ export function setFaultProfile(armed: boolean, profile: FaultProfile): Promise<
 
 export function runConcurrencyBurst(spec: BurstSpec): Promise<IpcResult<BurstReport>> {
   return call<BurstReport>("run_concurrency_burst", { spec });
+}
+
+export function scanProjectRoutes(root: string): Promise<IpcResult<RouteScanReport>> {
+  return call<RouteScanReport>("scan_project_routes", { root });
+}
+
+/** Resolves to `null` when the operator cancels the dialog. */
+export function pickProjectRoot(): Promise<IpcResult<string | null>> {
+  return call<string | null>("pick_project_root");
 }
 
 export interface TelemetrySubscription {

@@ -1,15 +1,17 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useMemo, useState } from "react";
 import { Zap } from "lucide-react";
 import type { BurstControl } from "../../hooks/useBurst";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import { formatBytes, formatLatency, formatPercent } from "../../lib/format";
+import { joinTarget, originOf, parseHeaders } from "../../lib/request";
+import { unresolvedParams, type RequestTarget } from "../../lib/routes";
 import { httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
-import type { Anomaly, AnomalyKind, BurstMethod, BurstReport, HeaderPair } from "../../lib/types";
+import type { Anomaly, AnomalyKind, BurstReport } from "../../lib/types";
 import { Section, StatusSquare } from "../shell/PanelHeader";
 import { ErrorLine } from "./ErrorLine";
+import { Field, MethodPicker, Metric, OriginRow, PathField } from "./RequestFields";
 import { Slider } from "./Slider";
 
-const METHODS: readonly BurstMethod[] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
 const MAX_WORKERS = 100;
 const MAX_LISTED_WORKERS = 16;
 
@@ -24,11 +26,12 @@ interface BurstPanelProps {
   guard: GuardState;
   burst: BurstControl;
   online: boolean;
+  target: RequestTarget;
+  onTarget: (target: RequestTarget) => void;
 }
 
-export function BurstPanel({ guard, burst, online }: BurstPanelProps) {
-  const [method, setMethod] = useState<BurstMethod>("POST");
-  const [path, setPath] = useState("/");
+export function BurstPanel({ guard, burst, online, target: request, onTarget }: BurstPanelProps) {
+  const { method, path } = request;
   const [workers, setWorkers] = useState(20);
   const [timeoutMs, setTimeoutMs] = useState(5_000);
   const [headerText, setHeaderText] = useState("");
@@ -36,8 +39,9 @@ export function BurstPanel({ guard, burst, online }: BurstPanelProps) {
 
   const origin = guard.phase === "accepted" ? originOf(guard.target.normalized) : null;
   const parsed = useMemo(() => parseHeaders(headerText), [headerText]);
-  const target = origin === null ? null : `${origin}${path.startsWith("/") ? path : `/${path}`}`;
-  const canFire = online && target !== null && parsed.error === null && !burst.running;
+  const unresolved = unresolvedParams(path);
+  const target = origin === null ? null : joinTarget(origin, path);
+  const canFire = online && target !== null && parsed.error === null && unresolved.length === 0 && !burst.running;
 
   const fire = () => {
     if (target === null || parsed.error !== null) return;
@@ -53,37 +57,13 @@ export function BurstPanel({ guard, burst, online }: BurstPanelProps) {
 
   return (
     <>
-      <div className="flex h-6 shrink-0 items-center gap-2 border-b border-line px-2.5 text-2xs">
-        <span className="label-caps text-fg-faint">Origin</span>
-        <span className="num truncate text-fg">{origin ?? "no validated target"}</span>
-      </div>
+      <OriginRow origin={origin} />
       {burst.error !== null && <ErrorLine error={burst.error} />}
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         <Section title="Request">
-          <div className="mb-2 grid grid-cols-5 border border-line">
-            {METHODS.map((m) => (
-              <button
-                key={m}
-                type="button"
-                onClick={() => setMethod(m)}
-                aria-pressed={method === m}
-                className={`num h-6 border-r border-line text-2xs last:border-r-0 ${
-                  method === m ? "bg-active text-fg-bright" : "text-fg-dim hover:bg-active hover:text-fg"
-                }`}
-              >
-                {m}
-              </button>
-            ))}
-          </div>
-          <Field label="Path">
-            <input
-              value={path}
-              onChange={(e) => setPath(e.target.value)}
-              spellCheck={false}
-              className="num h-5 w-full min-w-0 rounded-xs border border-line bg-bg px-1.5 text-xs text-fg-bright outline-none focus:border-fg-faint"
-            />
-          </Field>
+          <MethodPicker value={method} onChange={(m) => onTarget({ method: m, path })} />
+          <PathField value={path} onChange={(p) => onTarget({ method, path: p })} unresolved={unresolved} />
           <Field label="Headers" error={parsed.error}>
             <textarea
               value={headerText}
@@ -134,17 +114,6 @@ export function BurstPanel({ guard, burst, online }: BurstPanelProps) {
   );
 }
 
-function Field({ label, error = null, children }: { label: string; error?: string | null; children: ReactNode }) {
-  return (
-    <div className="mb-1.5 grid grid-cols-[52px_1fr] items-start gap-2 last:mb-0">
-      <span className="pt-0.5 text-xs text-fg-dim">{label}</span>
-      <div className="min-w-0">
-        {children}
-        {error !== null && <div className="num pt-0.5 text-2xs text-fault">{error}</div>}
-      </div>
-    </div>
-  );
-}
 
 function ReportView({ report }: { report: BurstReport }) {
   const total = report.samples.length;
@@ -231,32 +200,3 @@ function AnomalyRow({ anomaly }: { anomaly: Anomaly }) {
   );
 }
 
-function Metric({ label, value, tone }: { label: string; value: string; tone?: Tone | undefined }) {
-  return (
-    <div className="flex flex-col bg-bg px-1.5 py-1">
-      <span className="label-caps text-fg-faint">{label}</span>
-      <span className={tone === undefined ? "text-fg-bright" : TONE_TEXT[tone]}>{value}</span>
-    </div>
-  );
-}
-
-function originOf(normalized: string): string | null {
-  try {
-    return new URL(normalized).origin;
-  } catch {
-    return null;
-  }
-}
-
-function parseHeaders(text: string): { headers: HeaderPair[]; error: string | null } {
-  const headers: HeaderPair[] = [];
-  const lines = text.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]?.trim() ?? "";
-    if (line === "") continue;
-    const colon = line.indexOf(":");
-    if (colon <= 0) return { headers, error: `line ${i + 1}: expected "Name: value"` };
-    headers.push({ name: line.slice(0, colon).trim(), value: line.slice(colon + 1).trim() });
-  }
-  return { headers, error: null };
-}

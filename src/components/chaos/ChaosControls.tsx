@@ -4,6 +4,7 @@ import type { BurstControl } from "../../hooks/useBurst";
 import type { EngineLink } from "../../hooks/useEngineStatus";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import type { ProxyControl } from "../../hooks/useProxy";
+import type { RequestTarget } from "../../lib/routes";
 import type { FaultProfile, StatusMutation } from "../../lib/types";
 import { PanelHeader, Section, StatusSquare, ToolButton } from "../shell/PanelHeader";
 import { BurstPanel } from "./BurstPanel";
@@ -30,9 +31,11 @@ interface ChaosControlsProps {
   guard: GuardState;
   proxy: ProxyControl;
   burst: BurstControl;
+  target: RequestTarget;
+  onTarget: (target: RequestTarget) => void;
 }
 
-export function ChaosControls({ profile, onChange, link, guard, proxy, burst }: ChaosControlsProps) {
+export function ChaosControls({ profile, onChange, link, guard, proxy, burst, target, onTarget }: ChaosControlsProps) {
   const [tab, setTab] = useState<ChaosTab>("faults");
 
   return (
@@ -44,7 +47,7 @@ export function ChaosControls({ profile, onChange, link, guard, proxy, burst }: 
       {tab === "faults" ? (
         <FaultsTab profile={profile} onChange={onChange} link={link} guard={guard} proxy={proxy} />
       ) : (
-        <BurstPanel guard={guard} burst={burst} online={link.state === "online"} />
+        <BurstPanel guard={guard} burst={burst} online={link.state === "online"} target={target} onTarget={onTarget} />
       )}
     </div>
   );

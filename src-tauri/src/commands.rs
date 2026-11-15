@@ -1,5 +1,6 @@
 use tauri::ipc::Channel;
-use tauri::{State, Webview};
+use tauri::{State, Webview, WebviewWindow};
+use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 use crate::engine::concurrency;
@@ -8,9 +9,10 @@ use crate::engine::fault::FaultProfile;
 use crate::engine::guard;
 use crate::engine::net;
 use crate::engine::types::{
-    BurstReport, BurstSpec, EngineStatus, ProbeResult, ProxyConfig, ProxyStatus, TelemetryEvent,
-    ValidatedTarget, Verdict,
+    BurstReport, BurstSpec, EngineStatus, ProbeResult, ProxyConfig, ProxyStatus, RouteScanReport,
+    TelemetryEvent, ValidatedTarget, Verdict,
 };
+use crate::scanner::routes;
 use crate::state::AppState;
 use crate::telemetry::{now_us, uptime_ms};
 
@@ -130,6 +132,62 @@ pub async fn run_concurrency_burst(
     spec: BurstSpec,
 ) -> Result<BurstReport, EngineError> {
     concurrency::run(spec, &state.hub).await
+}
+
+#[tauri::command]
+pub async fn scan_project_routes(
+    state: State<'_, AppState>,
+    root: String,
+) -> Result<RouteScanReport, EngineError> {
+    // Directory walking and file reads are blocking I/O; keep them off the async workers
+    // that drive the proxy and telemetry fan-out.
+    let report = tokio::task::spawn_blocking(move || routes::scan(&root))
+        .await
+        .map_err(|err| EngineError::InternalTask {
+            reason: format!("route scan aborted: {err}"),
+        })??;
+
+    let hub = &state.hub;
+    hub.publish(TelemetryEvent::RouteScanCompleted {
+        seq: hub.next_seq(),
+        id: report.id,
+        ts_us: now_us(),
+        root: report.root.clone(),
+        routes: u32::try_from(report.routes.len()).unwrap_or(u32::MAX),
+        files_visited: report.files_visited,
+        elapsed_us: report.elapsed_us,
+        truncated: report.truncated,
+    });
+    tracing::info!(
+        root = %report.root,
+        routes = report.routes.len(),
+        files = report.files_visited,
+        elapsed_us = report.elapsed_us,
+        "route scan completed"
+    );
+    Ok(report)
+}
+
+/// Native folder picker. Opened from Rust so the webview needs no `dialog:*` capability;
+/// cancelling resolves to `None`.
+#[tauri::command]
+pub async fn pick_project_root(window: WebviewWindow) -> Result<Option<String>, EngineError> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    window
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("Select project root")
+        .pick_folder(move |picked| {
+            // The receiver is only gone if the command future was dropped; nothing to report.
+            let _ = tx.send(picked);
+        });
+    let picked = rx.await.map_err(|_| EngineError::InternalTask {
+        reason: "folder dialog closed without a result".to_owned(),
+    })?;
+    Ok(picked
+        .and_then(|path| path.into_path().ok())
+        .map(|path| routes::display_path(&path)))
 }
 
 #[tauri::command]

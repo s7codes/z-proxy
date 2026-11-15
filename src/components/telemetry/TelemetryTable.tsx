@@ -241,6 +241,19 @@ function toRow(event: TelemetryEvent): Row {
         latency: formatLatency(event.wallUs),
         detail: `spread ${event.dispatchSpreadUs === null ? "-" : formatLatency(event.dispatchSpreadUs)}  errors ${event.errors}`,
       };
+    case "routeScanCompleted":
+      return {
+        ...base,
+        kind: "SCAN",
+        kindTone: "muted",
+        target: event.root,
+        result: `${event.routes} ROUTES`,
+        resultTone: event.truncated ? "warn" : event.routes > 0 ? "ok" : "muted",
+        latency: formatLatency(event.elapsedUs),
+        detail: [`${event.filesVisited} files`, event.truncated ? "truncated at cap" : null]
+          .filter((part) => part !== null)
+          .join("  "),
+      };
   }
 }
 
