@@ -475,12 +475,14 @@ async fn proxy_handler(
         violations: Vec::new(),
         findings: Vec::new(),
     };
-    let upstream_path = upstream_url(&ctx.upstream.url, &record.path)
-        .path()
-        .to_owned();
-    let (plan, rule) = ctx.plan(&record.method, &upstream_path);
-    record.rule = rule;
-    let contract = ctx.contract(&record.method, &upstream_path);
+    // Rules and contracts address the path the service receives; both are resolved here,
+    // before any await, from one joined URL.
+    let (plan, contract) = {
+        let upstream = upstream_url(&ctx.upstream.url, &record.path);
+        let (plan, rule) = ctx.plan(&record.method, upstream.path());
+        record.rule = rule;
+        (plan, ctx.contract(&record.method, upstream.path()))
+    };
 
     let (parts, body) = request.into_parts();
     let credentialed = parts.headers.contains_key(header::AUTHORIZATION)
