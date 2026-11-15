@@ -657,9 +657,13 @@ mod tests {
                 "GET /api/v1/health",
                 "POST /api/v1/coupons/redeem",
                 "POST /api/v1/orders/checkout",
+                "GET /api/v1/orders/{orderId}",
                 "GET /api/v1/lab/openapi.json",
             ]
         );
+        let lookup = &report.routes[3];
+        assert_eq!(lookup.params, ["orderId"]);
+        assert_eq!(lookup.sample_body, None);
         let body = |path: &str| -> serde_json::Value {
             let route = report.routes.iter().find(|r| r.path == path).unwrap();
             serde_json::from_str(route.sample_body.as_deref().unwrap()).unwrap()

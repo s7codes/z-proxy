@@ -1,23 +1,27 @@
 //! Embedded target lab: a deliberately flawed loopback microservice.
 //!
 //! Gives the burst runner, fuzzer and proxy a known target whose defects switch at runtime.
-//! `Unprotected` mode redeems a single-use coupon with a check-then-act race and lets
-//! unvalidated checkout input crash into handlers that leak stack traces and database
-//! errors. `Hardened` mode reserves the coupon with one conditional update and rejects every
-//! invalid checkout with a 422 JSON body. The listener binds 127.0.0.1 only.
+//! `Unprotected` mode redeems a single-use coupon with a check-then-act race, lets
+//! unvalidated checkout input and order identifiers crash into handlers that leak stack
+//! traces and database errors, and accepts JSON that violates the documented contract.
+//! `Hardened` mode reserves the coupon with one conditional update and rejects every invalid
+//! body or path parameter with a 422 JSON body. The listener binds 127.0.0.1 only.
 
+use std::collections::{HashSet, VecDeque};
+use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{json, Map, Value};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
@@ -47,6 +51,20 @@ const MAX_LOOKUP_DEPTH: u32 = 64;
 /// that Windows' default 15.6 ms timer resolution cannot close the race window.
 const COMMIT_WINDOW: Duration = Duration::from_millis(60);
 const HARDENED_MAX_BODY: usize = 32 * 1024;
+/// The checkout schema nests two levels (root, customer); anything far deeper is not a
+/// payload the contract describes and is refused before field validation walks it.
+const HARDENED_MAX_DEPTH: usize = 8;
+/// Documented `maximum` of the `orderId` path parameter.
+const ORDER_ID_MAX: u64 = 999_999;
+/// Confirmed orders kept for lookup; the oldest is evicted first.
+const ORDER_RETENTION: usize = 1_024;
+/// Seeded history, so `GET /api/v1/orders/1` resolves on a fresh lab and a fuzz baseline
+/// with the default identifier is accepted.
+const ORDER_HISTORY: [(u64, &str, i64); 3] = [
+    (1, "LAB-KB-01", 2),
+    (2, "LAB-MS-02", 1),
+    (3, "LAB-HUB-03", 4),
+];
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const SKU_MAX: usize = 64;
 const EMAIL_MAX: usize = 254;
@@ -87,6 +105,28 @@ struct Ledger {
     redeemed: u32,
     granted: u32,
     orders: u32,
+    created: VecDeque<StoredOrder>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct StoredOrder {
+    id: u64,
+    sku: String,
+    quantity: i64,
+    total_cents: i64,
+}
+
+impl StoredOrder {
+    fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "orderId": format!("ord-{:06}", self.id),
+            "status": "confirmed",
+            "sku": self.sku,
+            "quantity": self.quantity,
+            "totalCents": self.total_cents,
+        })
+    }
 }
 
 impl Shared {
@@ -116,6 +156,22 @@ impl Shared {
         *self.ledger() = Ledger::default();
         self.requests.store(0, Ordering::SeqCst);
     }
+
+    fn find_order(&self, id: u64) -> Option<StoredOrder> {
+        if let Some((_, sku, quantity)) = ORDER_HISTORY.iter().find(|(known, ..)| *known == id) {
+            return Some(StoredOrder {
+                id,
+                sku: (*sku).to_owned(),
+                quantity: *quantity,
+                total_cents: price(sku).unwrap_or(0) * quantity,
+            });
+        }
+        self.ledger()
+            .created
+            .iter()
+            .find(|order| order.id == id)
+            .cloned()
+    }
 }
 
 impl LabServer {
@@ -127,7 +183,7 @@ impl LabServer {
                 ledger: Mutex::new(Ledger::default()),
                 redeem_depth: AtomicU32::new(0),
                 requests: AtomicU64::new(0),
-                next_order: AtomicU64::new(1),
+                next_order: AtomicU64::new(ORDER_HISTORY.len() as u64 + 1),
             }),
             running: AsyncMutex::new(None),
         }
@@ -285,6 +341,10 @@ fn router(shared: Arc<Shared>, base_url: String) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/coupons/redeem", post(redeem))
         .route("/api/v1/orders/checkout", post(checkout))
+        .route("/api/v1/orders/{order_id}", get(order_lookup))
+        // An empty identifier leaves a trailing slash; routed explicitly so the handler, not
+        // the 404 fallback, decides how the empty parameter is treated.
+        .route("/api/v1/orders/", get(empty_order_lookup))
         .route(
             SPEC_PATH,
             get(move || {
@@ -352,7 +412,12 @@ async fn index(State(shared): State<Arc<Shared>>) -> Response {
             "service": "z-proxy-target-lab",
             "mode": shared.mode(),
             "spec": SPEC_PATH,
-            "endpoints": ["GET /api/v1/health", "POST /api/v1/coupons/redeem", "POST /api/v1/orders/checkout"]
+            "endpoints": [
+                "GET /api/v1/health",
+                "POST /api/v1/coupons/redeem",
+                "POST /api/v1/orders/checkout",
+                "GET /api/v1/orders/{orderId}"
+            ]
         }),
         "index",
     )
@@ -521,19 +586,22 @@ async fn checkout(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
             quantity,
             total_cents,
         } => {
-            let order = shared.next_order.fetch_add(1, Ordering::SeqCst);
-            shared.ledger().orders += 1;
-            json_reply(
-                StatusCode::CREATED,
-                &json!({
-                    "orderId": format!("ord-{order:06}"),
-                    "status": "confirmed",
-                    "sku": sku,
-                    "quantity": quantity,
-                    "totalCents": total_cents,
-                }),
-                "order confirmed",
-            )
+            let order = StoredOrder {
+                id: shared.next_order.fetch_add(1, Ordering::SeqCst),
+                sku,
+                quantity,
+                total_cents,
+            };
+            let body = order.to_json();
+            {
+                let mut ledger = shared.ledger();
+                ledger.orders += 1;
+                if ledger.created.len() == ORDER_RETENTION {
+                    ledger.created.pop_front();
+                }
+                ledger.created.push_back(order);
+            }
+            json_reply(StatusCode::CREATED, &body, "order confirmed")
         }
         Checkout::Invalid(violations) => json_reply(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -573,9 +641,11 @@ fn price(sku: &str) -> Option<i64> {
 /// class surfaces through a different service of the simulated stack so every disclosure
 /// signature the fuzzer knows has a reproducible trigger.
 fn unprotected_checkout(body: &[u8]) -> Checkout {
+    // `Value` keeps the last of duplicated keys, the same as `JSON.parse`, so a duplicate
+    // reaches the handlers below with whatever value came last.
     let value = match serde_json::from_slice::<Value>(body) {
         Ok(value) => value,
-        Err(err) => return Checkout::Leak(body_parser_trace(&err)),
+        Err(err) => return unprotected_parse_failure(&err),
     };
     let sku = match value.get("sku") {
         None => return node_null("undefined", "trim", "normalizeSku", 42),
@@ -673,10 +743,24 @@ fn hardened_checkout(body: &[u8]) -> Checkout {
             &format!("payload exceeds {HARDENED_MAX_BODY} bytes"),
         )]);
     }
+    // Out-of-range numbers (`1e309`) and nesting beyond serde_json's recursion limit fail
+    // here and are answered as malformed, never coerced.
     let value = match serde_json::from_slice::<Value>(body) {
         Ok(value) => value,
         Err(err) => return Checkout::Malformed(err.to_string()),
     };
+    let depth = json_depth(&value);
+    if depth > HARDENED_MAX_DEPTH {
+        return Checkout::Invalid(vec![violation(
+            "",
+            &format!("nesting depth {depth} exceeds {HARDENED_MAX_DEPTH}"),
+        )]);
+    }
+    match duplicate_key(body) {
+        Ok(Some(pointer)) => return Checkout::Invalid(vec![violation(&pointer, "duplicate key")]),
+        Ok(None) => {}
+        Err(err) => return Checkout::Malformed(err.to_string()),
+    }
     let Some(object) = value.as_object() else {
         return Checkout::Invalid(vec![violation("", "must be a JSON object")]);
     };
@@ -800,6 +884,192 @@ fn js_string(value: &Value) -> String {
         Value::String(text) => text.clone(),
         Value::Array(items) => items.iter().map(js_string).collect::<Vec<_>>().join(","),
         Value::Object(_) => "[object Object]".to_owned(),
+    }
+}
+
+/// Levels of nested arrays and objects; a scalar root is 0. Bounded by serde_json's
+/// recursion limit, since only parsed values reach it.
+fn json_depth(value: &Value) -> usize {
+    match value {
+        Value::Array(items) => 1 + items.iter().map(json_depth).max().unwrap_or(0),
+        Value::Object(fields) => 1 + fields.values().map(json_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// RFC 6901 pointer of the first object key that occurs twice in one object.
+///
+/// `serde_json::Value` silently keeps the last occurrence, as most parsers do. A validator
+/// that reads the first occurrence and a handler that reads the last then disagree about the
+/// same document, so a strict contract refuses duplicates instead of picking one.
+fn duplicate_key(body: &[u8]) -> Result<Option<String>, serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let found = DuplicateProbe(String::new()).deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(found)
+}
+
+/// Seed carrying the pointer of the value it visits.
+struct DuplicateProbe(String);
+
+impl<'de> DeserializeSeed<'de> for DuplicateProbe {
+    type Value = Option<String>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for DuplicateProbe {
+    type Value = Option<String>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut found = None;
+        let mut index = 0usize;
+        while let Some(child) =
+            seq.next_element_seed(DuplicateProbe(format!("{}/{index}", self.0)))?
+        {
+            found = found.or(child);
+            index += 1;
+        }
+        Ok(found)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut found = None;
+        let mut seen = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let pointer = format!("{}/{}", self.0, key.replace('~', "~0").replace('/', "~1"));
+            let child = map.next_value_seed(DuplicateProbe(pointer.clone()))?;
+            if !seen.insert(key) {
+                found = found.or(Some(pointer));
+            }
+            found = found.or(child);
+        }
+        Ok(found)
+    }
+}
+
+// ---- order lookup ---------------------------------------------------------------------
+
+#[derive(Debug, PartialEq)]
+enum Lookup {
+    Found(StoredOrder),
+    NotFound,
+    /// Hardened: 422 for an identifier outside the documented contract.
+    Invalid,
+    Leak(Leak),
+}
+
+async fn order_lookup(State(shared): State<Arc<Shared>>, Path(order_id): Path<String>) -> Response {
+    lookup_response(&shared, &order_id)
+}
+
+async fn empty_order_lookup(State(shared): State<Arc<Shared>>) -> Response {
+    lookup_response(&shared, "")
+}
+
+fn lookup_response(shared: &Shared, order_id: &str) -> Response {
+    match evaluate_lookup(shared.mode(), order_id, |id| shared.find_order(id)) {
+        Lookup::Found(order) => json_reply(StatusCode::OK, &order.to_json(), "order found"),
+        Lookup::NotFound => json_reply(
+            StatusCode::NOT_FOUND,
+            &json!({ "error": "order_not_found" }),
+            "no such order",
+        ),
+        Lookup::Invalid => json_reply(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &json!({
+                "error": "invalid_path_parameter",
+                "parameter": "orderId",
+                "reason": format!("integer between 1 and {ORDER_ID_MAX}"),
+            }),
+            "rejected: invalid order id",
+        ),
+        Lookup::Leak(leak) => reply(leak.status, leak.content_type, leak.body, leak.outcome),
+    }
+}
+
+fn evaluate_lookup(mode: LabMode, raw: &str, find: impl Fn(u64) -> Option<StoredOrder>) -> Lookup {
+    match mode {
+        LabMode::Unprotected => unprotected_lookup(raw, find),
+        LabMode::Hardened => hardened_lookup(raw, find),
+    }
+}
+
+/// `Number(req.params.orderId)` and an array index, as an unvalidated gateway would: an
+/// empty segment is 0, text is `NaN`, digits beyond `f64` range are `Infinity`, and the raw
+/// segment is what the database driver finally receives.
+fn unprotected_lookup(raw: &str, find: impl Fn(u64) -> Option<StoredOrder>) -> Lookup {
+    let trimmed = raw.trim();
+    let number = if trimmed.is_empty() {
+        0.0
+    } else {
+        trimmed.parse::<f64>().unwrap_or(f64::NAN)
+    };
+    if number.is_nan() {
+        return Lookup::Leak(postgres_lookup_input(raw));
+    }
+    if number.is_infinite() {
+        return Lookup::Leak(python_numeric_overflow(raw));
+    }
+    if number >= 9_223_372_036_854_775_807.0 {
+        return Lookup::Leak(postgres_out_of_range(raw));
+    }
+    if number < 1.0 || number.fract() != 0.0 {
+        return Lookup::Leak(node_lookup_undefined());
+    }
+    // `number` is a positive integer below 2^63 here, so the conversion is exact up to 2^53
+    // and saturates above it, where no stored order exists anyway.
+    match find(number as u64) {
+        Some(order) => Lookup::Found(order),
+        None => Lookup::NotFound,
+    }
+}
+
+fn hardened_lookup(raw: &str, find: impl Fn(u64) -> Option<StoredOrder>) -> Lookup {
+    let canonical = (1..=6).contains(&raw.len())
+        && !raw.starts_with('0')
+        && raw.bytes().all(|b| b.is_ascii_digit());
+    let id = if canonical {
+        raw.parse::<u64>().ok()
+    } else {
+        None
+    };
+    match id.filter(|id| (1..=ORDER_ID_MAX).contains(id)) {
+        Some(id) => find(id).map_or(Lookup::NotFound, Lookup::Found),
+        None => Lookup::Invalid,
     }
 }
 
@@ -930,6 +1200,94 @@ fn postgres_invalid_input(text: &str) -> Checkout {
     )
 }
 
+/// Unprotected parse failures, by cause. serde_json reports both refusals below as syntax
+/// errors; the message is the only distinguishing field it exposes.
+fn unprotected_parse_failure(err: &serde_json::Error) -> Checkout {
+    let message = err.to_string();
+    if message.starts_with("recursion limit exceeded") {
+        return node_recursion_overflow();
+    }
+    if message.starts_with("number out of range") {
+        return rust_decode_panic(&message);
+    }
+    Checkout::Leak(body_parser_trace(err))
+}
+
+/// A recursive input sanitizer walking a deeply nested body until V8's stack runs out.
+fn node_recursion_overflow() -> Checkout {
+    leak(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "text/plain; charset=utf-8",
+        "RangeError: Maximum call stack size exceeded\n    at stripKeys (/srv/lab/gateway/src/middleware/sanitize.js:14:23)\n    at stripKeys (/srv/lab/gateway/src/middleware/sanitize.js:18:16)\n    at stripKeys (/srv/lab/gateway/src/middleware/sanitize.js:18:16)\n    at sanitizeBody (/srv/lab/gateway/src/middleware/sanitize.js:31:10)".to_owned(),
+        "crash: node stack overflow",
+    )
+}
+
+/// The pricing service decoding the forwarded body with `unwrap()`.
+fn rust_decode_panic(message: &str) -> Checkout {
+    leak(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "text/plain; charset=utf-8",
+        format!(
+            "thread 'tokio-runtime-worker' panicked at src/pricing/decode.rs:31:52:\ncalled `Result::unwrap()` on an `Err` value: Error(\"{message}\")\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+        ),
+        "crash: rust panic",
+    )
+}
+
+fn node_lookup_undefined() -> Leak {
+    Leak {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        content_type: "text/plain; charset=utf-8",
+        body: "TypeError: Cannot read properties of undefined (reading 'status')\n    at serializeOrder (/srv/lab/gateway/src/orders/lookup.js:23:31)\n    at loadOrder (/srv/lab/gateway/src/orders/lookup.js:12:10)\n    at Layer.handle [as handle_request] (/srv/lab/gateway/node_modules/express/lib/router/layer.js:95:5)".to_owned(),
+        outcome: "crash: node TypeError",
+    }
+}
+
+fn postgres_lookup_input(raw: &str) -> Leak {
+    let shown: String = raw.chars().take(80).collect();
+    Leak {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        content_type: "application/json",
+        body: json!({
+            "error": "database_error",
+            "detail": format!("ERROR:  invalid input syntax for type bigint: \"{shown}\""),
+            "query": "SELECT * FROM orders WHERE id = $1",
+        })
+        .to_string(),
+        outcome: "crash: sql type error",
+    }
+}
+
+fn postgres_out_of_range(raw: &str) -> Leak {
+    let shown: String = raw.chars().take(80).collect();
+    Leak {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        content_type: "application/json",
+        body: json!({
+            "name": "error",
+            "severity": "ERROR",
+            "code": "22003",
+            "message": format!("value \"{shown}\" is out of range for type bigint"),
+            "routine": "pg_strtoint64_safe",
+        })
+        .to_string(),
+        outcome: "crash: sql range error",
+    }
+}
+
+fn python_numeric_overflow(raw: &str) -> Leak {
+    Leak {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        content_type: "text/plain; charset=utf-8",
+        body: format!(
+            "Traceback (most recent call last):\n  File \"/srv/lab/inventory/app/orders.py\", line 88, in fetch_order\n    cursor.execute(SELECT_ORDER, (order_id,))\npsycopg2.errors.NumericValueOutOfRange: value overflows numeric format\nDETAIL:  input has {} digits",
+            raw.len()
+        ),
+        outcome: "crash: python traceback",
+    }
+}
+
 // ---- OpenAPI document -----------------------------------------------------------------
 
 /// The lab's own OpenAPI 3.1 description, pretty-printed so route lines are meaningful.
@@ -975,6 +1333,22 @@ pub fn openapi_document(base_url: Option<&str>) -> String {
                         "201": response("Order confirmed"),
                         "422": response("Validation failed"),
                         "500": response("Unhandled failure")
+                    }
+                }
+            },
+            "/api/v1/orders/{orderId}": {
+                "get": {
+                    "summary": "Look up a confirmed order",
+                    "parameters": [{
+                        "name": "orderId",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "integer", "minimum": 1, "maximum": ORDER_ID_MAX, "example": 1 }
+                    }],
+                    "responses": {
+                        "200": response("Order"),
+                        "404": response("Unknown order"),
+                        "422": response("Identifier outside the documented range")
                     }
                 }
             },
@@ -1063,6 +1437,19 @@ mod tests {
         edited(field, |object, key| {
             object.shift_remove(key);
         })
+    }
+
+    /// The checkout sample plus a `deep` field nested `levels` objects down.
+    fn nested(levels: usize) -> Vec<u8> {
+        let chain = format!("{}1{}", r#"{"d":"#.repeat(levels), "}".repeat(levels));
+        let open = CHECKOUT_SAMPLE.strip_suffix('}').unwrap();
+        format!(r#"{open},"deep":{chain}}}"#).into_bytes()
+    }
+
+    /// The checkout sample with `"key":value` appended after the original fields.
+    fn duplicated(entry: &str) -> Vec<u8> {
+        let open = CHECKOUT_SAMPLE.strip_suffix('}').unwrap();
+        format!("{open},{entry}}}").into_bytes()
     }
 
     fn leaked(body: &[u8]) -> (StatusCode, Option<DisclosureKind>) {
@@ -1156,6 +1543,15 @@ mod tests {
                 node,
             ),
             ("empty body", Vec::new(), StatusCode::BAD_REQUEST, node),
+            ("200-level nesting", nested(200), server_error, node),
+            (
+                "1e309 quantity",
+                CHECKOUT_SAMPLE
+                    .replace(r#""quantity":2"#, r#""quantity":1e309"#)
+                    .into_bytes(),
+                server_error,
+                Some(DisclosureKind::RustPanic),
+            ),
         ];
         for (label, body, status, kind) in cases {
             assert_eq!(leaked(&body), (status, kind), "{label}");
@@ -1183,6 +1579,9 @@ mod tests {
             with("giftWrap", json!("yes")),
             omit("note"),
             with("zproxyPad", json!("x".repeat(70_000))),
+            duplicated(r#""giftWrap":true"#),
+            duplicated(r#""note":"""#),
+            nested(64),
         ] {
             assert!(
                 matches!(unprotected_checkout(&body), Checkout::Created { .. }),
@@ -1232,6 +1631,9 @@ mod tests {
             with("zproxyPad", json!("x")),
             with("sku", json!("A".repeat(40_000))),
             b"[]".to_vec(),
+            duplicated(r#""giftWrap":true"#),
+            duplicated(r#""note":"""#),
+            nested(12),
         ];
         for body in &invalid {
             match hardened_checkout(body) {
@@ -1246,8 +1648,25 @@ mod tests {
                 ),
             }
         }
-        match hardened_checkout(b"{\"sku\":") {
-            Checkout::Malformed(detail) => assert_eq!(disclosure::detect(&detail), None),
+        let overflow = CHECKOUT_SAMPLE
+            .replace(r#""quantity":2"#, r#""quantity":1e309"#)
+            .into_bytes();
+        for body in [b"{\"sku\":".to_vec(), overflow, nested(200)] {
+            match hardened_checkout(&body) {
+                Checkout::Malformed(detail) => assert_eq!(disclosure::detect(&detail), None),
+                other => panic!("{other:?}"),
+            }
+        }
+        match hardened_checkout(&duplicated(r#""note":"""#)) {
+            Checkout::Invalid(violations) => {
+                assert_eq!(violations, [violation("/note", "duplicate key")]);
+            }
+            other => panic!("{other:?}"),
+        }
+        match hardened_checkout(&nested(12)) {
+            Checkout::Invalid(violations) => {
+                assert_eq!(violations, [violation("", "nesting depth 13 exceeds 8")]);
+            }
             other => panic!("{other:?}"),
         }
         match hardened_checkout(&with("customer.role", json!("admin"))) {
@@ -1255,6 +1674,93 @@ mod tests {
                 assert_eq!(violations[0]["pointer"], "/customer/role");
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_keys_are_located_by_pointer() {
+        let probe = |text: &str| duplicate_key(text.as_bytes()).unwrap();
+        assert_eq!(probe(r#"{"a":1,"b":{"c":[1,{"d":2}]}}"#), None);
+        assert_eq!(probe(r#"{"a":1,"a":2}"#).as_deref(), Some("/a"));
+        assert_eq!(probe(r#"{"a":{"b":1,"b":2}}"#).as_deref(), Some("/a/b"));
+        assert_eq!(probe(r#"[{"x":1},{"x":1,"x":2}]"#).as_deref(), Some("/1/x"));
+        assert_eq!(probe(r#"{"a/b":1,"a/b":2}"#).as_deref(), Some("/a~1b"));
+        // First in document order wins when several objects repeat keys.
+        assert_eq!(
+            probe(r#"{"o":{"k":1,"k":2},"o":3}"#).as_deref(),
+            Some("/o/k")
+        );
+        assert!(duplicate_key(b"{\"a\":").is_err());
+        assert_eq!(json_depth(&json!(1)), 0);
+        assert_eq!(json_depth(&json!({"a":[{"b":{}}]})), 4);
+    }
+
+    #[test]
+    fn order_lookup_by_mode() {
+        let created = StoredOrder {
+            id: 7,
+            sku: "LAB-MS-02".to_owned(),
+            quantity: 3,
+            total_cents: 8_997,
+        };
+        let shared = Shared {
+            hub: Arc::new(TelemetryHub::new()),
+            hardened: AtomicBool::new(false),
+            ledger: Mutex::new(Ledger::default()),
+            redeem_depth: AtomicU32::new(0),
+            requests: AtomicU64::new(0),
+            next_order: AtomicU64::new(8),
+        };
+        shared.ledger().created.push_back(created.clone());
+        let lookup = |mode, raw: &str| evaluate_lookup(mode, raw, |id| shared.find_order(id));
+        let leak_kind = |raw: &str| match lookup(LabMode::Unprotected, raw) {
+            Lookup::Leak(leak) => {
+                assert_eq!(leak.status, StatusCode::INTERNAL_SERVER_ERROR, "{raw}");
+                disclosure::detect(&leak.body).map(|d| d.kind)
+            }
+            other => panic!("expected a leak for {raw:?}, got {other:?}"),
+        };
+
+        assert!(
+            matches!(lookup(LabMode::Unprotected, "1"), Lookup::Found(o) if o.sku == "LAB-KB-01" && o.total_cents == 9_998)
+        );
+        assert_eq!(
+            lookup(LabMode::Unprotected, "7"),
+            Lookup::Found(created.clone())
+        );
+        assert_eq!(lookup(LabMode::Unprotected, "4"), Lookup::NotFound);
+        let node = Some(DisclosureKind::NodeStackTrace);
+        let sql = Some(DisclosureKind::SqlError);
+        let long = "9".repeat(4_096);
+        for (raw, kind) in [
+            ("", node),
+            ("0", node),
+            ("-1", node),
+            ("1.5", node),
+            ("9223372036854775807", sql),
+            ("9223372036854775808", sql),
+            ("invalid-uuid", sql),
+            (long.as_str(), Some(DisclosureKind::PythonTraceback)),
+        ] {
+            assert_eq!(leak_kind(raw), kind, "{raw:.24}");
+        }
+
+        assert!(matches!(lookup(LabMode::Hardened, "3"), Lookup::Found(o) if o.id == 3));
+        assert_eq!(lookup(LabMode::Hardened, "7"), Lookup::Found(created));
+        assert_eq!(lookup(LabMode::Hardened, "999999"), Lookup::NotFound);
+        for raw in [
+            "",
+            "0",
+            "-1",
+            "01",
+            "1.5",
+            "1000000",
+            "9223372036854775807",
+            "invalid-uuid",
+            " 1",
+            long.as_str(),
+        ] {
+            assert_eq!(lookup(LabMode::Hardened, raw), Lookup::Invalid, "{raw:.24}");
         }
     }
 
@@ -1520,6 +2026,68 @@ mod tests {
         assert_eq!(states, [true, false, false]);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn order_lookup_over_http() {
+        let (_hub, lab, base) = started(LabMode::Unprotected).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let get = |path: &str| {
+            let request = client.get(format!("{base}{path}"));
+            async move {
+                let response = request.send().await.unwrap();
+                let status = response.status().as_u16();
+                (status, response.text().await.unwrap())
+            }
+        };
+
+        let (status, body) = get("/api/v1/orders/1").await;
+        assert_eq!(status, 200, "{body}");
+        let order: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            (order["id"].as_u64(), order["orderId"].as_str()),
+            (Some(1), Some("ord-000001"))
+        );
+
+        let created: Value = client
+            .post(format!("{base}/api/v1/orders/checkout"))
+            .body(CHECKOUT_SAMPLE)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = created["id"].as_u64().unwrap();
+        assert!(id > ORDER_HISTORY.len() as u64, "{created}");
+        let (status, body) = get(&format!("/api/v1/orders/{id}")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), created);
+
+        let (status, body) = get("/api/v1/orders/").await;
+        assert_eq!(status, 500);
+        assert!(body.contains("TypeError"), "{body}");
+        let (status, body) = get("/api/v1/orders/invalid-uuid").await;
+        assert_eq!(status, 500);
+        assert!(
+            body.contains("invalid input syntax for type bigint"),
+            "{body}"
+        );
+
+        lab.set_mode(LabMode::Hardened).await;
+        for path in [
+            "/api/v1/orders/",
+            "/api/v1/orders/invalid-uuid",
+            "/api/v1/orders/-1",
+        ] {
+            let (status, body) = get(path).await;
+            assert_eq!(status, 422, "{path}: {body}");
+            assert!(body.contains("invalid_path_parameter"), "{body}");
+        }
+        // The mode switch cleared the ledger; the seeded history stays.
+        assert_eq!(get(&format!("/api/v1/orders/{id}")).await.0, 404);
+        assert_eq!(get("/api/v1/orders/2").await.0, 200);
+        lab.stop().await;
+    }
+
     #[tokio::test]
     async fn explicit_busy_port_fails_and_default_falls_back() {
         let blocker = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1551,7 +2119,7 @@ mod tests {
         let document: Value =
             serde_json::from_str(&openapi_document(Some("http://127.0.0.1:4242"))).unwrap();
         assert_eq!(document["servers"][0]["url"], "http://127.0.0.1:4242");
-        assert_eq!(document["paths"].as_object().unwrap().len(), 4);
+        assert_eq!(document["paths"].as_object().unwrap().len(), 5);
         let fallback: Value = serde_json::from_str(&openapi_document(None)).unwrap();
         assert_eq!(
             fallback["servers"][0]["url"],

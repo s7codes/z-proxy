@@ -270,6 +270,7 @@ same state.
 |---------------------------------|-----------------------------------------------------------|----------------------------------------------|
 | `POST /api/v1/coupons/redeem`   | Reads the coupon's use count, waits 60 ms (provider call), writes back `read + 1` | Check and increment under one lock, then the provider call |
 | `POST /api/v1/orders/checkout`  | Unvalidated input reaches failing code; the failure is serialized into the response | Every invalid input: 422 `{ error, violations[] }` |
+| `GET /api/v1/orders/{orderId}`  | `Number(orderId)` used as an index and passed raw to SQL  | `orderId` must be an integer 1-999 999, else 422 |
 | `GET /api/v1/health`            | `{ status, mode }`                                        | same                                         |
 | `GET /api/v1/lab/openapi.json`  | OpenAPI 3.1 document of the above                         | same                                         |
 
@@ -293,12 +294,33 @@ Unprotected checkout failures, by input:
 | Negative `quantity`                                       | 500 Go panic with goroutine dump                 |
 | `quantity` above 10 000                                   | 500 Rust panic (index out of bounds)             |
 | String above column length (sku 64, email 254, name 64, note 256) | 500 Python traceback ending in psycopg2 `StringDataRightTruncation` |
-| `quantity` 0, empty email or name, unknown fields         | 201 (accepted without validation)                |
+| Nesting beyond 128 levels                                 | 500 Node.js `RangeError: Maximum call stack size exceeded` |
+| Number outside `f64` range (`1e309`)                      | 500 Rust panic from an `unwrap()` on the decode error |
+| `quantity` 0, empty email or name, unknown fields, duplicate keys (last one wins), deep nesting under an unknown field | 201 (accepted without validation) |
 
 Hardened checkout enforces the documented schema: `sku` `^[A-Z0-9-]{1,32}$` and in the
 catalog, `quantity` integer 1-10 000, `customer.email` and `customer.name` required, `note`
-optional string up to 256, `giftWrap` optional boolean, unknown fields rejected, body at
-most 32 KiB.
+optional string up to 256, `giftWrap` optional boolean, unknown fields rejected
+(`additionalProperties: false`), body at most 32 KiB. Before field validation it refuses
+nesting deeper than 8 levels and any key repeated within one object (the violation names the
+duplicate's pointer); numbers outside `f64` range and nesting past the parser limit are
+422 `malformed_json`.
+
+Order lookup serves the seeded history (orders 1-3) and every order confirmed by checkout
+since the last reset or mode switch (at most 1 024). Unprotected responses, by `orderId`:
+
+| `orderId`                                       | Response                                          |
+|-------------------------------------------------|---------------------------------------------------|
+| Known id                                        | 200 order                                         |
+| Unknown positive integer                        | 404                                               |
+| Empty segment, `0`, negative, fractional        | 500 Node.js `TypeError` stack trace               |
+| Non-numeric (`invalid-uuid`)                    | 500 PostgreSQL `invalid input syntax for type bigint` |
+| At or above `i64::MAX` (`9223372036854775807`)  | 500 PostgreSQL `out of range for type bigint` (SQLSTATE 22003) |
+| Digits beyond `f64` range                       | 500 Python traceback ending in psycopg2 `NumericValueOutOfRange` |
+
+Hardened lookup accepts only canonical decimal identifiers without sign or leading zero in
+1-999 999 and answers anything else, including the empty segment, with
+422 `{ error: "invalid_path_parameter", parameter, reason }`, without echoing the input.
 
 "Load Lab Target" in the inspector sets the lab as the validated target (so the proxy
 upstream and the Burst/Fuzzer origin follow), replaces the route list with the routes parsed
