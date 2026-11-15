@@ -6,7 +6,7 @@ import { formatBytes, formatLatency, formatPercent } from "../../lib/format";
 import { joinTarget, originOf, parseHeaders } from "../../lib/request";
 import { unresolvedParams, type RequestTarget } from "../../lib/routes";
 import { httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
-import type { Anomaly, AnomalyKind, BurstReport } from "../../lib/types";
+import type { Anomaly, AnomalyKind, BurstReport, LatencyStats } from "../../lib/types";
 import { Section, StatusSquare } from "../shell/PanelHeader";
 import { ErrorLine } from "./ErrorLine";
 import { Field, MethodPicker, Metric, OriginRow, PathField, SampleHint } from "./RequestFields";
@@ -49,6 +49,8 @@ export function BurstPanel({
   const { method, path } = request;
   const [workers, setWorkers] = useState(20);
   const [timeoutMs, setTimeoutMs] = useState(5_000);
+  // 0 means no quota; the engine receives `null`.
+  const [maxSuccesses, setMaxSuccesses] = useState(0);
   const [headerText, setHeaderText] = useState("");
 
   const origin = guard.phase === "accepted" ? originOf(guard.target.normalized) : null;
@@ -66,6 +68,7 @@ export function BurstPanel({
       headers: parsed.headers,
       body: body === "" ? null : body,
       timeoutMs,
+      expectedMaxSuccesses: maxSuccesses === 0 ? null : maxSuccesses,
     });
   };
 
@@ -112,6 +115,7 @@ export function BurstPanel({
           <div className="flex flex-col gap-1.5">
             <Slider label="Workers" unit="req" min={1} max={MAX_WORKERS} step={1} value={workers} onChange={setWorkers} />
             <Slider label="Timeout" unit="ms" min={100} max={60000} step={100} value={timeoutMs} onChange={setTimeoutMs} />
+            <QuotaField value={maxSuccesses} max={workers} onChange={setMaxSuccesses} />
           </div>
         </Section>
 
@@ -168,15 +172,8 @@ function ReportView({ report }: { report: BurstReport }) {
       </Section>
 
       {report.latency !== null && (
-        <Section title="Latency">
-          <div className="num grid grid-cols-3 gap-px border border-line bg-line text-xs">
-            <Metric label="min" value={formatLatency(report.latency.minUs)} />
-            <Metric label="p50" value={formatLatency(report.latency.p50Us)} />
-            <Metric label="mean" value={formatLatency(report.latency.meanUs)} />
-            <Metric label="p95" value={formatLatency(report.latency.p95Us)} />
-            <Metric label="p99" value={formatLatency(report.latency.p99Us)} />
-            <Metric label="max" value={formatLatency(report.latency.maxUs)} />
-          </div>
+        <Section title="Latency" aside={<span className="num text-2xs text-fg-faint">nearest rank</span>}>
+          <LatencyGrid ttfb={report.ttfb} total={report.latency} />
           {report.size !== null && (
             <div className="num pt-1.5 text-2xs text-fg-faint">
               size {formatBytes(report.size.minBytes)}
@@ -186,7 +183,15 @@ function ReportView({ report }: { report: BurstReport }) {
         </Section>
       )}
 
-      <Section title="Anomalies" aside={<span className="num text-2xs text-fg-faint">{report.anomalies.length}</span>}>
+      <Section
+        title="Anomalies"
+        aside={
+          <span className="num text-2xs text-fg-faint">
+            {report.expectedMaxSuccesses === null ? "" : `max 2xx ${report.expectedMaxSuccesses}  `}
+            {report.anomalies.length}
+          </span>
+        }
+      >
         {report.anomalies.length === 0 ? (
           <div className="flex items-center gap-1.5 text-xs text-ok">
             <StatusSquare className="bg-ok" />
@@ -201,6 +206,64 @@ function ReportView({ report }: { report: BurstReport }) {
         )}
       </Section>
     </>
+  );
+}
+
+const LATENCY_ROWS: ReadonlyArray<{ label: string; key: keyof LatencyStats }> = [
+  { label: "min", key: "minUs" },
+  { label: "p50", key: "p50Us" },
+  { label: "p95", key: "p95Us" },
+  { label: "p99", key: "p99Us" },
+  { label: "max", key: "maxUs" },
+  { label: "mean", key: "meanUs" },
+];
+
+/** TTFB next to total exchange time; the gap is time spent producing or streaming the body. */
+function LatencyGrid({ ttfb, total }: { ttfb: LatencyStats | null; total: LatencyStats }) {
+  return (
+    <div className="num border border-line text-xs">
+      <div className="grid h-5 grid-cols-[40px_1fr_1fr_1fr] items-center border-b border-line bg-bg px-1.5 text-2xs text-fg-faint">
+        <span />
+        <span className="text-right">ttfb</span>
+        <span className="text-right">total</span>
+        <span className="text-right">body</span>
+      </div>
+      {LATENCY_ROWS.map(({ label, key }) => {
+        const head = ttfb?.[key] ?? null;
+        const end = total[key];
+        return (
+          <div key={key} className="grid h-5 grid-cols-[40px_1fr_1fr_1fr] items-center border-b border-line/60 px-1.5 last:border-b-0">
+            <span className="text-2xs text-fg-faint">{label}</span>
+            <span className="text-right text-fg-bright">{head === null ? "-" : formatLatency(head)}</span>
+            <span className="text-right text-fg-bright">{formatLatency(end)}</span>
+            <span className="text-right text-fg-dim">{head === null ? "-" : formatLatency(Math.max(0, end - head))}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function QuotaField({ value, max, onChange }: { value: number; max: number; onChange: (value: number) => void }) {
+  return (
+    <div className="flex h-5 items-center gap-2 text-xs">
+      <span className="w-[52px] shrink-0 text-fg-dim">Max 2xx</span>
+      <input
+        type="number"
+        min={0}
+        max={max}
+        value={value}
+        aria-label="Expected maximum successes"
+        onChange={(e) => {
+          const next = Number(e.target.value);
+          if (Number.isInteger(next) && next >= 0 && next <= 65_535) onChange(next);
+        }}
+        className="num h-5 w-12 rounded-xs border border-line bg-bg px-1 text-right text-xs text-fg-bright outline-none focus:border-fg-faint [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+      />
+      <span className="min-w-0 truncate text-2xs text-fg-faint">
+        {value === 0 ? "no quota; race needs a conflict response" : `more than ${value} success${value === 1 ? "" : "es"} is a race`}
+      </span>
+    </div>
   );
 }
 

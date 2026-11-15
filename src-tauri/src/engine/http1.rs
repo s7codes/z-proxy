@@ -10,7 +10,7 @@ use std::error::Error as _;
 use std::fmt;
 use std::hash::{DefaultHasher, Hasher};
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::http::header::{self, HeaderMap, HeaderName, HeaderValue};
@@ -167,6 +167,9 @@ pub async fn open(target: &GuardedTarget) -> Result<SendRequest<Full<Bytes>>, Op
 }
 
 pub struct Received {
+    /// When hyper finished parsing the status line and headers. Callers subtract their own
+    /// write instant, so TTFB and total latency are measured from the same clock edge.
+    pub head_at: Instant,
     pub status: u16,
     pub bytes: u64,
     /// 64-bit SipHash of the full body as 16 hex digits.
@@ -228,6 +231,7 @@ pub async fn exchange(
         .send_request(request)
         .await
         .map_err(ExchangeError::Send)?;
+    let head_at = Instant::now();
     let status = response.status().as_u16();
 
     let mut body = response.into_body();
@@ -245,6 +249,7 @@ pub async fn exchange(
     }
 
     Ok(Received {
+        head_at,
         status,
         bytes,
         hash: format!("{:016x}", hasher.finish()),

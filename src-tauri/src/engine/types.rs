@@ -112,6 +112,10 @@ pub struct BurstSpec {
     pub headers: Vec<HeaderPair>,
     pub body: Option<String>,
     pub timeout_ms: u32,
+    /// Upper bound on 2xx responses the operation may legitimately produce (1 for a
+    /// single-use coupon or an idempotent charge). More successes are a race window even
+    /// when no request was answered with a conflict. `None` applies no quota.
+    pub expected_max_successes: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -122,6 +126,9 @@ pub struct WorkerSample {
     pub status: Option<u16>,
     /// Offset from the first worker past the barrier; `None` if the worker never fired.
     pub dispatch_offset_us: Option<u64>,
+    /// Request write to parsed response head; `None` when no head arrived.
+    pub ttfb_us: Option<u64>,
+    /// Request write to the last body frame, or to the failure.
     pub latency_us: u64,
     pub bytes: u64,
     /// 64-bit SipHash of the response body as 16 hex digits; a string because the value
@@ -190,9 +197,15 @@ pub struct BurstReport {
     pub wall_us: u64,
     pub dispatch_spread_us: Option<u64>,
     pub status_histogram: Vec<StatusBucket>,
+    /// Total exchange time over responded workers.
     pub latency: Option<LatencyStats>,
+    /// Time to the response head over responded workers. A wide gap to `latency` puts the
+    /// cost in body generation or streaming rather than in the handler before the head.
+    pub ttfb: Option<LatencyStats>,
     pub size: Option<SizeStats>,
     pub distinct_bodies: u32,
+    /// Quota the race analysis applied, echoed from the spec.
+    pub expected_max_successes: Option<u16>,
     pub anomalies: Vec<Anomaly>,
     pub samples: Vec<WorkerSample>,
 }

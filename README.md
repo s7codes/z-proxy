@@ -113,18 +113,26 @@ handshakes its own HTTP/1.1 connection, then waits on a `tokio::sync::Barrier`; 
 the only remaining work is writing the request. Workers that fail to connect still join the
 barrier and report a transport error.
 
-The report contains the status histogram, latency min/mean/p50/p95/p99/max (nearest rank,
-responses only), response size range, distinct body fingerprints (SipHash-64), dispatch
-spread (latest minus earliest release), and anomalies:
+Each worker records two monotonic intervals from the instant it writes its request: `ttfbUs`
+to the parsed response head (hyper resolves `send_request` once the status line and headers
+are read) and `latencyUs` to the last body frame. The report carries min/mean/p50/p95/p99/max
+for both (`ttfb`, `latency`; nearest rank, responses only), the status histogram, response
+size range, distinct body fingerprints (SipHash-64), dispatch spread (latest minus earliest
+release), and anomalies:
 
 | Kind               | Severity   | Condition                                                       |
 |--------------------|------------|-----------------------------------------------------------------|
-| `raceWindow`       | fault      | More than one 2xx alongside 409/412/422/423/425/429 responses   |
+| `raceWindow`       | fault      | 2xx count above the quota; without a quota, more than one 2xx alongside 409/412/422/423/425/429 responses |
 | `statusDivergence` | warn/fault | Statuses outside the majority (fault when any is 5xx)           |
 | `bodyDivergence`   | warn       | Differing bodies within one status                              |
 | `transportErrors`  | warn/fault | Workers without a response (fault when all failed)              |
 
-One 2xx plus conflicts is treated as correct serialization and is not reported.
+`BurstSpec.expectedMaxSuccesses` sets the quota: the number of 2xx the operation may
+legitimately produce (1 for a single-use coupon or an idempotent charge, `0` for a resource
+that is already spent). Without a quota, one 2xx plus conflicts is correct serialization and
+twenty 2xx with no conflict are indistinguishable from an operation that admits everyone, so
+neither is reported. With a quota, any surplus is a race window whether or not a conflict was
+returned. The UI field "Max 2xx" sends `null` for 0.
 
 ## Route scanner
 

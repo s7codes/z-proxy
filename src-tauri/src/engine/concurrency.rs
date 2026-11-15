@@ -39,6 +39,7 @@ struct Prepared {
     template: RequestTemplate,
     body: Bytes,
     timeout: Duration,
+    expected_max_successes: Option<u16>,
 }
 
 impl Prepared {
@@ -108,6 +109,7 @@ pub async fn run(spec: BurstSpec, hub: &TelemetryHub) -> EngineResult<BurstRepor
             method: spec.method,
             workers,
             wall_us: net::elapsed_us(started),
+            expected_max_successes: prepared.expected_max_successes,
         },
         samples,
     );
@@ -150,6 +152,7 @@ fn prepare(spec: &BurstSpec) -> EngineResult<Prepared> {
         template: RequestTemplate::new(&spec.target, spec.method, &spec.headers, invalid)?,
         body: spec.body.clone().map(Bytes::from).unwrap_or_default(),
         timeout: Duration::from_millis(u64::from(spec.timeout_ms)),
+        expected_max_successes: spec.expected_max_successes,
     })
 }
 
@@ -192,6 +195,9 @@ async fn run_worker(
             worker,
             status: Some(received.status),
             dispatch_offset_us,
+            ttfb_us: Some(duration_us(
+                received.head_at.saturating_duration_since(fired),
+            )),
             latency_us,
             bytes: received.bytes,
             body_hash: Some(received.hash),
@@ -226,6 +232,7 @@ fn failed(
         worker,
         status: None,
         dispatch_offset_us,
+        ttfb_us: None,
         latency_us,
         bytes: 0,
         body_hash: None,
@@ -241,6 +248,7 @@ struct ReportMeta {
     method: BurstMethod,
     workers: u16,
     wall_us: u64,
+    expected_max_successes: Option<u16>,
 }
 
 fn analyze(meta: ReportMeta, samples: Vec<WorkerSample>) -> BurstReport {
@@ -263,6 +271,7 @@ fn analyze(meta: ReportMeta, samples: Vec<WorkerSample>) -> BurstReport {
 
     let responded: Vec<&WorkerSample> = samples.iter().filter(|s| s.status.is_some()).collect();
     let latency = latency_stats(responded.iter().map(|s| s.latency_us).collect());
+    let ttfb = latency_stats(responded.iter().filter_map(|s| s.ttfb_us).collect());
     let size = responded
         .iter()
         .map(|s| s.bytes)
@@ -285,7 +294,7 @@ fn analyze(meta: ReportMeta, samples: Vec<WorkerSample>) -> BurstReport {
         .zip(offsets.min())
         .map(|(max, min)| max - min);
 
-    let anomalies = detect_anomalies(&samples, &by_status);
+    let anomalies = detect_anomalies(&samples, &by_status, meta.expected_max_successes);
 
     BurstReport {
         id: meta.id,
@@ -296,8 +305,10 @@ fn analyze(meta: ReportMeta, samples: Vec<WorkerSample>) -> BurstReport {
         dispatch_spread_us,
         status_histogram,
         latency,
+        ttfb,
         size,
         distinct_bodies: count_u32(distinct_bodies),
+        expected_max_successes: meta.expected_max_successes,
         anomalies,
         samples,
     }
@@ -306,6 +317,7 @@ fn analyze(meta: ReportMeta, samples: Vec<WorkerSample>) -> BurstReport {
 fn detect_anomalies(
     samples: &[WorkerSample],
     by_status: &BTreeMap<Option<u16>, Vec<u16>>,
+    expected_max_successes: Option<u16>,
 ) -> Vec<Anomaly> {
     let total = samples.len();
     let mut anomalies = Vec::new();
@@ -349,15 +361,29 @@ fn detect_anomalies(
         .sum();
 
     // One winner plus conflicts is correct serialization. More than one winner means two
-    // requests passed the same uniqueness check before either committed.
-    if conflicts > 0 && successes.len() > 1 {
-        anomalies.push(Anomaly {
-            kind: AnomalyKind::RaceWindow,
-            severity: Severity::Fault,
-            detail: format!(
+    // requests passed the same uniqueness check before either committed. Without conflicts
+    // the responses alone cannot tell a race from an operation that admits everyone, so only
+    // an operator quota turns surplus successes into a finding.
+    let allowed = expected_max_successes.map_or(1, usize::from);
+    if successes.len() > allowed && (expected_max_successes.is_some() || conflicts > 0) {
+        let detail = match expected_max_successes {
+            Some(limit) if conflicts > 0 => format!(
+                "{} of {total} requests succeeded alongside {conflicts} conflict responses; the expected maximum is {limit}",
+                successes.len()
+            ),
+            Some(limit) => format!(
+                "{} of {total} requests succeeded with no conflict response; the expected maximum is {limit}",
+                successes.len()
+            ),
+            None => format!(
                 "{} of {total} requests succeeded alongside {conflicts} conflict responses; a serialized handler admits at most one",
                 successes.len()
             ),
+        };
+        anomalies.push(Anomaly {
+            kind: AnomalyKind::RaceWindow,
+            severity: Severity::Fault,
+            detail,
             workers: successes,
         });
     }
@@ -513,6 +539,7 @@ mod tests {
             headers: Vec::new(),
             body: None,
             timeout_ms: 5_000,
+            expected_max_successes: None,
         }
     }
 
@@ -521,6 +548,7 @@ mod tests {
             worker,
             status,
             dispatch_offset_us: status.map(|_| u64::from(worker)),
+            ttfb_us: status.map(|_| latency_us / 2),
             latency_us,
             bytes: 10,
             body_hash: status.map(|_| hash.to_owned()),
@@ -535,6 +563,14 @@ mod tests {
             method: BurstMethod::Post,
             workers,
             wall_us: 1,
+            expected_max_successes: None,
+        }
+    }
+
+    fn quota(workers: u16, limit: u16) -> ReportMeta {
+        ReportMeta {
+            expected_max_successes: Some(limit),
+            ..meta(workers)
         }
     }
 
@@ -596,6 +632,70 @@ mod tests {
             "{}",
             race.detail
         );
+    }
+
+    #[test]
+    fn quota_flags_surplus_successes_without_any_conflict() {
+        let winners = || (1..=20).map(|w| sample(w, Some(200), 100, "ok")).collect();
+        let unbounded = analyze(meta(20), winners());
+        assert!(unbounded.anomalies.is_empty(), "{:?}", unbounded.anomalies);
+        assert_eq!(unbounded.expected_max_successes, None);
+
+        let report = analyze(quota(20, 1), winners());
+        assert_eq!(kinds(&report), [AnomalyKind::RaceWindow]);
+        let race = &report.anomalies[0];
+        assert_eq!(race.severity, Severity::Fault);
+        assert_eq!(race.workers, (1..=20).collect::<Vec<u16>>());
+        assert_eq!(
+            race.detail,
+            "20 of 20 requests succeeded with no conflict response; the expected maximum is 1"
+        );
+        assert_eq!(report.expected_max_successes, Some(1));
+    }
+
+    #[test]
+    fn quota_replaces_the_single_winner_assumption() {
+        let mixed = || {
+            let mut samples: Vec<WorkerSample> =
+                (1..=3).map(|w| sample(w, Some(200), 100, "ok")).collect();
+            samples.extend((4..=20).map(|w| sample(w, Some(409), 100, "c")));
+            samples
+        };
+        assert_eq!(
+            kinds(&analyze(meta(20), mixed())),
+            [AnomalyKind::RaceWindow]
+        );
+        assert!(analyze(quota(20, 3), mixed()).anomalies.is_empty());
+        assert!(analyze(quota(20, 5), mixed()).anomalies.is_empty());
+
+        let over = analyze(quota(20, 2), mixed());
+        assert_eq!(kinds(&over), [AnomalyKind::RaceWindow]);
+        assert_eq!(
+            over.anomalies[0].detail,
+            "3 of 20 requests succeeded alongside 17 conflict responses; the expected maximum is 2"
+        );
+
+        // A zero quota asserts the operation must not succeed at all (an already spent coupon).
+        let mut spent = vec![sample(1, Some(200), 100, "ok")];
+        spent.extend((2..=10).map(|w| sample(w, Some(409), 100, "c")));
+        let report = analyze(quota(10, 0), spent);
+        assert_eq!(kinds(&report), [AnomalyKind::RaceWindow]);
+        assert_eq!(report.anomalies[0].workers, [1]);
+    }
+
+    #[test]
+    fn ttfb_stats_cover_responded_workers_only() {
+        let samples = vec![
+            sample(1, Some(200), 400, "ok"),
+            sample(2, None, 9_999, ""),
+            sample(3, Some(200), 200, "ok"),
+        ];
+        let report = analyze(meta(3), samples);
+        let ttfb = report.ttfb.unwrap();
+        assert_eq!((ttfb.min_us, ttfb.max_us, ttfb.mean_us), (100, 200, 150));
+        assert!(analyze(meta(1), vec![sample(1, None, 5, "")])
+            .ttfb
+            .is_none());
     }
 
     #[test]
@@ -718,6 +818,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.samples.len(), 50);
+        for sample in &report.samples {
+            let ttfb = sample.ttfb_us.expect("responded worker has a ttfb");
+            assert!(ttfb <= sample.latency_us, "{sample:?}");
+        }
+        assert_eq!(
+            report.ttfb.map(|t| t.min_us <= t.max_us),
+            Some(true),
+            "{:?}",
+            report.ttfb
+        );
         assert_eq!(
             report.status_histogram,
             [StatusBucket {
@@ -758,6 +868,83 @@ mod tests {
             }
         }
         assert_eq!((started, samples, completed), (1, 50, 1));
+    }
+
+    async fn write_all(stream: &tokio::net::TcpStream, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            stream.writable().await.unwrap();
+            match stream.try_write(bytes) {
+                Ok(n) => bytes = &bytes[n..],
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => panic!("write failed: {err}"),
+            }
+        }
+    }
+
+    /// Writes the response head as soon as the request head is read, then holds the body
+    /// back for `stall`: a handler that commits headers before its slow work.
+    async fn serve_split_response(stall: Duration) -> SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut seen = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        stream.readable().await.unwrap();
+                        match stream.try_read(&mut buf) {
+                            Ok(0) => return,
+                            Ok(n) => seen.extend_from_slice(&buf[..n]),
+                            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => return,
+                        }
+                    }
+                    write_all(&stream, b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\n").await;
+                    tokio::time::sleep(stall).await;
+                    write_all(&stream, b"done").await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ttfb_separates_the_response_head_from_a_stalled_body() {
+        let stall = Duration::from_millis(150);
+        let addr = serve_split_response(stall).await;
+        let hub = TelemetryHub::new();
+        let report = run(
+            spec(format!("http://127.0.0.1:{}/slow", addr.port()), 4),
+            &hub,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            report.status_histogram,
+            [StatusBucket {
+                status: Some(200),
+                count: 4
+            }]
+        );
+        // The stall sits between head and body, so it must show up in total latency and not
+        // in TTFB. 100 ms of the 150 ms stall is the margin left for timer coarseness.
+        for sample in &report.samples {
+            let ttfb = sample.ttfb_us.unwrap();
+            assert!(
+                sample.latency_us >= ttfb + 100_000,
+                "ttfb {ttfb} us, latency {} us",
+                sample.latency_us
+            );
+            assert_eq!(sample.bytes, 4);
+        }
+        let (ttfb, latency) = (report.ttfb.unwrap(), report.latency.unwrap());
+        assert!(
+            latency.p50_us >= ttfb.p50_us + 100_000,
+            "{ttfb:?} {latency:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1293,6 +1293,8 @@ mod tests {
             }],
             body: Some(format!(r#"{{"code":"{COUPON_CODE}","userId":"u-1001"}}"#)),
             timeout_ms: 10_000,
+            // The coupon admits one use; the quota holds the hardened run to exactly that.
+            expected_max_successes: Some(1),
         }
     }
 

@@ -228,6 +228,7 @@ function toRow(event: TelemetryEvent): Row {
         detail:
           sample.error ??
           [
+            sample.ttfbUs === null ? null : `ttfb ${formatLatency(sample.ttfbUs)}`,
             sample.dispatchOffsetUs === null ? null : `dispatch +${formatLatency(sample.dispatchOffsetUs)}`,
             formatBytes(sample.bytes),
             sample.bodyHash === null ? null : `#${sample.bodyHash.slice(0, 8)}`,

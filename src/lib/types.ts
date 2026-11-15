@@ -84,12 +84,20 @@ export interface BurstSpec {
   headers: HeaderPair[];
   body: string | null;
   timeoutMs: number;
+  /**
+   * Upper bound on 2xx responses the operation may produce (1 for a single-use coupon or an
+   * idempotent charge); more is a race window even without conflicts. `null`: no quota.
+   */
+  expectedMaxSuccesses: number | null;
 }
 
 export interface WorkerSample {
   worker: number;
   status: number | null;
   dispatchOffsetUs: number | null;
+  /** Request write to parsed response head; `null` when no head arrived. */
+  ttfbUs: number | null;
+  /** Request write to the last body frame, or to the failure. */
   latencyUs: number;
   bytes: number;
   bodyHash: string | null;
@@ -134,9 +142,14 @@ export interface BurstReport {
   wallUs: number;
   dispatchSpreadUs: number | null;
   statusHistogram: StatusBucket[];
+  /** Total exchange time over responded workers. */
   latency: LatencyStats | null;
+  /** Time to the response head over responded workers. */
+  ttfb: LatencyStats | null;
   size: SizeStats | null;
   distinctBodies: number;
+  /** Quota the race analysis applied, echoed from the spec. */
+  expectedMaxSuccesses: number | null;
   anomalies: Anomaly[];
   samples: WorkerSample[];
 }
