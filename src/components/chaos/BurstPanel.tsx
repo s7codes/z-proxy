@@ -19,6 +19,7 @@ const ANOMALY_LABEL: Record<AnomalyKind, string> = {
   statusDivergence: "Status split",
   bodyDivergence: "Body divergence",
   transportErrors: "Transport",
+  idempotencyViolation: "Idempotency violation",
 };
 
 interface BurstPanelProps {
@@ -51,11 +52,14 @@ export function BurstPanel({
   const [timeoutMs, setTimeoutMs] = useState(5_000);
   // 0 means no quota; the engine receives `null`.
   const [maxSuccesses, setMaxSuccesses] = useState(0);
+  const [idempotencyMode, setIdempotencyMode] = useState(false);
   const [headerText, setHeaderText] = useState("");
 
   const parsed = useMemo(() => parseHeaders(headerText), [headerText]);
   const params = pathParams(path);
   const target = requestOrigin === null ? null : joinTarget(requestOrigin.url, path);
+  const writeMethod = method === "POST" || method === "PUT" || method === "PATCH";
+  const replaying = idempotencyMode && writeMethod;
   const canFire = online && target !== null && parsed.error === null && !burst.running;
 
   const fire = () => {
@@ -68,6 +72,7 @@ export function BurstPanel({
       body: body === "" ? null : body,
       timeoutMs,
       expectedMaxSuccesses: maxSuccesses === 0 ? null : maxSuccesses,
+      idempotencyMode: replaying,
     });
   };
 
@@ -115,6 +120,11 @@ export function BurstPanel({
             <Slider label="Workers" unit="req" min={1} max={MAX_WORKERS} step={1} value={workers} onChange={setWorkers} />
             <Slider label="Timeout" unit="ms" min={100} max={60000} step={100} value={timeoutMs} onChange={setTimeoutMs} />
             <QuotaField value={maxSuccesses} max={workers} onChange={setMaxSuccesses} />
+            <IdempotencyField
+              value={idempotencyMode}
+              available={writeMethod}
+              onChange={setIdempotencyMode}
+            />
           </div>
         </Section>
 
@@ -123,7 +133,11 @@ export function BurstPanel({
 
       <div className="flex h-9 shrink-0 items-center gap-2 border-t border-line px-2.5">
         <span className="text-2xs text-fg-faint">
-          {burst.running ? `Barrier armed: ${workers} workers` : "Pre-connected workers, single barrier release"}
+          {burst.running
+            ? `Barrier armed: ${workers} workers`
+            : replaying
+              ? "One Idempotency-Key from every worker, single barrier release"
+              : "Pre-connected workers, single barrier release"}
         </span>
         <button
           type="button"
@@ -152,6 +166,12 @@ function ReportView({ report }: { report: BurstReport }) {
           <Metric label="bodies" value={String(report.distinctBodies)} />
           <Metric label="errors" value={String(errors)} tone={errors > 0 ? "fault" : undefined} />
         </div>
+        {report.idempotencyKey !== null && (
+          <div className="num mb-1.5 flex min-w-0 items-center gap-1.5 text-2xs" title={report.idempotencyKey}>
+            <span className="shrink-0 text-fg-faint">Idempotency-Key</span>
+            <span className="truncate text-fg-dim select-text">{report.idempotencyKey}</span>
+          </div>
+        )}
 
         <div className="mb-1.5 flex h-1.5 w-full gap-px" aria-hidden>
           {report.statusHistogram.map((bucket) => (
@@ -260,6 +280,44 @@ function QuotaField({ value, max, onChange }: { value: number; max: number; onCh
       />
       <span className="min-w-0 truncate text-2xs text-fg-faint">
         {value === 0 ? "no quota; race needs a conflict response" : `more than ${value} success${value === 1 ? "" : "es"} is a race`}
+      </span>
+    </div>
+  );
+}
+
+function IdempotencyField({
+  value,
+  available,
+  onChange,
+}: {
+  value: boolean;
+  available: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  const active = value && available;
+  return (
+    <div className="flex h-5 items-center gap-2 text-xs">
+      <button
+        type="button"
+        role="switch"
+        aria-checked={active}
+        aria-label="Idempotency-Key replay"
+        disabled={!available}
+        onClick={() => onChange(!value)}
+        title={
+          available
+            ? "Send one Idempotency-Key from every worker; 2xx responses must replay one body"
+            : "Replays a write; select POST, PUT or PATCH"
+        }
+        className={`flex h-4 w-7 shrink-0 items-center rounded-xs border px-px disabled:cursor-not-allowed disabled:opacity-40 ${
+          active ? "justify-end border-warn/60 bg-warn/10" : "justify-start border-line bg-bg"
+        }`}
+      >
+        <span className={`size-2.5 rounded-[1px] ${active ? "bg-warn" : "bg-fg-faint"}`} />
+      </button>
+      <span className="shrink-0 text-fg-dim">Idempotency-Key replay</span>
+      <span className="min-w-0 truncate text-2xs text-fg-faint">
+        {!available ? "write methods only" : active ? "distinct 2xx bodies are a fault" : "off"}
       </span>
     </div>
   );

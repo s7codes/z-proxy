@@ -119,6 +119,10 @@ pub struct BurstSpec {
     /// single-use coupon or an idempotent charge). More successes are a race window even
     /// when no request was answered with a conflict. `None` applies no quota.
     pub expected_max_successes: Option<u16>,
+    /// Every worker sends the same `Idempotency-Key` (the operator's, else a generated
+    /// UUID); 2xx responses must then be one replayed body. Absent means off.
+    #[serde(default)]
+    pub idempotency_mode: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -172,6 +176,9 @@ pub enum AnomalyKind {
     StatusDivergence,
     BodyDivergence,
     TransportErrors,
+    /// 2xx responses to one `Idempotency-Key` with distinct bodies: the key was not
+    /// deduplicated and the operation ran more than once.
+    IdempotencyViolation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -209,6 +216,8 @@ pub struct BurstReport {
     pub distinct_bodies: u32,
     /// Quota the race analysis applied, echoed from the spec.
     pub expected_max_successes: Option<u16>,
+    /// Key every worker sent in idempotency mode.
+    pub idempotency_key: Option<String>,
     pub anomalies: Vec<Anomaly>,
     pub samples: Vec<WorkerSample>,
 }
@@ -711,6 +720,7 @@ pub enum TelemetryEvent {
         target: String,
         method: BurstMethod,
         workers: u16,
+        idempotency_key: Option<String>,
     },
     BurstSample {
         seq: u64,

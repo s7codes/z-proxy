@@ -23,8 +23,8 @@ use super::http1::{self, RequestTemplate, CONNECT_TIMEOUT};
 use super::net;
 use super::pathparam;
 use super::types::{
-    Anomaly, AnomalyKind, BurstMethod, BurstReport, BurstSpec, LatencyStats, Severity, SizeStats,
-    StatusBucket, TelemetryEvent, WorkerSample,
+    Anomaly, AnomalyKind, BurstMethod, BurstReport, BurstSpec, HeaderPair, LatencyStats, Severity,
+    SizeStats, StatusBucket, TelemetryEvent, WorkerSample,
 };
 use crate::telemetry::{now_us, TelemetryHub};
 
@@ -32,6 +32,7 @@ pub const MAX_WORKERS: u16 = 100;
 const MAX_TIMEOUT_MS: u32 = 60_000;
 const USER_AGENT: &str = concat!("z-proxy-burst/", env!("CARGO_PKG_VERSION"));
 const WORKER_HEADER: &str = "x-zproxy-burst-worker";
+pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 
 /// Statuses that mean a request lost a uniqueness, precondition or idempotency check.
 const CONFLICT_STATUSES: [u16; 6] = [409, 412, 422, 423, 425, 429];
@@ -41,6 +42,7 @@ struct Prepared {
     body: Bytes,
     timeout: Duration,
     expected_max_successes: Option<u16>,
+    idempotency_key: Option<String>,
 }
 
 impl Prepared {
@@ -70,8 +72,9 @@ pub async fn run(spec: BurstSpec, hub: &TelemetryHub) -> EngineResult<BurstRepor
         target: prepared.template.label.clone(),
         method: spec.method,
         workers,
+        idempotency_key: prepared.idempotency_key.clone(),
     });
-    tracing::info!(%id, target = %prepared.template.label, workers, "concurrency burst started");
+    tracing::info!(%id, target = %prepared.template.label, workers, idempotent = prepared.idempotency_key.is_some(), "concurrency burst started");
 
     let barrier = Arc::new(Barrier::new(usize::from(workers)));
     let release = Arc::new(OnceLock::new());
@@ -111,6 +114,7 @@ pub async fn run(spec: BurstSpec, hub: &TelemetryHub) -> EngineResult<BurstRepor
             workers,
             wall_us: net::elapsed_us(started),
             expected_max_successes: prepared.expected_max_successes,
+            idempotency_key: prepared.idempotency_key.clone(),
         },
         samples,
     );
@@ -149,16 +153,49 @@ fn prepare(spec: &BurstSpec) -> EngineResult<Prepared> {
         ));
     }
 
+    let mut headers = spec.headers.clone();
+    let idempotency_key = if spec.idempotency_mode {
+        if !matches!(
+            spec.method,
+            BurstMethod::Post | BurstMethod::Put | BurstMethod::Patch
+        ) {
+            return Err(invalid(
+                "idempotencyMode",
+                "replays a write; use POST, PUT or PATCH".to_owned(),
+            ));
+        }
+        // An operator-supplied key is replayed as given, so a key already known to the
+        // service (a retried checkout) can be tested too.
+        let supplied = spec
+            .headers
+            .iter()
+            .find(|pair| pair.name.trim().eq_ignore_ascii_case(IDEMPOTENCY_HEADER));
+        Some(match supplied {
+            Some(pair) => pair.value.clone(),
+            None => {
+                let key = Uuid::new_v4().to_string();
+                headers.push(HeaderPair {
+                    name: IDEMPOTENCY_HEADER.to_owned(),
+                    value: key.clone(),
+                });
+                key
+            }
+        })
+    } else {
+        None
+    };
+
     Ok(Prepared {
         template: RequestTemplate::new(
             &pathparam::resolve(&spec.target)?.target,
             spec.method,
-            &spec.headers,
+            &headers,
             invalid,
         )?,
         body: spec.body.clone().map(Bytes::from).unwrap_or_default(),
         timeout: Duration::from_millis(u64::from(spec.timeout_ms)),
         expected_max_successes: spec.expected_max_successes,
+        idempotency_key,
     })
 }
 
@@ -255,6 +292,7 @@ struct ReportMeta {
     workers: u16,
     wall_us: u64,
     expected_max_successes: Option<u16>,
+    idempotency_key: Option<String>,
 }
 
 fn analyze(meta: ReportMeta, samples: Vec<WorkerSample>) -> BurstReport {
@@ -300,7 +338,12 @@ fn analyze(meta: ReportMeta, samples: Vec<WorkerSample>) -> BurstReport {
         .zip(offsets.min())
         .map(|(max, min)| max - min);
 
-    let anomalies = detect_anomalies(&samples, &by_status, meta.expected_max_successes);
+    let anomalies = detect_anomalies(
+        &samples,
+        &by_status,
+        meta.expected_max_successes,
+        meta.idempotency_key.is_some(),
+    );
 
     BurstReport {
         id: meta.id,
@@ -315,15 +358,19 @@ fn analyze(meta: ReportMeta, samples: Vec<WorkerSample>) -> BurstReport {
         size,
         distinct_bodies: count_u32(distinct_bodies),
         expected_max_successes: meta.expected_max_successes,
+        idempotency_key: meta.idempotency_key,
         anomalies,
         samples,
     }
 }
 
+/// `idempotent`: every worker sent the same `Idempotency-Key`. Several 2xx responses are
+/// then legitimate replays, so the race analysis gives way to a body comparison.
 fn detect_anomalies(
     samples: &[WorkerSample],
     by_status: &BTreeMap<Option<u16>, Vec<u16>>,
     expected_max_successes: Option<u16>,
+    idempotent: bool,
 ) -> Vec<Anomaly> {
     let total = samples.len();
     let mut anomalies = Vec::new();
@@ -371,7 +418,9 @@ fn detect_anomalies(
     // the responses alone cannot tell a race from an operation that admits everyone, so only
     // an operator quota turns surplus successes into a finding.
     let allowed = expected_max_successes.map_or(1, usize::from);
-    if successes.len() > allowed && (expected_max_successes.is_some() || conflicts > 0) {
+    if idempotent {
+        anomalies.extend(idempotency_violation(samples));
+    } else if successes.len() > allowed && (expected_max_successes.is_some() || conflicts > 0) {
         let detail = match expected_max_successes {
             Some(limit) if conflicts > 0 => format!(
                 "{} of {total} requests succeeded alongside {conflicts} conflict responses; the expected maximum is {limit}",
@@ -443,7 +492,8 @@ fn detect_anomalies(
     }
 
     for (status, workers) in &responded {
-        if workers.len() < 2 {
+        // Divergent 2xx bodies under one key are the idempotency finding above.
+        if workers.len() < 2 || (idempotent && is_success(*status)) {
             continue;
         }
         let mut groups: HashMap<&str, Vec<u16>> = HashMap::new();
@@ -478,6 +528,45 @@ fn detect_anomalies(
     }
 
     anomalies
+}
+
+/// A deduplicating handler answers every request carrying one key with the stored response
+/// of the first, so all 2xx bodies share one fingerprint. More than one fingerprint means
+/// the operation ran again for some requests: a second order, a second charge.
+fn idempotency_violation(samples: &[WorkerSample]) -> Option<Anomaly> {
+    let mut groups: HashMap<&str, Vec<u16>> = HashMap::new();
+    let mut successes = 0usize;
+    for sample in samples
+        .iter()
+        .filter(|s| s.status.is_some_and(|status| (200..300).contains(&status)))
+    {
+        if let Some(hash) = sample.body_hash.as_deref() {
+            groups.entry(hash).or_default().push(sample.worker);
+            successes += 1;
+        }
+    }
+    if groups.len() < 2 {
+        return None;
+    }
+    let majority = groups
+        .iter()
+        .max_by(|a, b| a.1.len().cmp(&b.1.len()).then(b.0.cmp(a.0)))
+        .map(|(hash, _)| *hash);
+    let mut workers: Vec<u16> = groups
+        .iter()
+        .filter(|(hash, _)| Some(**hash) != majority)
+        .flat_map(|(_, workers)| workers.iter().copied())
+        .collect();
+    workers.sort_unstable();
+    Some(Anomaly {
+        kind: AnomalyKind::IdempotencyViolation,
+        severity: Severity::Fault,
+        detail: format!(
+            "{successes} 2xx responses to one Idempotency-Key carried {} distinct bodies; a deduplicating handler replays the first response",
+            groups.len()
+        ),
+        workers,
+    })
 }
 
 fn latency_stats(mut values: Vec<u64>) -> Option<LatencyStats> {
@@ -546,6 +635,7 @@ mod tests {
             body: None,
             timeout_ms: 5_000,
             expected_max_successes: None,
+            idempotency_mode: false,
         }
     }
 
@@ -570,6 +660,7 @@ mod tests {
             workers,
             wall_us: 1,
             expected_max_successes: None,
+            idempotency_key: None,
         }
     }
 
@@ -729,6 +820,53 @@ mod tests {
         assert_eq!(report.anomalies[0].severity, Severity::Warn);
     }
 
+    fn idempotent(workers: u16) -> ReportMeta {
+        ReportMeta {
+            idempotency_key: Some("k-1".to_owned()),
+            ..meta(workers)
+        }
+    }
+
+    #[test]
+    fn one_key_must_replay_one_body() {
+        let replays = || {
+            (1..=20)
+                .map(|w| sample(w, Some(201), 100, "order-1"))
+                .collect()
+        };
+        let report = analyze(idempotent(20), replays());
+        assert!(report.anomalies.is_empty(), "{:?}", report.anomalies);
+        assert_eq!(report.idempotency_key.as_deref(), Some("k-1"));
+
+        // In-flight duplicates refused with 409 next to replays of the stored response.
+        let mut mixed: Vec<WorkerSample> = (1..=3)
+            .map(|w| sample(w, Some(201), 100, "order-1"))
+            .collect();
+        mixed.extend((4..=20).map(|w| sample(w, Some(409), 100, "busy")));
+        assert!(analyze(idempotent(20), mixed).anomalies.is_empty());
+
+        let mut doubled: Vec<WorkerSample> = (1..=18)
+            .map(|w| sample(w, Some(201), 100, "order-1"))
+            .collect();
+        doubled.push(sample(19, Some(201), 100, "order-2"));
+        doubled.push(sample(20, Some(200), 100, "order-3"));
+        let report = analyze(idempotent(20), doubled);
+        assert_eq!(
+            kinds(&report),
+            [
+                AnomalyKind::IdempotencyViolation,
+                AnomalyKind::StatusDivergence
+            ]
+        );
+        let violation = &report.anomalies[0];
+        assert_eq!(violation.severity, Severity::Fault);
+        assert_eq!(violation.workers, [19, 20]);
+        assert_eq!(
+            violation.detail,
+            "20 2xx responses to one Idempotency-Key carried 3 distinct bodies; a deduplicating handler replays the first response"
+        );
+    }
+
     #[test]
     fn transport_errors_are_reported_and_excluded_from_latency() {
         let samples = vec![
@@ -790,6 +928,13 @@ mod tests {
                         value: "x".to_owned(),
                     }],
                     ..spec(ok.clone(), 1)
+                },
+                "INVALID_BURST_SPEC",
+            ),
+            (
+                BurstSpec {
+                    idempotency_mode: true,
+                    ..spec(ok.clone(), 2)
                 },
                 "INVALID_BURST_SPEC",
             ),
@@ -1005,6 +1150,52 @@ mod tests {
             .expect("race window anomaly");
         assert_eq!(race.workers, winners);
         assert_eq!(race.severity, Severity::Fault);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idempotency_mode_sends_one_key_from_every_worker() {
+        let keys: Arc<Mutex<Vec<String>>> = Arc::default();
+        let router = Router::new()
+            .fallback(
+                |State(keys): State<Arc<Mutex<Vec<String>>>>, request: Request| async move {
+                    let key = request
+                        .headers()
+                        .get(IDEMPOTENCY_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("-")
+                        .to_owned();
+                    keys.lock().unwrap().push(key);
+                    (StatusCode::CREATED, "order-1")
+                },
+            )
+            .with_state(Arc::clone(&keys));
+        let addr = serve(router).await;
+        let idempotent = |headers: Vec<HeaderPair>| BurstSpec {
+            method: BurstMethod::Post,
+            headers,
+            idempotency_mode: true,
+            ..spec(format!("http://127.0.0.1:{}/checkout", addr.port()), 12)
+        };
+
+        let report = run(idempotent(Vec::new()), &TelemetryHub::new())
+            .await
+            .unwrap();
+        let key = report.idempotency_key.clone().unwrap();
+        assert!(Uuid::parse_str(&key).is_ok(), "{key}");
+        assert!(report.anomalies.is_empty(), "{:?}", report.anomalies);
+        let seen = std::mem::take(&mut *keys.lock().unwrap());
+        assert_eq!(seen.len(), 12);
+        assert!(seen.iter().all(|k| *k == key), "{seen:?}");
+
+        let supplied = vec![HeaderPair {
+            name: "Idempotency-Key".to_owned(),
+            value: "retry-7".to_owned(),
+        }];
+        let report = run(idempotent(supplied), &TelemetryHub::new())
+            .await
+            .unwrap();
+        assert_eq!(report.idempotency_key.as_deref(), Some("retry-7"));
+        assert!(keys.lock().unwrap().iter().all(|k| k == "retry-7"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

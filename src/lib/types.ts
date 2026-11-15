@@ -92,6 +92,11 @@ export interface BurstSpec {
    * idempotent charge); more is a race window even without conflicts. `null`: no quota.
    */
   expectedMaxSuccesses: number | null;
+  /**
+   * Every worker sends one `Idempotency-Key` (a supplied header, else a generated UUID);
+   * 2xx responses must then carry one replayed body. POST, PUT and PATCH only.
+   */
+  idempotencyMode: boolean;
 }
 
 export interface WorkerSample {
@@ -126,7 +131,12 @@ export interface SizeStats {
   maxBytes: number;
 }
 
-export type AnomalyKind = "raceWindow" | "statusDivergence" | "bodyDivergence" | "transportErrors";
+export type AnomalyKind =
+  | "raceWindow"
+  | "statusDivergence"
+  | "bodyDivergence"
+  | "transportErrors"
+  | "idempotencyViolation";
 
 export type Severity = "warn" | "fault";
 
@@ -153,6 +163,8 @@ export interface BurstReport {
   distinctBodies: number;
   /** Quota the race analysis applied, echoed from the spec. */
   expectedMaxSuccesses: number | null;
+  /** Key every worker sent in idempotency mode. */
+  idempotencyKey: string | null;
   anomalies: Anomaly[];
   samples: WorkerSample[];
 }
@@ -501,6 +513,7 @@ export type TelemetryEvent =
       target: string;
       method: BurstMethod;
       workers: number;
+      idempotencyKey: string | null;
     }
   | {
       kind: "burstSample";

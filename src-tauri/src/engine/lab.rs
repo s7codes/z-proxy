@@ -9,8 +9,9 @@
 //! parameter with a 422 JSON body, and answers exactly as documented. The listener binds
 //! 127.0.0.1 only.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::hash::{DefaultHasher, Hasher};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{Path, Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -60,6 +61,10 @@ const HARDENED_MAX_DEPTH: usize = 8;
 const ORDER_ID_MAX: u64 = 999_999;
 /// Confirmed orders kept for lookup; the oldest is evicted first.
 const ORDER_RETENTION: usize = 1_024;
+const IDEMPOTENCY_HEADER: &str = "idempotency-key";
+const REPLAYED_HEADER: &str = "idempotent-replayed";
+/// Upper bound of an `Idempotency-Key`, as the IETF draft recommends for UUID-sized keys.
+const IDEMPOTENCY_KEY_MAX: usize = 255;
 /// Seeded history, so `GET /api/v1/orders/1` resolves on a fresh lab and a fuzz baseline
 /// with the default identifier is accepted.
 const ORDER_HISTORY: [(u64, &str, i64); 3] = [
@@ -108,6 +113,43 @@ struct Ledger {
     granted: u32,
     orders: u32,
     created: VecDeque<StoredOrder>,
+    /// Hardened checkout responses by `Idempotency-Key`, oldest evicted first.
+    replays: ReplayLog,
+}
+
+impl Ledger {
+    fn confirm(&mut self, order: StoredOrder) {
+        self.orders += 1;
+        if self.created.len() == ORDER_RETENTION {
+            self.created.pop_front();
+        }
+        self.created.push_back(order);
+    }
+}
+
+#[derive(Default)]
+struct ReplayLog {
+    by_key: HashMap<String, Replay>,
+    order: VecDeque<String>,
+}
+
+struct Replay {
+    /// SipHash of the request body the key was first used with.
+    fingerprint: u64,
+    body: String,
+}
+
+impl ReplayLog {
+    fn record(&mut self, key: &str, fingerprint: u64, body: String) {
+        if self.order.len() == ORDER_RETENTION {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_key.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.to_owned());
+        self.by_key
+            .insert(key.to_owned(), Replay { fingerprint, body });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -610,8 +652,15 @@ struct Leak {
     outcome: &'static str,
 }
 
-async fn checkout(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
+/// Unprotected ignores `Idempotency-Key`: a retried or duplicated checkout creates another
+/// order every time. Hardened stores the response per key and replays it.
+async fn checkout(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Bytes) -> Response {
     let mode = shared.mode();
+    if mode == LabMode::Hardened {
+        if let Some(key) = headers.get(IDEMPOTENCY_HEADER) {
+            return idempotent_checkout(&shared, key, &body);
+        }
+    }
     match evaluate_checkout(mode, &body) {
         Checkout::Created {
             sku,
@@ -625,16 +674,95 @@ async fn checkout(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
                 total_cents,
             };
             let body = order.to_json(mode);
-            {
-                let mut ledger = shared.ledger();
-                ledger.orders += 1;
-                if ledger.created.len() == ORDER_RETENTION {
-                    ledger.created.pop_front();
-                }
-                ledger.created.push_back(order);
-            }
+            shared.ledger().confirm(order);
             json_reply(StatusCode::CREATED, &body, "order confirmed")
         }
+        rejected => checkout_rejection(rejected),
+    }
+}
+
+/// Claim, create and record under one ledger lock: the equivalent of inserting the key with
+/// a unique constraint in the order's transaction, so concurrent duplicates replay the
+/// stored response instead of racing to create their own order.
+fn idempotent_checkout(shared: &Shared, key: &HeaderValue, body: &[u8]) -> Response {
+    let Some(key) = key
+        .to_str()
+        .ok()
+        .filter(|key| (1..=IDEMPOTENCY_KEY_MAX).contains(&key.len()))
+        .filter(|key| key.bytes().all(|b| b.is_ascii_graphic()))
+    else {
+        return json_reply(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &json!({
+                "error": "invalid_idempotency_key",
+                "reason": format!("1 to {IDEMPOTENCY_KEY_MAX} visible ASCII characters"),
+            }),
+            "rejected: invalid idempotency key",
+        );
+    };
+    let mut hasher = DefaultHasher::new();
+    hasher.write(body);
+    let fingerprint = hasher.finish();
+
+    let mut ledger = shared.ledger();
+    if let Some(stored) = ledger.replays.by_key.get(key) {
+        if stored.fingerprint != fingerprint {
+            return json_reply(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &json!({ "error": "idempotency_key_reused", "detail": "the key was first used with a different payload" }),
+                "rejected: idempotency key reused with another payload",
+            );
+        }
+        let mut response = reply(
+            StatusCode::CREATED,
+            "application/json",
+            stored.body.clone(),
+            "replayed: idempotency key seen",
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static(REPLAYED_HEADER),
+            HeaderValue::from_static("true"),
+        );
+        return response;
+    }
+    match evaluate_checkout(LabMode::Hardened, body) {
+        Checkout::Created {
+            sku,
+            quantity,
+            total_cents,
+        } => {
+            let order = StoredOrder {
+                id: shared.next_order.fetch_add(1, Ordering::SeqCst),
+                sku,
+                quantity,
+                total_cents,
+            };
+            let text = order.to_json(LabMode::Hardened).to_string();
+            ledger.confirm(order);
+            ledger.replays.record(key, fingerprint, text.clone());
+            drop(ledger);
+            reply(
+                StatusCode::CREATED,
+                "application/json",
+                text,
+                "order confirmed",
+            )
+        }
+        // Only completed orders are stored: a corrected retry under the same key proceeds.
+        rejected => {
+            drop(ledger);
+            checkout_rejection(rejected)
+        }
+    }
+}
+
+fn checkout_rejection(outcome: Checkout) -> Response {
+    match outcome {
+        Checkout::Created { .. } => json_reply(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({ "error": "unexpected_outcome" }),
+            "crash: created order routed as a rejection",
+        ),
         Checkout::Invalid(violations) => json_reply(
             StatusCode::UNPROCESSABLE_ENTITY,
             &validation_failed(&violations),
@@ -1369,6 +1497,13 @@ pub fn openapi_document(base_url: Option<&str>) -> String {
             "/api/v1/orders/checkout": {
                 "post": {
                     "summary": "Price and confirm an order",
+                    "parameters": [{
+                        "name": "Idempotency-Key",
+                        "in": "header",
+                        "required": false,
+                        "description": "Repeated requests with the same key replay the first response",
+                        "schema": { "type": "string", "minLength": 1, "maxLength": IDEMPOTENCY_KEY_MAX }
+                    }],
                     "requestBody": { "$ref": "#/components/requestBodies/Checkout" },
                     "responses": {
                         "201": body("Order confirmed", "Order"),
@@ -1889,6 +2024,7 @@ mod tests {
             timeout_ms: 10_000,
             // The coupon admits one use; the quota holds the hardened run to exactly that.
             expected_max_successes: Some(1),
+            idempotency_mode: false,
         }
     }
 
@@ -1955,6 +2091,74 @@ mod tests {
         assert!(report.anomalies.is_empty(), "{:?}", report.anomalies);
         assert_eq!(lab.status().await.counters.granted, 1);
 
+        lab.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn checkout_replays_one_idempotency_key_only_when_hardened() {
+        let (hub, lab, base) = started(LabMode::Unprotected).await;
+        let burst = || BurstSpec {
+            target: format!("{base}/api/v1/orders/checkout"),
+            method: BurstMethod::Post,
+            workers: 20,
+            headers: vec![HeaderPair {
+                name: "Content-Type".to_owned(),
+                value: "application/json".to_owned(),
+            }],
+            body: Some(CHECKOUT_SAMPLE.to_owned()),
+            timeout_ms: 10_000,
+            expected_max_successes: None,
+            idempotency_mode: true,
+        };
+        let created = |report: &crate::engine::types::BurstReport| {
+            report
+                .samples
+                .iter()
+                .filter(|s| s.status == Some(201))
+                .count()
+        };
+
+        let report = concurrency::run(burst(), &hub).await.unwrap();
+        assert!(report.idempotency_key.is_some());
+        assert_eq!(created(&report), 20, "{:?}", report.status_histogram);
+        assert_eq!(report.distinct_bodies, 20);
+        let violation = report
+            .anomalies
+            .iter()
+            .find(|a| a.kind == AnomalyKind::IdempotencyViolation)
+            .expect("idempotency violation");
+        assert_eq!(violation.severity, Severity::Fault);
+        assert_eq!(violation.workers.len(), 19);
+        assert_eq!(lab.status().await.counters.orders, 20);
+
+        lab.set_mode(LabMode::Hardened).await;
+        let report = concurrency::run(burst(), &hub).await.unwrap();
+        assert_eq!(created(&report), 20, "{:?}", report.status_histogram);
+        assert_eq!(report.distinct_bodies, 1);
+        assert!(report.anomalies.is_empty(), "{:?}", report.anomalies);
+        assert_eq!(lab.status().await.counters.orders, 1);
+
+        // The same key with another payload is refused, not replayed.
+        let key = report.idempotency_key.unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let reused = client
+            .post(format!("{base}/api/v1/orders/checkout"))
+            .header("Idempotency-Key", key.as_str())
+            .body(CHECKOUT_SAMPLE.replace(r#""quantity":2"#, r#""quantity":3"#))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let replayed = client
+            .post(format!("{base}/api/v1/orders/checkout"))
+            .header("Idempotency-Key", key.as_str())
+            .body(CHECKOUT_SAMPLE)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replayed.status(), StatusCode::CREATED);
+        assert_eq!(replayed.headers()[REPLAYED_HEADER], "true");
+        assert_eq!(lab.status().await.counters.orders, 1);
         lab.stop().await;
     }
 

@@ -234,7 +234,13 @@ function toRow(event: TelemetryEvent): Row {
         result: `${event.method} x${event.workers}`,
         resultTone: "muted",
         latency: "-",
-        detail: `run ${event.id.slice(0, 8)}  barrier armed`,
+        detail: [
+          `run ${event.id.slice(0, 8)}`,
+          "barrier armed",
+          event.idempotencyKey === null ? null : `idempotency-key ${event.idempotencyKey}`,
+        ]
+          .filter((part) => part !== null)
+          .join("  "),
       };
     case "burstSample": {
       const { sample } = event;
