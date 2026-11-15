@@ -31,8 +31,10 @@ import type {
 } from "./types";
 
 /** Version 2 added the passive traffic audit, contract drift, static route risks and the
- * idempotency replay summary. */
-export const AUDIT_SCHEMA = "z-proxy.audit/2";
+ * idempotency replay summary. Version 3 added the burst sync mode and burst contract drift,
+ * value-constraint violations, retry storms, latency regressions, mid-body drops in the
+ * fault profile, and route risks found in imported handlers (`routeFile` next to `file`). */
+export const AUDIT_SCHEMA = "z-proxy.audit/3";
 /** Findings listed in Markdown; the JSON rendering carries all of them. */
 const MARKDOWN_FINDINGS = 200;
 
@@ -100,6 +102,12 @@ export interface AuditFuzzDrift {
   violations: ContractViolation[];
 }
 
+export interface AuditBurstDrift {
+  worker: number;
+  status: number | null;
+  violations: ContractViolation[];
+}
+
 export interface AuditContracts {
   /** Contracts the proxy checked forwarded responses against. */
   proxyContracts: number;
@@ -107,14 +115,20 @@ export interface AuditContracts {
   /** Requests of the last fuzz suite, baseline included, whose response drifted. */
   fuzzRequests: number;
   fuzzCases: AuditFuzzDrift[];
+  /** Workers of the last burst whose response drifted under concurrent load. */
+  burstResponses: number;
+  burstWorkers: AuditBurstDrift[];
 }
 
 export interface AuditRouteRisk {
   kind: RouteRiskKind;
   method: RouteMethod;
   path: string;
+  /** File holding the evidence: the route's own, or the module its handler is imported from. */
   file: string;
   line: number;
+  /** File declaring the route. */
+  routeFile: string;
   evidence: string;
   detail: string;
 }
@@ -212,11 +226,16 @@ function buildContracts(inputs: AuditInputs): AuditContracts {
             status: result.status,
             violations: result.violations,
           }));
+  const burstWorkers = (inputs.burst?.samples ?? [])
+    .filter((sample) => sample.violations.length > 0)
+    .map((sample) => ({ worker: sample.worker, status: sample.status, violations: sample.violations }));
   return {
     proxyContracts: inputs.proxy?.contracts ?? 0,
     proxied: inputs.traffic.records.filter((record) => record.kind === "contractDrift"),
     fuzzRequests: fuzz?.contractViolations ?? 0,
     fuzzCases,
+    burstResponses: inputs.burst?.contractViolations ?? 0,
+    burstWorkers,
   };
 }
 
@@ -234,6 +253,7 @@ function buildRoutes(report: RouteScanReport | null): AuditRoutes | null {
         // An imported handler's evidence line belongs to its own module.
         file: risk.file ?? route.file,
         line: risk.line,
+        routeFile: route.file,
         evidence: risk.evidence,
         detail: risk.detail,
       });
@@ -470,10 +490,10 @@ function overview(report: AuditReport): string[][] {
   ]);
   rows.push([
     "Contract drift",
-    contracts.proxyContracts === 0 && contracts.fuzzCases.length === 0
+    contracts.proxyContracts === 0 && contracts.fuzzCases.length === 0 && contracts.burstResponses === 0
       ? "no response contracts in use"
       : cell(
-          `${count(contracts.proxied.length, "proxied violation")}, ${count(contracts.fuzzRequests, "fuzz request")} with drift`,
+          `${count(contracts.proxied.length, "proxied violation")}, ${count(contracts.fuzzRequests, "fuzz request")} and ${count(contracts.burstResponses, "burst response")} with drift`,
         ),
   ]);
   rows.push([
@@ -602,11 +622,18 @@ function renderMarkdown(report: AuditReport): string {
         ["Run", code(burst.id)],
         ["Request", `${burst.method} ${code(burst.target)}`],
         ["Workers", String(burst.workers)],
+        [
+          "Barrier sync",
+          burst.syncMode === "lastByte"
+            ? "last byte: every request byte but the final one written before release"
+            : "pre-connected: connections handshaken before release",
+        ],
         ["Success quota", burst.expectedMaxSuccesses === null ? "none" : `at most ${burst.expectedMaxSuccesses} 2xx`],
         ["Idempotency-Key", burst.idempotencyKey === null ? "not replayed" : `${code(burst.idempotencyKey)} from every worker`],
         ["Wall time", formatLatency(burst.wallUs)],
         ["Dispatch spread", burst.dispatchSpreadUs === null ? "-" : formatLatency(burst.dispatchSpreadUs)],
         ["Distinct bodies", String(burst.distinctBodies)],
+        ["Contract drift", `${burst.contractViolations} of ${total} responses`],
         [
           "Response size",
           burst.size === null
@@ -769,17 +796,37 @@ function renderTraffic(traffic: AuditTraffic, push: Push): void {
 
 function renderContracts(contracts: AuditContracts, push: Push): void {
   push("## Contract drift");
-  if (contracts.proxyContracts === 0 && contracts.fuzzCases.length === 0 && contracts.proxied.length === 0) {
+  if (
+    contracts.proxyContracts === 0 &&
+    contracts.fuzzCases.length === 0 &&
+    contracts.proxied.length === 0 &&
+    contracts.burstWorkers.length === 0
+  ) {
     push("No OpenAPI response contracts were in use: scan an OpenAPI document or load the lab target.");
     return;
   }
   push(
+    "Types, required fields and value constraints (bounds, length, enum, uuid / email / date-time / date formats) of the documented success body; undocumented 2xx and 4xx statuses.",
     fields([
       ["Proxy contracts", String(contracts.proxyContracts)],
       ["Proxied violations", String(contracts.proxied.length)],
       ["Fuzz requests with drift", String(contracts.fuzzRequests)],
+      ["Burst responses with drift", String(contracts.burstResponses)],
     ]),
   );
+  if (contracts.burstWorkers.length > 0) {
+    push(
+      "### Burst responses",
+      table(
+        ["Worker", "Status", "Violations"],
+        contracts.burstWorkers.slice(0, MARKDOWN_FINDINGS).map((drift) => [
+          `w${drift.worker}`,
+          drift.status === null ? "-" : String(drift.status),
+          cell(drift.violations.map(describeViolation).join("; ")),
+        ]),
+      ),
+    );
+  }
   if (contracts.proxied.length > 0) {
     push(
       "### Proxied responses",
@@ -826,16 +873,21 @@ function renderRoutes(routes: AuditRoutes | null, push: Push): void {
     ]),
   );
   if (routes.risks.length === 0) {
-    push("No unvalidated mutations, unbounded queries or floating async calls found.");
+    push(
+      "No unvalidated mutations, unbounded queries, floating async calls, non-atomic writes or interpolated SQL found.",
+    );
     return;
   }
   push(
+    "Locations in another file than the route's are handlers imported from that module.",
     table(
       ["Kind", "Route", "Location", "Evidence", "Detail"],
       routes.risks.slice(0, MARKDOWN_FINDINGS).map((risk) => [
         code(risk.kind),
         code(`${risk.method} ${risk.path}`),
-        code(`${risk.file}:${risk.line}`),
+        risk.file === risk.routeFile
+          ? code(`${risk.file}:${risk.line}`)
+          : `${code(`${risk.file}:${risk.line}`)} via ${code(risk.routeFile)}`,
         code(risk.evidence),
         cell(risk.detail),
       ]),
