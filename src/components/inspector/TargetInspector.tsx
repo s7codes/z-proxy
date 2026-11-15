@@ -1,10 +1,13 @@
 import type { Ref } from "react";
 import type { EngineLink } from "../../hooks/useEngineStatus";
 import type { GuardState } from "../../hooks/useGuardValidator";
+import type { LabControl } from "../../hooks/useLab";
 import type { RouteScanControl } from "../../hooks/useRouteScan";
+import { TONE_TEXT } from "../../lib/tone";
 import type { DiscoveredRoute } from "../../lib/types";
 import { PanelHeader, Section } from "../shell/PanelHeader";
 import { GuardValidator } from "./GuardValidator";
+import { LAB_MODE_TONE, LabPanel } from "./LabPanel";
 import { RouteList } from "./RouteList";
 
 const FALLBACK_ALLOWLIST = ["127.0.0.1", "::1", "localhost"] as const;
@@ -18,6 +21,8 @@ interface TargetInspectorProps {
   scan: RouteScanControl;
   selectedRoute: DiscoveredRoute | null;
   onSelectRoute: (route: DiscoveredRoute) => void;
+  lab: LabControl;
+  onLoadLab: () => void;
 }
 
 export function TargetInspector({
@@ -29,7 +34,10 @@ export function TargetInspector({
   scan,
   selectedRoute,
   onSelectRoute,
+  lab,
+  onLoadLab,
 }: TargetInspectorProps) {
+  const labMode = lab.status?.mode ?? null;
   const online = link.state === "online";
   const allowlist = online ? link.status.allowlist : FALLBACK_ALLOWLIST;
 
@@ -53,6 +61,17 @@ export function TargetInspector({
               </li>
             ))}
           </ul>
+        </Section>
+
+        <Section
+          title="Target Lab"
+          aside={
+            labMode === null ? undefined : (
+              <span className={`num text-2xs ${TONE_TEXT[LAB_MODE_TONE[labMode]]}`}>{labMode}</span>
+            )
+          }
+        >
+          <LabPanel lab={lab} online={online} onLoadTarget={onLoadLab} />
         </Section>
       </div>
 

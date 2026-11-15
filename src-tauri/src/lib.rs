@@ -38,6 +38,12 @@ pub fn run() {
             commands::cancel_fuzzer_suite,
             commands::scan_project_routes,
             commands::pick_project_root,
+            commands::start_lab_server,
+            commands::stop_lab_server,
+            commands::set_lab_mode,
+            commands::reset_lab_state,
+            commands::get_lab_status,
+            commands::get_lab_routes,
         ])
         .run(tauri::generate_context!());
 

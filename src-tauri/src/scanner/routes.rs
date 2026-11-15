@@ -239,6 +239,37 @@ impl Scan {
     }
 }
 
+/// Routes of an in-memory OpenAPI JSON document, reported like a one-file scan rooted at
+/// `root`. Used for specs the engine serves itself, which have no file on disk.
+pub fn spec_report(root: &str, file: &str, document: &str) -> RouteScanReport {
+    let started = Instant::now();
+    let (routes, issues) = match openapi::from_json(document) {
+        Ok(raw) => (
+            raw.into_iter()
+                .map(|route| discovered(route, file))
+                .collect(),
+            Vec::new(),
+        ),
+        Err(reason) => (
+            Vec::new(),
+            vec![ScanIssue {
+                file: file.to_owned(),
+                reason,
+            }],
+        ),
+    };
+    RouteScanReport {
+        id: Uuid::new_v4(),
+        root: root.to_owned(),
+        files_visited: 1,
+        files_parsed: 1,
+        elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        truncated: false,
+        routes,
+        issues,
+    }
+}
+
 pub fn discovered(route: RawRoute, file: &str) -> DiscoveredRoute {
     let (path, params) = normalize_path(&route.path);
     let prefix = route
@@ -605,6 +636,53 @@ mod tests {
         assert_eq!(route.params, ["org", "id"]);
         assert_eq!(route.prefix.as_deref(), Some("/orgs/{org}/users"));
         assert_eq!((route.file.as_str(), route.line), ("api/server.js", 3));
+    }
+
+    #[test]
+    fn lab_document_reports_routes_with_synthesized_bodies() {
+        let document = crate::engine::lab::openapi_document(Some("http://127.0.0.1:17480"));
+        let report = spec_report("target-lab", "openapi.json", &document);
+        assert!(report.issues.is_empty());
+        let listed: Vec<String> = report
+            .routes
+            .iter()
+            .map(|r| {
+                let method = serde_json::to_value(r.method).unwrap();
+                format!("{} {}", method.as_str().unwrap(), r.path)
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                "GET /api/v1/health",
+                "POST /api/v1/coupons/redeem",
+                "POST /api/v1/orders/checkout",
+                "GET /api/v1/lab/openapi.json",
+            ]
+        );
+        let body = |path: &str| -> serde_json::Value {
+            let route = report.routes.iter().find(|r| r.path == path).unwrap();
+            serde_json::from_str(route.sample_body.as_deref().unwrap()).unwrap()
+        };
+        assert_eq!(
+            body("/api/v1/coupons/redeem"),
+            serde_json::json!({ "code": "LAB-SINGLE-USE", "userId": "u-1001" })
+        );
+        // `orderId` is readOnly and must not appear in the request sample.
+        assert_eq!(
+            body("/api/v1/orders/checkout"),
+            serde_json::json!({
+                "sku": "LAB-KB-01",
+                "quantity": 2,
+                "customer": { "email": "operator@lab.local", "name": "Lab Operator" },
+                "note": "leave at loading dock",
+                "giftWrap": false
+            })
+        );
+        assert!(report
+            .routes
+            .iter()
+            .all(|r| r.file == "openapi.json" && r.line > 1));
     }
 
     #[test]

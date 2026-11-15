@@ -9,6 +9,9 @@ import type {
   FaultRule,
   FuzzReport,
   FuzzSpec,
+  LabConfig,
+  LabMode,
+  LabStatus,
   ProxyConfig,
   ProxyStatus,
   RouteScanReport,
@@ -41,6 +44,7 @@ const ENGINE_CODES: ReadonlySet<string> = new Set<EngineErrorCode>([
   "INVALID_FUZZ_SPEC",
   "FUZZER_BUSY",
   "INVALID_SCAN_ROOT",
+  "LAB_ALREADY_RUNNING",
   "INTERNAL_TASK_FAILED",
 ]);
 
@@ -125,6 +129,32 @@ export function scanProjectRoutes(root: string): Promise<IpcResult<RouteScanRepo
 /** Resolves to `null` when the operator cancels the dialog. */
 export function pickProjectRoot(): Promise<IpcResult<string | null>> {
   return call<string | null>("pick_project_root");
+}
+
+export function startLabServer(config: LabConfig): Promise<IpcResult<LabStatus>> {
+  return call<LabStatus>("start_lab_server", { config });
+}
+
+export function stopLabServer(): Promise<IpcResult<LabStatus>> {
+  return call<LabStatus>("stop_lab_server");
+}
+
+/** Applies on the next request without a restart; clears the coupon ledger. */
+export function setLabMode(mode: LabMode): Promise<IpcResult<LabStatus>> {
+  return call<LabStatus>("set_lab_mode", { mode });
+}
+
+export function resetLabState(): Promise<IpcResult<LabStatus>> {
+  return call<LabStatus>("reset_lab_state");
+}
+
+export function getLabStatus(): Promise<IpcResult<LabStatus>> {
+  return call<LabStatus>("get_lab_status");
+}
+
+/** Routes parsed from the lab's own OpenAPI document, shaped like a scan report. */
+export function getLabRoutes(): Promise<IpcResult<RouteScanReport>> {
+  return call<RouteScanReport>("get_lab_routes");
 }
 
 export interface TelemetrySubscription {

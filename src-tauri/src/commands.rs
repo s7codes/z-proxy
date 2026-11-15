@@ -8,14 +8,19 @@ use crate::engine::error::EngineError;
 use crate::engine::fault::{FaultProfile, FaultRule};
 use crate::engine::fuzzer;
 use crate::engine::guard;
+use crate::engine::lab;
 use crate::engine::net;
 use crate::engine::types::{
-    BurstReport, BurstSpec, EngineStatus, FuzzReport, FuzzSpec, ProbeResult, ProxyConfig,
-    ProxyStatus, RouteScanReport, TelemetryEvent, ValidatedTarget, Verdict,
+    BurstReport, BurstSpec, EngineStatus, FuzzReport, FuzzSpec, LabConfig, LabMode, LabStatus,
+    ProbeResult, ProxyConfig, ProxyStatus, RouteScanReport, TelemetryEvent, ValidatedTarget,
+    Verdict,
 };
 use crate::scanner::routes;
 use crate::state::AppState;
 use crate::telemetry::{now_us, uptime_ms};
+
+/// Root label of the lab's route report; it has no directory on disk.
+const LAB_ROOT: &str = "target-lab";
 
 #[tauri::command]
 pub async fn validate_target(
@@ -190,6 +195,47 @@ pub async fn scan_project_routes(
         "route scan completed"
     );
     Ok(report)
+}
+
+#[tauri::command]
+pub async fn start_lab_server(
+    state: State<'_, AppState>,
+    config: LabConfig,
+) -> Result<LabStatus, EngineError> {
+    state.lab.start(config).await
+}
+
+#[tauri::command]
+pub async fn stop_lab_server(state: State<'_, AppState>) -> Result<LabStatus, EngineError> {
+    Ok(state.lab.stop().await)
+}
+
+/// Takes effect on the next request without a restart; clears the coupon ledger.
+#[tauri::command]
+pub async fn set_lab_mode(
+    state: State<'_, AppState>,
+    mode: LabMode,
+) -> Result<LabStatus, EngineError> {
+    Ok(state.lab.set_mode(mode).await)
+}
+
+#[tauri::command]
+pub async fn reset_lab_state(state: State<'_, AppState>) -> Result<LabStatus, EngineError> {
+    Ok(state.lab.reset().await)
+}
+
+#[tauri::command]
+pub async fn get_lab_status(state: State<'_, AppState>) -> Result<LabStatus, EngineError> {
+    Ok(state.lab.status().await)
+}
+
+/// The lab's routes, parsed from the OpenAPI document it serves, so the route list and the
+/// request panels treat it like any scanned project.
+#[tauri::command]
+pub async fn get_lab_routes(state: State<'_, AppState>) -> Result<RouteScanReport, EngineError> {
+    let status = state.lab.status().await;
+    let document = lab::openapi_document(status.base_url.as_deref());
+    Ok(routes::spec_report(LAB_ROOT, lab::SPEC_FILE, &document))
 }
 
 /// Native folder picker. Opened from Rust so the webview needs no `dialog:*` capability;

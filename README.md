@@ -33,11 +33,14 @@ src-tauri/
   src/engine/http1.rs      Guarded HTTP/1.1 request template, connect and exchange
   src/engine/concurrency.rs  Burst runner and report analysis
   src/engine/fuzzer.rs     Mutation case generation, sequential runner, verdicts
+  src/engine/disclosure.rs Stack trace and database error signatures in response bodies
+  src/engine/lab.rs        Embedded target lab service (unprotected / hardened)
   src/engine/error.rs      EngineError, serialized as { code, message, ... }
   src/engine/types.rs      IPC DTOs and TelemetryEvent
   src/scanner/routes.rs    Project walk, path normalization, scan report
   src/scanner/lex.rs       Comment masking, string spans, bracket matching
-  src/scanner/{next,node,axum,go,openapi}.rs  Per-framework extractors
+  src/scanner/{next,node,axum,go,openapi}.rs  Per-framework extractors, mount prefixes
+  src/scanner/schema.rs    OpenAPI request body sample synthesis
 ```
 
 ## Loopback guard
@@ -234,6 +237,55 @@ keywords, and accept JSON-escaped (`\n`) traces:
 Runtime traces take precedence over database errors found in the same body. The report counts
 affected mutation cases in `disclosures`; a disclosing baseline is reported as a note.
 
+## Target lab
+
+An embedded Axum service (`engine/lab.rs`) that gives the burst runner, fuzzer and proxy a
+known target. It binds `127.0.0.1:17480`, or an ephemeral port when 17480 is taken (an
+explicit port is bound exactly and fails with `LISTENER_BIND_FAILED`). The mode switches at
+runtime without a restart and clears the coupon ledger, so both modes are observed from the
+same state.
+
+| Route                           | `unprotected`                                             | `hardened`                                   |
+|---------------------------------|-----------------------------------------------------------|----------------------------------------------|
+| `POST /api/v1/coupons/redeem`   | Reads the coupon's use count, waits 60 ms (provider call), writes back `read + 1` | Check and increment under one lock, then the provider call |
+| `POST /api/v1/orders/checkout`  | Unvalidated input reaches failing code; the failure is serialized into the response | Every invalid input: 422 `{ error, violations[] }` |
+| `GET /api/v1/health`            | `{ status, mode }`                                        | same                                         |
+| `GET /api/v1/lab/openapi.json`  | OpenAPI 3.1 document of the above                         | same                                         |
+
+Coupon `LAB-SINGLE-USE` admits one redemption. Each redemption in flight adds 5 ms of lookup
+latency (a saturated pool), which spreads a burst's reads across the 60 ms commit window: in
+`unprotected` mode the early reads all pass the check (several 200) and the late ones see the
+write (409), which the burst analyzer reports as `raceWindow`. The written count stays at 1
+(lost update) while `granted` counts every 200. In `hardened` mode exactly one request gets
+200 and the rest 409. The window is wider than Windows' 15.6 ms timer resolution, so the
+outcome does not depend on timer precision; with 17 or more workers at least one conflict is
+guaranteed.
+
+Unprotected checkout failures, by input:
+
+| Input                                                     | Response                                         |
+|-----------------------------------------------------------|--------------------------------------------------|
+| Malformed JSON                                            | 400 with a body-parser `SyntaxError` stack trace |
+| Missing or `null` field, `null` note, non-object root     | 500 Node.js `TypeError` stack trace              |
+| Non-string `sku`, `sku` containing `'`                    | 500 MySQL driver error object with the query     |
+| String `quantity` (`"NaN"`, `"1"`)                        | 500 PostgreSQL `invalid input syntax` error      |
+| Negative `quantity`                                       | 500 Go panic with goroutine dump                 |
+| `quantity` above 10 000                                   | 500 Rust panic (index out of bounds)             |
+| String above column length (sku 64, email 254, name 64, note 256) | 500 Python traceback ending in psycopg2 `StringDataRightTruncation` |
+| `quantity` 0, empty email or name, unknown fields         | 201 (accepted without validation)                |
+
+Hardened checkout enforces the documented schema: `sku` `^[A-Z0-9-]{1,32}$` and in the
+catalog, `quantity` integer 1-10 000, `customer.email` and `customer.name` required, `note`
+optional string up to 256, `giftWrap` optional boolean, unknown fields rejected, body at
+most 32 KiB.
+
+"Load Lab Target" in the inspector sets the lab as the validated target (so the proxy
+upstream and the Burst/Fuzzer origin follow), replaces the route list with the routes parsed
+from the lab's OpenAPI document (`get_lab_routes`, through the same OpenAPI extractor and
+body synthesis as a scanned project), preselects the redeem route with its sample body and
+opens the Burst tab. Every request the lab serves is reported as a `labExchange` event with
+the handler outcome and live counters.
+
 ## IPC
 
 | Command                  | Arguments                                   | Returns            |
@@ -252,11 +304,18 @@ affected mutation cases in `disclosures`; a disclosing baseline is reported as a
 | `cancel_fuzzer_suite`    | none                                        | `boolean`          |
 | `scan_project_routes`    | `root: string`                              | `RouteScanReport`  |
 | `pick_project_root`      | none                                        | `string \| null`   |
+| `start_lab_server`       | `config: LabConfig`                         | `LabStatus`        |
+| `stop_lab_server`        | none                                        | `LabStatus`        |
+| `set_lab_mode`           | `mode: "unprotected" \| "hardened"`         | `LabStatus`        |
+| `reset_lab_state`        | none                                        | `LabStatus`        |
+| `get_lab_status`         | none                                        | `LabStatus`        |
+| `get_lab_routes`         | none                                        | `RouteScanReport`  |
 
 Telemetry is pushed over `tauri::ipc::Channel<TelemetryEvent>`; the UI does not poll.
 Event kinds: `engineHeartbeat` (1 Hz), `guardDecision`, `probeCompleted`,
 `proxyStateChanged`, `proxyExchange`, `burstStarted`, `burstSample`, `burstCompleted`,
-`fuzzerStarted`, `fuzzerCaseCompleted`, `fuzzerCompleted`, `routeScanCompleted`.
+`fuzzerStarted`, `fuzzerCaseCompleted`, `fuzzerCompleted`, `routeScanCompleted`,
+`labStateChanged`, `labExchange`.
 
 ## Requirements
 

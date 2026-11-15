@@ -48,6 +48,9 @@ pub enum EngineError {
     #[error("cannot scan `{path}`: {reason}")]
     InvalidScanRoot { path: String, reason: String },
 
+    #[error("target lab is already running on {listener}")]
+    LabAlreadyRunning { listener: String },
+
     #[error("engine task failed: {reason}")]
     InternalTask { reason: String },
 }
@@ -69,6 +72,7 @@ impl EngineError {
             Self::InvalidFuzzSpec { .. } => "INVALID_FUZZ_SPEC",
             Self::FuzzerBusy => "FUZZER_BUSY",
             Self::InvalidScanRoot { .. } => "INVALID_SCAN_ROOT",
+            Self::LabAlreadyRunning { .. } => "LAB_ALREADY_RUNNING",
             Self::InternalTask { .. } => "INTERNAL_TASK_FAILED",
         }
     }
@@ -85,7 +89,9 @@ impl Serialize for EngineError {
             Self::UnsupportedScheme { scheme } | Self::PlaintextOnly { scheme } => {
                 s.serialize_field("scheme", scheme)?
             }
-            Self::ProxyAlreadyRunning { listener } => s.serialize_field("listener", listener)?,
+            Self::ProxyAlreadyRunning { listener } | Self::LabAlreadyRunning { listener } => {
+                s.serialize_field("listener", listener)?
+            }
             Self::ListenerBind { addr, .. } | Self::ProxyLoop { addr } => {
                 s.serialize_field("addr", addr)?
             }

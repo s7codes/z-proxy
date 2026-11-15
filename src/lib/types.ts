@@ -272,6 +272,35 @@ export interface RouteScanReport {
   issues: ScanIssue[];
 }
 
+// ---- target lab -----------------------------------------------------------------------
+
+export type LabMode = "unprotected" | "hardened";
+
+export interface LabConfig {
+  /** `null` tries 17480, then an ephemeral port; `0` is ephemeral. */
+  port: number | null;
+  mode: LabMode;
+}
+
+export interface LabCounters {
+  /** Uses recorded on the coupon row; a lost update keeps it at the limit. */
+  redeemed: number;
+  /** Redemptions answered with 200; above the limit means the race was won twice. */
+  granted: number;
+  orders: number;
+  requests: number;
+}
+
+export interface LabStatus {
+  running: boolean;
+  listener: string | null;
+  baseUrl: string | null;
+  mode: LabMode;
+  couponCode: string;
+  couponLimit: number;
+  counters: LabCounters;
+}
+
 // ---- telemetry ------------------------------------------------------------------------
 
 export type TelemetryEvent =
@@ -392,6 +421,25 @@ export type TelemetryEvent =
       warnings: number;
       disclosures: number;
       aborted: string | null;
+    }
+  | {
+      kind: "labStateChanged";
+      seq: number;
+      tsUs: number;
+      status: LabStatus;
+    }
+  | {
+      kind: "labExchange";
+      seq: number;
+      id: string;
+      tsUs: number;
+      method: string;
+      path: string;
+      status: number;
+      latencyUs: number;
+      mode: LabMode;
+      outcome: string;
+      counters: LabCounters;
     };
 
 export type TelemetryKind = TelemetryEvent["kind"];
@@ -415,6 +463,7 @@ export type EngineErrorCode =
   | "INVALID_FUZZ_SPEC"
   | "FUZZER_BUSY"
   | "INVALID_SCAN_ROOT"
+  | "LAB_ALREADY_RUNNING"
   | "INTERNAL_TASK_FAILED";
 
 export type EngineError =
@@ -432,4 +481,5 @@ export type EngineError =
   | { code: "INVALID_FUZZ_SPEC"; message: string; field: string }
   | { code: "FUZZER_BUSY"; message: string }
   | { code: "INVALID_SCAN_ROOT"; message: string; path: string }
+  | { code: "LAB_ALREADY_RUNNING"; message: string; listener: string }
   | { code: "INTERNAL_TASK_FAILED"; message: string };

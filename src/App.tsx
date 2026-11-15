@@ -9,9 +9,11 @@ import {
   PanelLeft,
   PanelRight,
   Pause,
+  Play,
   Power,
   RefreshCw,
   RotateCcw,
+  ShieldCheck,
   Square,
   Trash2,
 } from "lucide-react";
@@ -27,6 +29,7 @@ import { useBurst } from "./hooks/useBurst";
 import { useEngineStatus } from "./hooks/useEngineStatus";
 import { useFuzzer } from "./hooks/useFuzzer";
 import { useGuardValidator } from "./hooks/useGuardValidator";
+import { useLab } from "./hooks/useLab";
 import { sameProfile, useProxy } from "./hooks/useProxy";
 import { useRouteScan } from "./hooks/useRouteScan";
 import { useTelemetry } from "./hooks/useTelemetry";
@@ -35,6 +38,7 @@ import type { DiscoveredRoute, FaultProfile } from "./lib/types";
 
 // Slider drags emit a value per pixel; one IPC round trip per settled position is enough.
 const PROFILE_PUSH_MS = 150;
+const LAB_RACE_PATH = "/api/v1/coupons/redeem";
 
 export function App() {
   const [targetInput, setTargetInput] = useState("http://127.0.0.1:3000");
@@ -48,6 +52,7 @@ export function App() {
   const burst = useBurst();
   const fuzzer = useFuzzer();
   const routeScan = useRouteScan();
+  const lab = useLab(telemetry.latestLabState, telemetry.latestLabExchange);
   const [chaosTab, setChaosTab] = useState<ChaosTab>("faults");
   const [selectedRoute, setSelectedRoute] = useState<DiscoveredRoute | null>(null);
   const [requestTarget, setRequestTarget] = useState<RequestTarget>({ method: "POST", path: "/" });
@@ -87,6 +92,27 @@ export function App() {
   const chaosRef = useRef<PanelImperativeHandle | null>(null);
   const telemetryRef = useRef<PanelImperativeHandle | null>(null);
 
+  // The lab becomes the validated target, so the proxy upstream and the Burst/Fuzzer origin
+  // follow from the guard; its routes replace the list and the race-prone redeem route is
+  // preselected with its OpenAPI sample body.
+  const { adopt: adoptRoutes } = routeScan;
+  const { loadRoutes: loadLabRoutes } = lab;
+  const labBaseUrl = lab.status?.baseUrl ?? null;
+  const loadLabTarget = useCallback(() => {
+    if (labBaseUrl === null) return;
+    void loadLabRoutes().then((report) => {
+      if (report === null) return;
+      setTargetInput(labBaseUrl);
+      adoptRoutes(report);
+      const redeem = report.routes.find((route) => route.method === "POST" && route.path === LAB_RACE_PATH);
+      const first = redeem ?? report.routes[0];
+      if (first !== undefined) selectRoute(first);
+      inspectorRef.current?.expand();
+      chaosRef.current?.expand();
+      setChaosTab("burst");
+    });
+  }, [labBaseUrl, loadLabRoutes, adoptRoutes, selectRoute]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
@@ -101,7 +127,36 @@ export function App() {
   const { setPaused, paused, clear } = telemetry;
   const { scan: scanRoutes, browse: browseRoot, root: scanRoot } = routeScan;
   const { running: fuzzing, cancel: cancelFuzzer } = fuzzer;
+  const { status: labStatus, start: startLab, stop: stopLab, setMode: setLabMode, reset: resetLab } = lab;
   const commands = useMemo<PaletteCommand[]>(() => {
+    const labCommands: PaletteCommand[] =
+      labStatus === null
+        ? []
+        : labStatus.running
+          ? [
+              { id: "load-lab", group: "Target Lab", label: "Load lab target", icon: Crosshair, run: loadLabTarget },
+              {
+                id: "lab-mode",
+                group: "Target Lab",
+                label: labStatus.mode === "hardened" ? "Switch lab to unprotected" : "Switch lab to hardened",
+                icon: ShieldCheck,
+                run: () => setLabMode(labStatus.mode === "hardened" ? "unprotected" : "hardened"),
+              },
+              { id: "reset-lab", group: "Target Lab", label: "Reset lab state", icon: RotateCcw, run: resetLab },
+              { id: "stop-lab", group: "Target Lab", label: "Stop target lab", icon: Square, run: stopLab },
+            ]
+          : [
+              {
+                id: "start-lab",
+                group: "Target Lab",
+                label: "Start target lab",
+                icon: Play,
+                run: () => {
+                  inspectorRef.current?.expand();
+                  startLab(labStatus.mode);
+                },
+              },
+            ];
     const toggle = (ref: React.RefObject<PanelImperativeHandle | null>) => () => {
       const panel = ref.current;
       if (panel === null) return;
@@ -132,6 +187,7 @@ export function App() {
       ...(scanRoot.trim() === ""
         ? []
         : [{ id: "scan-routes", group: "Routes", label: "Rescan project routes", icon: RefreshCw, run: () => scanRoutes() }]),
+      ...labCommands,
       {
         id: "open-fuzzer",
         group: "Fuzzer",
@@ -179,6 +235,12 @@ export function App() {
     browseRoot,
     fuzzing,
     cancelFuzzer,
+    labStatus,
+    startLab,
+    stopLab,
+    setLabMode,
+    resetLab,
+    loadLabTarget,
   ]);
 
   // The endpoint node reflects the last fuzz report only while it still describes the
@@ -225,6 +287,8 @@ export function App() {
             scan={routeScan}
             selectedRoute={selectedRoute}
             onSelectRoute={selectRoute}
+            lab={lab}
+            onLoadLab={loadLabTarget}
           />
         }
         topology={

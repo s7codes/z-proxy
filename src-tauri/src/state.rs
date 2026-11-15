@@ -5,6 +5,7 @@ use reqwest::Client;
 
 use crate::engine::error::EngineResult;
 use crate::engine::fuzzer::FuzzerSlot;
+use crate::engine::lab::LabServer;
 use crate::engine::net;
 use crate::engine::proxy::ProxyManager;
 use crate::telemetry::TelemetryHub;
@@ -15,6 +16,7 @@ pub struct AppState {
     pub probe_client: Client,
     pub proxy: ProxyManager,
     pub fuzzer: FuzzerSlot,
+    pub lab: LabServer,
 }
 
 impl AppState {
@@ -23,6 +25,7 @@ impl AppState {
         Ok(Self {
             started_at: Instant::now(),
             proxy: ProxyManager::new(Arc::clone(&hub))?,
+            lab: LabServer::new(Arc::clone(&hub)),
             hub,
             probe_client: net::probe_client()?,
             fuzzer: FuzzerSlot::default(),

@@ -21,6 +21,8 @@ export interface TelemetryStore {
   events: readonly TelemetryEvent[];
   latestHeartbeat: TelemetryEventOf<"engineHeartbeat"> | null;
   latestProxyState: TelemetryEventOf<"proxyStateChanged"> | null;
+  latestLabState: TelemetryEventOf<"labStateChanged"> | null;
+  latestLabExchange: TelemetryEventOf<"labExchange"> | null;
   fuzzerProgress: FuzzerProgress | null;
   paused: boolean;
   setPaused: (paused: boolean) => void;
@@ -61,6 +63,8 @@ export function useTelemetry(): TelemetryStore {
   const [events, setEvents] = useState<readonly TelemetryEvent[]>([]);
   const [latestHeartbeat, setLatestHeartbeat] = useState<TelemetryStore["latestHeartbeat"]>(null);
   const [latestProxyState, setLatestProxyState] = useState<TelemetryStore["latestProxyState"]>(null);
+  const [latestLabState, setLatestLabState] = useState<TelemetryStore["latestLabState"]>(null);
+  const [latestLabExchange, setLatestLabExchange] = useState<TelemetryStore["latestLabExchange"]>(null);
   const [fuzzerProgress, setFuzzerProgress] = useState<FuzzerProgress | null>(null);
   const [paused, setPaused] = useState(false);
   const [totalReceived, setTotalReceived] = useState(0);
@@ -86,6 +90,10 @@ export function useTelemetry(): TelemetryStore {
       // not just the log.
       const proxyState = findLast(batch, "proxyStateChanged");
       if (proxyState !== null) setLatestProxyState(proxyState);
+      const labState = findLast(batch, "labStateChanged");
+      if (labState !== null) setLatestLabState(labState);
+      const labExchange = findLast(batch, "labExchange");
+      if (labExchange !== null) setLatestLabExchange(labExchange);
       if (batch.some((event) => event.kind.startsWith("fuzzer"))) {
         setFuzzerProgress((progress) => foldFuzzer(progress, batch));
       }
@@ -108,5 +116,16 @@ export function useTelemetry(): TelemetryStore {
     setEvents([]);
   }, []);
 
-  return { events, latestHeartbeat, latestProxyState, fuzzerProgress, paused, setPaused, clear, totalReceived };
+  return {
+    events,
+    latestHeartbeat,
+    latestProxyState,
+    latestLabState,
+    latestLabExchange,
+    fuzzerProgress,
+    paused,
+    setPaused,
+    clear,
+    totalReceived,
+  };
 }

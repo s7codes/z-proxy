@@ -389,6 +389,51 @@ pub struct RouteScanReport {
     pub issues: Vec<ScanIssue>,
 }
 
+// ---- target lab -----------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LabMode {
+    /// Check-then-act coupon redemption; unvalidated checkout input leaks traces.
+    #[default]
+    Unprotected,
+    /// Conditional-update redemption; every invalid checkout is a 422.
+    Hardened,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LabConfig {
+    /// `None` tries 17480, then an ephemeral port; `Some(0)` is ephemeral; any other value
+    /// is bound exactly.
+    pub port: Option<u16>,
+    pub mode: LabMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabCounters {
+    /// Uses recorded on the coupon row. A lost update under the race keeps it at the limit.
+    pub redeemed: u32,
+    /// Redemptions answered with 200; above the limit means the race was won more than once.
+    pub granted: u32,
+    pub orders: u32,
+    pub requests: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabStatus {
+    pub running: bool,
+    pub listener: Option<String>,
+    /// `http://127.0.0.1:<port>`; `None` while stopped.
+    pub base_url: Option<String>,
+    pub mode: LabMode,
+    pub coupon_code: &'static str,
+    pub coupon_limit: u32,
+    pub counters: LabCounters,
+}
+
 // ---- telemetry ------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
@@ -506,5 +551,25 @@ pub enum TelemetryEvent {
         warnings: u32,
         disclosures: u32,
         aborted: Option<String>,
+    },
+    /// Lab start, stop, mode switch and reset.
+    LabStateChanged {
+        seq: u64,
+        ts_us: u64,
+        status: LabStatus,
+    },
+    /// One per request the lab served, as the service saw it.
+    LabExchange {
+        seq: u64,
+        id: Uuid,
+        ts_us: u64,
+        method: String,
+        path: String,
+        status: u16,
+        latency_us: u64,
+        mode: LabMode,
+        /// What the handler did: `granted`, `conflict: coupon exhausted`, `crash: rust panic`.
+        outcome: String,
+        counters: LabCounters,
     },
 }

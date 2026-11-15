@@ -306,6 +306,33 @@ function toRow(event: TelemetryEvent): Row {
           .filter((part) => part !== null)
           .join("  "),
       };
+    case "labStateChanged": {
+      const { status } = event;
+      const { counters } = status;
+      return {
+        ...base,
+        kind: "LAB",
+        kindTone: "muted",
+        target: status.listener ?? "target lab",
+        result: status.running ? status.mode.toUpperCase() : "STOPPED",
+        resultTone: status.running ? (status.mode === "hardened" ? "ok" : "warn") : "muted",
+        latency: "-",
+        detail: `coupon ${counters.granted}/${status.couponLimit}  redeemed ${counters.redeemed}  orders ${counters.orders}  req ${counters.requests}`,
+      };
+    }
+    case "labExchange": {
+      const raced = event.outcome.startsWith("granted past limit");
+      return {
+        ...base,
+        kind: "LAB",
+        kindTone: event.status >= 500 || raced ? "fault" : "muted",
+        target: `${event.method} ${event.path}`,
+        result: String(event.status),
+        resultTone: raced ? "fault" : httpStatusTone(event.status),
+        latency: formatLatency(event.latencyUs),
+        detail: `${event.mode}  ${event.outcome}`,
+      };
+    }
   }
 }
 

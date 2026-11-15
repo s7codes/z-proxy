@@ -12,6 +12,8 @@ export interface RouteScanControl {
   error: EngineError | TransportError | null;
   scan: (root?: string) => void;
   browse: () => void;
+  /** Shows a report produced elsewhere (the target lab) without touching the project root. */
+  adopt: (report: RouteScanReport) => void;
 }
 
 function readStoredRoot(): string {
@@ -70,5 +72,10 @@ export function useRouteScan(): RouteScanControl {
     });
   }, [scan]);
 
-  return { root, setRoot, scanning, report, error, scan, browse };
+  const adopt = useCallback((next: RouteScanReport) => {
+    setReport(next);
+    setError(null);
+  }, []);
+
+  return { root, setRoot, scanning, report, error, scan, browse, adopt };
 }
