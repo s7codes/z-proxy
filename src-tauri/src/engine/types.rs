@@ -84,6 +84,8 @@ pub struct ProxyStatus {
 pub enum FaultKind {
     StatusMutation,
     ConnectionDrop,
+    /// Upstream head and leading body bytes forwarded, then the connection reset mid-body.
+    PartialBodyDrop,
 }
 
 // ---- concurrency burst ----------------------------------------------------------------
@@ -105,6 +107,19 @@ pub struct HeaderPair {
     pub value: String,
 }
 
+/// What the barrier releases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BurstSyncMode {
+    /// Connections are opened and handshaken before the barrier; release writes each full
+    /// request.
+    #[default]
+    PreConnected,
+    /// Every request except its final byte is written and flushed before the barrier;
+    /// release writes one byte per worker, so no server can finish parsing a request early.
+    LastByte,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BurstSpec {
@@ -123,6 +138,8 @@ pub struct BurstSpec {
     /// UUID); 2xx responses must then be one replayed body. Absent means off.
     #[serde(default)]
     pub idempotency_mode: bool,
+    /// `None` is `PreConnected`.
+    pub sync_mode: Option<BurstSyncMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -204,6 +221,7 @@ pub struct BurstReport {
     pub target: String,
     pub method: BurstMethod,
     pub workers: u16,
+    pub sync_mode: BurstSyncMode,
     pub wall_us: u64,
     pub dispatch_spread_us: Option<u64>,
     pub status_histogram: Vec<StatusBucket>,
@@ -720,6 +738,7 @@ pub enum TelemetryEvent {
         target: String,
         method: BurstMethod,
         workers: u16,
+        sync_mode: BurstSyncMode,
         idempotency_key: Option<String>,
     },
     BurstSample {

@@ -24,7 +24,12 @@ export const DEFAULT_FAULT_PROFILE: FaultProfile = {
   dropRate: 0,
   statusMutation: "none",
   mutationRate: 0,
+  partialDropRate: 0,
+  partialDropBytes: null,
 };
+
+/** Mirrors engine/fault.rs `MAX_PARTIAL_DROP_BYTES`. */
+const MAX_PARTIAL_DROP_BYTES = 16 * 1024 * 1024;
 
 const MUTATIONS: readonly StatusMutation[] = ["none", "429", "500", "502", "503", "504"];
 
@@ -227,7 +232,23 @@ function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget, audit, o
         </Section>
 
         <Section title="Transport">
-          <Slider label="RST" unit="%" min={0} max={100} step={1} value={profile.dropRate} onChange={(v) => set("dropRate", v)} />
+          <div className="flex flex-col gap-1.5">
+            <Slider label="RST" unit="%" min={0} max={100} step={1} value={profile.dropRate} onChange={(v) => set("dropRate", v)} />
+            <Slider
+              label="Mid-body"
+              unit="%"
+              min={0}
+              max={100}
+              step={1}
+              value={profile.partialDropRate ?? 0}
+              onChange={(v) => set("partialDropRate", v)}
+            />
+            <CutPointField
+              value={profile.partialDropBytes ?? null}
+              disabled={(profile.partialDropRate ?? 0) === 0}
+              onChange={(v) => set("partialDropBytes", v)}
+            />
+          </div>
         </Section>
 
         <Section title="Status Mutation">
@@ -300,6 +321,45 @@ function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget, audit, o
         </button>
       </div>
     </>
+  );
+}
+
+/** Bytes of the upstream body forwarded before the mid-body reset; empty cuts at half. */
+function CutPointField({
+  value,
+  disabled,
+  onChange,
+}: {
+  value: number | null;
+  disabled: boolean;
+  onChange: (value: number | null) => void;
+}) {
+  return (
+    <div className={`flex h-5 items-center gap-2 text-xs ${disabled ? "opacity-40" : ""}`}>
+      <span className="w-[52px] shrink-0 text-fg-dim">Cut at</span>
+      <label className="flex h-5 w-[92px] shrink-0 items-center rounded-xs border border-line bg-bg pr-1.5 focus-within:border-fg-faint">
+        <input
+          type="number"
+          min={0}
+          max={MAX_PARTIAL_DROP_BYTES}
+          value={value ?? ""}
+          placeholder="half"
+          disabled={disabled}
+          aria-label="Mid-body cut point in bytes"
+          onChange={(e) => {
+            const raw = e.target.value.trim();
+            if (raw === "") return onChange(null);
+            const next = Number(raw);
+            if (Number.isInteger(next) && next >= 0 && next <= MAX_PARTIAL_DROP_BYTES) onChange(next);
+          }}
+          className="num w-full min-w-0 bg-transparent pl-1.5 text-right text-xs text-fg-bright outline-none placeholder:text-fg-faint [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+        />
+        <span className="num pl-1 text-2xs text-fg-faint">B</span>
+      </label>
+      <span className="min-w-0 truncate text-2xs text-fg-faint" title="Full Content-Length in the head, body cut short, then SO_LINGER=0 reset">
+        {value === null ? "head + half the body, then RST" : `head + ${value} B, then RST`}
+      </span>
+    </div>
   );
 }
 

@@ -7,6 +7,7 @@ import { AUDIT_SHORT, type AuditKind } from "../../lib/traffic";
 import { DISCLOSURE_LABEL } from "../../lib/disclosure";
 import { formatBytes, formatLatency, formatTimestamp, formatUptime } from "../../lib/format";
 import { ipcAvailable } from "../../lib/ipc";
+import { describePartialDrop } from "../../lib/rules";
 import { httpStatusTone, TONE_TEXT, type Tone } from "../../lib/tone";
 import type { FaultProfile, FuzzVerdict, TelemetryEvent } from "../../lib/types";
 import { FILTER_KINDS, TelemetryToolbar } from "./TelemetryToolbar";
@@ -212,6 +213,7 @@ function toRow(event: TelemetryEvent): Row {
         detail: [
           event.fault === "statusMutation" ? "injected status" : null,
           event.fault === "connectionDrop" ? "injected reset" : null,
+          event.fault === "partialBodyDrop" ? `injected mid-body reset after ${formatBytes(event.responseBytes)}` : null,
           ...event.findings.map((finding) => `${AUDIT_SHORT[finding.kind]} ${finding.detail}`),
           drift === null ? null : `drift ${drift}`,
           event.rule === null ? null : `rule ${event.rule}`,
@@ -236,7 +238,7 @@ function toRow(event: TelemetryEvent): Row {
         latency: "-",
         detail: [
           `run ${event.id.slice(0, 8)}`,
-          "barrier armed",
+          event.syncMode === "lastByte" ? "barrier armed, last byte held" : "barrier armed",
           event.idempotencyKey === null ? null : `idempotency-key ${event.idempotencyKey}`,
         ]
           .filter((part) => part !== null)
@@ -389,5 +391,7 @@ function describeFaults(armed: boolean, profile: FaultProfile): string {
   const parts = [`latency ${profile.latencyMs}±${profile.jitterMs} ms`];
   if (profile.dropRate > 0) parts.push(`rst ${profile.dropRate}%`);
   if (profile.statusMutation !== "none") parts.push(`${profile.statusMutation} @ ${profile.mutationRate}%`);
+  const partial = describePartialDrop(profile);
+  if (partial !== null) parts.push(partial);
   return `armed: ${parts.join(", ")}`;
 }

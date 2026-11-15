@@ -16,6 +16,8 @@ use super::types::RouteMethod;
 
 pub const MAX_LATENCY_MS: u32 = 30_000;
 pub const MAX_JITTER_MS: u32 = 10_000;
+/// The proxy buffers at most 16 MiB of a response; a cut point beyond that never applies.
+pub const MAX_PARTIAL_DROP_BYTES: u32 = 16 * 1024 * 1024;
 const MAX_RATE: u8 = 100;
 pub const MAX_RULES: usize = 64;
 const MAX_PATTERN_LEN: usize = 512;
@@ -60,6 +62,12 @@ pub struct FaultProfile {
     pub drop_rate: u8,
     pub status_mutation: StatusMutation,
     pub mutation_rate: u8,
+    /// Share of forwarded responses cut mid-body: the head and leading bytes reach the
+    /// client, then the connection is reset. `None` is 0.
+    pub partial_drop_rate: Option<u8>,
+    /// Body bytes written before the reset; `None` cuts at half the body. Always at least one
+    /// byte short of a non-empty body.
+    pub partial_drop_bytes: Option<u32>,
 }
 
 impl FaultProfile {
@@ -75,6 +83,18 @@ impl FaultProfile {
         }
         if self.mutation_rate > MAX_RATE {
             return Err(invalid("mutationRate", format!("must be <= {MAX_RATE}")));
+        }
+        if self.partial_drop_rate.is_some_and(|rate| rate > MAX_RATE) {
+            return Err(invalid("partialDropRate", format!("must be <= {MAX_RATE}")));
+        }
+        if self
+            .partial_drop_bytes
+            .is_some_and(|bytes| bytes > MAX_PARTIAL_DROP_BYTES)
+        {
+            return Err(invalid(
+                "partialDropBytes",
+                format!("must be <= {MAX_PARTIAL_DROP_BYTES}"),
+            ));
         }
         Ok(())
     }
@@ -244,6 +264,10 @@ pub enum FaultAction {
     Forward,
     Mutate(StatusCode),
     Drop,
+    /// Forward, then cut the response body after `after` bytes (`None`: half the body).
+    PartialDrop {
+        after: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +289,9 @@ impl FaultPlan {
 /// Latency applies to every outcome, including drops: a connection that hangs and then
 /// resets is the failure shape clients most often mishandle. Rules only apply while armed:
 /// the arm switch is the single control that stops all injection.
+///
+/// Precedence is drop, status mutation, partial drop. A rate of 0 draws nothing from the
+/// RNG, so a seeded sequence without partial drops is unchanged by their existence.
 pub fn plan(state: &FaultState, method: &str, path: &str, rng: &mut Rng) -> FaultPlan {
     if !state.armed {
         return FaultPlan::PASSTHROUGH;
@@ -280,11 +307,18 @@ pub fn plan(state: &FaultState, method: &str, path: &str, rng: &mut Rng) -> Faul
 
     let action = if roll(profile.drop_rate, rng) {
         FaultAction::Drop
-    } else {
-        match profile.status_mutation.status() {
-            Some(status) if roll(profile.mutation_rate, rng) => FaultAction::Mutate(status),
-            _ => FaultAction::Forward,
+    } else if let Some(status) = profile
+        .status_mutation
+        .status()
+        .filter(|_| roll(profile.mutation_rate, rng))
+    {
+        FaultAction::Mutate(status)
+    } else if roll(profile.partial_drop_rate.unwrap_or(0), rng) {
+        FaultAction::PartialDrop {
+            after: profile.partial_drop_bytes,
         }
+    } else {
+        FaultAction::Forward
     };
 
     FaultPlan {
@@ -512,6 +546,8 @@ mod tests {
                 drop_rate: 100,
                 status_mutation: StatusMutation::BadGateway,
                 mutation_rate: 100,
+                partial_drop_rate: Some(100),
+                partial_drop_bytes: Some(8),
             },
             rules: Vec::new(),
         };
@@ -519,6 +555,62 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(plan(&state, &mut rng), FaultPlan::PASSTHROUGH);
         }
+    }
+
+    #[test]
+    fn partial_drop_yields_to_resets_and_mutations() {
+        let mut rng = Rng::with_seed(13);
+        let partial = FaultProfile {
+            partial_drop_rate: Some(100),
+            partial_drop_bytes: Some(16),
+            ..FaultProfile::default()
+        };
+        assert_eq!(
+            plan(&armed(partial.clone()), &mut rng).action,
+            FaultAction::PartialDrop { after: Some(16) }
+        );
+        let halved = FaultProfile {
+            partial_drop_bytes: None,
+            ..partial.clone()
+        };
+        assert_eq!(
+            plan(&armed(halved), &mut rng).action,
+            FaultAction::PartialDrop { after: None }
+        );
+        let reset = FaultProfile {
+            drop_rate: 100,
+            ..partial.clone()
+        };
+        assert_eq!(plan(&armed(reset), &mut rng).action, FaultAction::Drop);
+        let mutated = FaultProfile {
+            status_mutation: StatusMutation::BadGateway,
+            mutation_rate: 100,
+            ..partial
+        };
+        assert_eq!(
+            plan(&armed(mutated), &mut rng).action,
+            FaultAction::Mutate(StatusCode::BAD_GATEWAY)
+        );
+
+        // A zero rate consumes no randomness: the seeded mutation sequence is unchanged.
+        let sequence = |profile: FaultProfile| {
+            let mut rng = Rng::with_seed(21);
+            (0..64)
+                .map(|_| plan(&armed(profile.clone()), &mut rng).action)
+                .collect::<Vec<_>>()
+        };
+        let base = FaultProfile {
+            status_mutation: StatusMutation::InternalServerError,
+            mutation_rate: 40,
+            ..FaultProfile::default()
+        };
+        assert_eq!(
+            sequence(base.clone()),
+            sequence(FaultProfile {
+                partial_drop_rate: Some(0),
+                ..base
+            })
+        );
     }
 
     #[test]
@@ -624,6 +716,20 @@ mod tests {
                     ..FaultProfile::default()
                 },
                 "mutationRate",
+            ),
+            (
+                FaultProfile {
+                    partial_drop_rate: Some(101),
+                    ..FaultProfile::default()
+                },
+                "partialDropRate",
+            ),
+            (
+                FaultProfile {
+                    partial_drop_bytes: Some(MAX_PARTIAL_DROP_BYTES + 1),
+                    ..FaultProfile::default()
+                },
+                "partialDropBytes",
             ),
         ];
         for (profile, expected) in cases {

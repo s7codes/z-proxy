@@ -39,6 +39,13 @@ export interface FaultProfile {
   dropRate: number;
   statusMutation: StatusMutation;
   mutationRate: number;
+  /**
+   * Share of forwarded responses cut mid-body: head and leading bytes reach the client, then
+   * the connection is reset. `null` (or absent from an older caller) is 0.
+   */
+  partialDropRate?: number | null;
+  /** Body bytes written before the reset; `null` cuts at half the body. */
+  partialDropBytes?: number | null;
 }
 
 /** Binds a profile to one route, matched against the path the upstream receives. */
@@ -68,7 +75,7 @@ export interface ProxyStatus {
   contracts: number;
 }
 
-export type FaultKind = "statusMutation" | "connectionDrop";
+export type FaultKind = "statusMutation" | "connectionDrop" | "partialBodyDrop";
 
 // ---- concurrency burst ----------------------------------------------------------------
 
@@ -78,6 +85,12 @@ export interface HeaderPair {
   name: string;
   value: string;
 }
+
+/**
+ * `preConnected`: connections handshaken before the barrier, full requests written on release.
+ * `lastByte`: every request byte but the last written before the barrier; release writes one.
+ */
+export type BurstSyncMode = "preConnected" | "lastByte";
 
 export interface BurstSpec {
   /** May hold `{param}` placeholders in the path; each is sent as `1`. */
@@ -97,6 +110,8 @@ export interface BurstSpec {
    * 2xx responses must then carry one replayed body. POST, PUT and PATCH only.
    */
   idempotencyMode: boolean;
+  /** `null` is `preConnected`. */
+  syncMode?: BurstSyncMode | null;
 }
 
 export interface WorkerSample {
@@ -152,6 +167,7 @@ export interface BurstReport {
   target: string;
   method: BurstMethod;
   workers: number;
+  syncMode: BurstSyncMode;
   wallUs: number;
   dispatchSpreadUs: number | null;
   statusHistogram: StatusBucket[];
@@ -513,6 +529,7 @@ export type TelemetryEvent =
       target: string;
       method: BurstMethod;
       workers: number;
+      syncMode: BurstSyncMode;
       idempotencyKey: string | null;
     }
   | {

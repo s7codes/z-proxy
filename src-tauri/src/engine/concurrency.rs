@@ -4,6 +4,10 @@
 //! only work left after release is writing the request. Dispatch spread is then bounded by
 //! task wake-up latency (microseconds) rather than TCP connect time (milliseconds), which is
 //! what makes narrow race windows reproducible.
+//!
+//! `LastByte` goes one step further: everything but the final request byte is already on
+//! the wire when the barrier opens, so release is a single-byte write from the worker's own
+//! task and the server's parsers complete every request within one write's latency.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -14,17 +18,19 @@ use axum::http::header::{self, HeaderName, HeaderValue};
 use axum::http::Request;
 use http_body_util::Full;
 use hyper::client::conn::http1::SendRequest;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Barrier;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use super::error::{EngineError, EngineResult};
-use super::http1::{self, RequestTemplate, CONNECT_TIMEOUT};
+use super::guard::GuardedTarget;
+use super::http1::{self, RequestTemplate, SplitConnection, CONNECT_TIMEOUT};
 use super::net;
 use super::pathparam;
 use super::types::{
-    Anomaly, AnomalyKind, BurstMethod, BurstReport, BurstSpec, HeaderPair, LatencyStats, Severity,
-    SizeStats, StatusBucket, TelemetryEvent, WorkerSample,
+    Anomaly, AnomalyKind, BurstMethod, BurstReport, BurstSpec, BurstSyncMode, HeaderPair,
+    LatencyStats, Severity, SizeStats, StatusBucket, TelemetryEvent, WorkerSample,
 };
 use crate::telemetry::{now_us, TelemetryHub};
 
@@ -43,6 +49,7 @@ struct Prepared {
     timeout: Duration,
     expected_max_successes: Option<u16>,
     idempotency_key: Option<String>,
+    sync_mode: BurstSyncMode,
 }
 
 impl Prepared {
@@ -72,9 +79,10 @@ pub async fn run(spec: BurstSpec, hub: &TelemetryHub) -> EngineResult<BurstRepor
         target: prepared.template.label.clone(),
         method: spec.method,
         workers,
+        sync_mode: prepared.sync_mode,
         idempotency_key: prepared.idempotency_key.clone(),
     });
-    tracing::info!(%id, target = %prepared.template.label, workers, idempotent = prepared.idempotency_key.is_some(), "concurrency burst started");
+    tracing::info!(%id, target = %prepared.template.label, workers, sync = ?prepared.sync_mode, idempotent = prepared.idempotency_key.is_some(), "concurrency burst started");
 
     let barrier = Arc::new(Barrier::new(usize::from(workers)));
     let release = Arc::new(OnceLock::new());
@@ -112,6 +120,7 @@ pub async fn run(spec: BurstSpec, hub: &TelemetryHub) -> EngineResult<BurstRepor
             target: prepared.template.label.clone(),
             method: spec.method,
             workers,
+            sync_mode: prepared.sync_mode,
             wall_us: net::elapsed_us(started),
             expected_max_successes: prepared.expected_max_successes,
             idempotency_key: prepared.idempotency_key.clone(),
@@ -196,6 +205,7 @@ fn prepare(spec: &BurstSpec) -> EngineResult<Prepared> {
         timeout: Duration::from_millis(u64::from(spec.timeout_ms)),
         expected_max_successes: spec.expected_max_successes,
         idempotency_key,
+        sync_mode: spec.sync_mode.unwrap_or_default(),
     })
 }
 
@@ -205,15 +215,22 @@ async fn run_worker(
     barrier: Arc<Barrier>,
     release: Arc<OnceLock<Instant>>,
 ) -> WorkerSample {
+    match prepared.sync_mode {
+        BurstSyncMode::PreConnected => pre_connected(worker, &prepared, &barrier, &release).await,
+        BurstSyncMode::LastByte => last_byte(worker, &prepared, &barrier, &release).await,
+    }
+}
+
+async fn pre_connected(
+    worker: u16,
+    prepared: &Prepared,
+    barrier: &Barrier,
+    release: &OnceLock<Instant>,
+) -> WorkerSample {
     let connection = tokio::time::timeout(CONNECT_TIMEOUT, http1::open(&prepared.template.target))
         .await
         .map_or_else(
-            |_| {
-                Err(format!(
-                    "connect timed out after {} ms",
-                    CONNECT_TIMEOUT.as_millis()
-                ))
-            },
+            |_| Err(connect_timeout()),
             |opened| opened.map_err(|err| err.to_string()),
         );
     let request = prepared.request(worker);
@@ -232,7 +249,95 @@ async fn run_worker(
     let dispatch_offset_us = Some(duration_us(fired.saturating_duration_since(epoch)));
     let outcome = tokio::time::timeout(prepared.timeout, exchange(&mut sender, request)).await;
     let latency_us = net::elapsed_us(fired);
+    sample(
+        worker,
+        prepared,
+        fired,
+        dispatch_offset_us,
+        latency_us,
+        outcome,
+    )
+}
 
+/// The server can finish parsing no request before its final byte, so holding that byte
+/// back aligns the requests at the server's parser rather than at the client's scheduler.
+async fn last_byte(
+    worker: u16,
+    prepared: &Prepared,
+    barrier: &Barrier,
+    release: &OnceLock<Instant>,
+) -> WorkerSample {
+    let request = prepared.request(worker);
+    let wire = http1::encode(&request, &prepared.body);
+    let staged = tokio::time::timeout(CONNECT_TIMEOUT, stage(&prepared.template.target, &wire))
+        .await
+        .unwrap_or_else(|_| Err(connect_timeout()))
+        .map(|(mut connection, last)| {
+            // Queued now so hyper has consumed its copy and armed the read side before the
+            // response can exist.
+            let pending = connection.sender.send_request(request);
+            (connection, last, pending)
+        });
+
+    barrier.wait().await;
+
+    let (mut connection, last, pending) = match staged {
+        Ok(staged) => staged,
+        Err(error) => return failed(worker, None, 0, error),
+    };
+
+    let fired = Instant::now();
+    let epoch = *release.get_or_init(|| fired);
+    let dispatch_offset_us = Some(duration_us(fired.saturating_duration_since(epoch)));
+    let written = connection.writer.write_all(&[last]).await;
+    let outcome = tokio::time::timeout(prepared.timeout, http1::exchange_pending(pending, 0)).await;
+    let latency_us = net::elapsed_us(fired);
+    drop(connection);
+    // A server may answer and close before the final byte (431, 413); its response wins
+    // over the failed write.
+    let outcome = match (outcome, written) {
+        (Ok(Err(err)), Err(write)) => Ok(Err(format!("{err}; final byte write failed: {write}"))),
+        (outcome, _) => outcome.map(|received| received.map_err(|err| err.to_string())),
+    };
+    sample(
+        worker,
+        prepared,
+        fired,
+        dispatch_offset_us,
+        latency_us,
+        outcome,
+    )
+}
+
+/// Opens a split connection and writes every request byte but the last.
+async fn stage(target: &GuardedTarget, wire: &[u8]) -> Result<(SplitConnection, u8), String> {
+    let Some((&last, held)) = wire.split_last() else {
+        return Err("request encoded to zero bytes".to_owned());
+    };
+    let mut connection = http1::open_split(target)
+        .await
+        .map_err(|err| err.to_string())?;
+    connection
+        .writer
+        .write_all(held)
+        .await
+        .map_err(|err| format!("request write failed: {err}"))?;
+    connection
+        .writer
+        .flush()
+        .await
+        .map_err(|err| format!("request flush failed: {err}"))?;
+    Ok((connection, last))
+}
+
+fn sample(
+    worker: u16,
+    prepared: &Prepared,
+    fired: Instant,
+    dispatch_offset_us: Option<u64>,
+    latency_us: u64,
+    outcome: Result<Result<http1::Received, String>, tokio::time::error::Elapsed>,
+) -> WorkerSample {
     match outcome {
         Ok(Ok(received)) => WorkerSample {
             worker,
@@ -254,6 +359,10 @@ async fn run_worker(
             format!("timed out after {} ms", prepared.timeout.as_millis()),
         ),
     }
+}
+
+fn connect_timeout() -> String {
+    format!("connect timed out after {} ms", CONNECT_TIMEOUT.as_millis())
 }
 
 async fn exchange(
@@ -290,6 +399,7 @@ struct ReportMeta {
     target: String,
     method: BurstMethod,
     workers: u16,
+    sync_mode: BurstSyncMode,
     wall_us: u64,
     expected_max_successes: Option<u16>,
     idempotency_key: Option<String>,
@@ -350,6 +460,7 @@ fn analyze(meta: ReportMeta, samples: Vec<WorkerSample>) -> BurstReport {
         target: meta.target,
         method: meta.method,
         workers: meta.workers,
+        sync_mode: meta.sync_mode,
         wall_us: meta.wall_us,
         dispatch_spread_us,
         status_histogram,
@@ -636,6 +747,7 @@ mod tests {
             timeout_ms: 5_000,
             expected_max_successes: None,
             idempotency_mode: false,
+            sync_mode: None,
         }
     }
 
@@ -658,6 +770,7 @@ mod tests {
             target: "http://127.0.0.1/".to_owned(),
             method: BurstMethod::Post,
             workers,
+            sync_mode: BurstSyncMode::PreConnected,
             wall_us: 1,
             expected_max_successes: None,
             idempotency_key: None,
@@ -1196,6 +1309,124 @@ mod tests {
             .unwrap();
         assert_eq!(report.idempotency_key.as_deref(), Some("retry-7"));
         assert!(keys.lock().unwrap().iter().all(|k| k == "retry-7"));
+    }
+
+    /// Accepts one connection, records every request byte, and answers once `expected` bytes
+    /// have arrived.
+    fn serve_recording(listener: TcpListener, expected: usize) -> Arc<Mutex<Vec<u8>>> {
+        let received: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let log = Arc::clone(&received);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            while log.lock().unwrap().len() < expected {
+                stream.readable().await.unwrap();
+                match stream.try_read(&mut buf) {
+                    Ok(0) => return,
+                    Ok(n) => log.lock().unwrap().extend_from_slice(&buf[..n]),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => return,
+                }
+            }
+            write_all(&stream, b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await;
+            // Held open until the client is done reading.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        received
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn last_byte_mode_holds_the_final_byte_until_release() {
+        let body = r#"{"code":"LAB-SINGLE-USE"}"#;
+        let spec_for = |port: u16| BurstSpec {
+            method: BurstMethod::Post,
+            body: Some(body.to_owned()),
+            sync_mode: Some(BurstSyncMode::LastByte),
+            ..spec(format!("http://127.0.0.1:{port}/redeem"), 1)
+        };
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let prepared = Arc::new(prepare(&spec_for(port)).unwrap());
+        let expected = http1::encode(&prepared.request(1), &prepared.body).len();
+        let received = serve_recording(listener, expected);
+        let barrier = Arc::new(Barrier::new(2));
+        let release = Arc::new(OnceLock::new());
+        let worker = tokio::spawn({
+            let (prepared, barrier, release) = (
+                Arc::clone(&prepared),
+                Arc::clone(&barrier),
+                Arc::clone(&release),
+            );
+            async move { last_byte(1, &prepared, &barrier, &release).await }
+        });
+
+        let staged = async {
+            while received.lock().unwrap().len() < expected - 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), staged)
+            .await
+            .expect("every byte but the last is written before the barrier");
+        // The worker is parked at the barrier the test still holds: nothing more can arrive.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(received.lock().unwrap().len(), expected - 1);
+
+        barrier.wait().await;
+        let sample = tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sample.status, Some(200), "{sample:?}");
+        assert_eq!(sample.bytes, 2);
+        assert_eq!(sample.dispatch_offset_us, Some(0));
+        let wire = received.lock().unwrap().clone();
+        assert_eq!(wire.len(), expected);
+        assert!(wire.ends_with(body.as_bytes()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn last_byte_burst_delivers_complete_requests() {
+        let lengths: Arc<Mutex<Vec<usize>>> = Arc::default();
+        let router = Router::new()
+            .fallback(
+                |State(lengths): State<Arc<Mutex<Vec<usize>>>>, body: Bytes| async move {
+                    lengths.lock().unwrap().push(body.len());
+                    (StatusCode::CREATED, "made")
+                },
+            )
+            .with_state(Arc::clone(&lengths));
+        let addr = serve(router).await;
+        let body = r#"{"sku":"LAB-KB-01","quantity":2}"#;
+        let report = run(
+            BurstSpec {
+                method: BurstMethod::Post,
+                body: Some(body.to_owned()),
+                sync_mode: Some(BurstSyncMode::LastByte),
+                ..spec(format!("http://127.0.0.1:{}/orders", addr.port()), 24)
+            },
+            &TelemetryHub::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.sync_mode, BurstSyncMode::LastByte);
+        assert_eq!(
+            report.status_histogram,
+            [StatusBucket {
+                status: Some(201),
+                count: 24
+            }]
+        );
+        assert!(report.anomalies.is_empty(), "{:?}", report.anomalies);
+        let lengths = lengths.lock().unwrap().clone();
+        assert_eq!(lengths.len(), 24);
+        assert!(lengths.iter().all(|len| *len == body.len()), "{lengths:?}");
+        let spread = report.dispatch_spread_us.unwrap();
+        assert!(spread < 250_000, "dispatch spread {spread} us");
+        for sample in &report.samples {
+            assert!(sample.ttfb_us.unwrap() <= sample.latency_us, "{sample:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

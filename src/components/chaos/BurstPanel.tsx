@@ -5,7 +5,7 @@ import { formatBytes, formatLatency, formatPercent } from "../../lib/format";
 import { joinTarget, parseHeaders, type RequestOrigin } from "../../lib/request";
 import { pathParams, type RequestTarget } from "../../lib/routes";
 import { httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
-import type { Anomaly, AnomalyKind, BurstReport, LatencyStats } from "../../lib/types";
+import type { Anomaly, AnomalyKind, BurstReport, BurstSyncMode, LatencyStats } from "../../lib/types";
 import { Section, StatusSquare } from "../shell/PanelHeader";
 import { ErrorLine } from "./ErrorLine";
 import { Field, MethodPicker, Metric, OriginRow, PathField, SampleHint } from "./RequestFields";
@@ -21,6 +21,19 @@ const ANOMALY_LABEL: Record<AnomalyKind, string> = {
   transportErrors: "Transport",
   idempotencyViolation: "Idempotency violation",
 };
+
+const SYNC_MODES: ReadonlyArray<{ mode: BurstSyncMode; label: string; title: string }> = [
+  {
+    mode: "preConnected",
+    label: "Pre-connected",
+    title: "Connections handshaken before the barrier; each worker writes its full request on release",
+  },
+  {
+    mode: "lastByte",
+    label: "Last byte",
+    title: "Every request byte but the last is on the wire before the barrier; release writes one byte per worker",
+  },
+];
 
 interface BurstPanelProps {
   /** Validated target, or the proxy listener in front of it. */
@@ -53,6 +66,7 @@ export function BurstPanel({
   // 0 means no quota; the engine receives `null`.
   const [maxSuccesses, setMaxSuccesses] = useState(0);
   const [idempotencyMode, setIdempotencyMode] = useState(false);
+  const [syncMode, setSyncMode] = useState<BurstSyncMode>("preConnected");
   const [headerText, setHeaderText] = useState("");
 
   const parsed = useMemo(() => parseHeaders(headerText), [headerText]);
@@ -73,6 +87,7 @@ export function BurstPanel({
       timeoutMs,
       expectedMaxSuccesses: maxSuccesses === 0 ? null : maxSuccesses,
       idempotencyMode: replaying,
+      syncMode,
     });
   };
 
@@ -117,6 +132,7 @@ export function BurstPanel({
 
         <Section title="Dispatch">
           <div className="flex flex-col gap-1.5">
+            <SyncField value={syncMode} onChange={setSyncMode} />
             <Slider label="Workers" unit="req" min={1} max={MAX_WORKERS} step={1} value={workers} onChange={setWorkers} />
             <Slider label="Timeout" unit="ms" min={100} max={60000} step={100} value={timeoutMs} onChange={setTimeoutMs} />
             <QuotaField value={maxSuccesses} max={workers} onChange={setMaxSuccesses} />
@@ -137,7 +153,9 @@ export function BurstPanel({
             ? `Barrier armed: ${workers} workers`
             : replaying
               ? "One Idempotency-Key from every worker, single barrier release"
-              : "Pre-connected workers, single barrier release"}
+              : syncMode === "lastByte"
+                ? "Final request byte held until the barrier releases"
+                : "Pre-connected workers, single barrier release"}
         </span>
         <button
           type="button"
@@ -159,7 +177,15 @@ function ReportView({ report }: { report: BurstReport }) {
 
   return (
     <>
-      <Section title="Result" aside={<span className="num text-2xs text-fg-faint">{report.id.slice(0, 8)}</span>}>
+      <Section
+        title="Result"
+        aside={
+          <span className="num text-2xs text-fg-faint">
+            {report.syncMode === "lastByte" ? "last byte  " : "pre-connected  "}
+            {report.id.slice(0, 8)}
+          </span>
+        }
+      >
         <div className="num mb-2 grid grid-cols-4 gap-px border border-line bg-line text-xs">
           <Metric label="spread" value={report.dispatchSpreadUs === null ? "-" : formatLatency(report.dispatchSpreadUs)} />
           <Metric label="wall" value={formatLatency(report.wallUs)} />
@@ -258,6 +284,31 @@ function LatencyGrid({ ttfb, total }: { ttfb: LatencyStats | null; total: Latenc
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function SyncField({ value, onChange }: { value: BurstSyncMode; onChange: (value: BurstSyncMode) => void }) {
+  return (
+    <div className="flex h-5 items-center gap-2 text-xs">
+      <span className="w-[52px] shrink-0 text-fg-dim">Sync</span>
+      <div className="grid min-w-0 flex-1 grid-cols-2 border border-line" role="radiogroup" aria-label="Barrier sync mode">
+        {SYNC_MODES.map(({ mode, label, title }) => (
+          <button
+            key={mode}
+            type="button"
+            role="radio"
+            aria-checked={value === mode}
+            title={title}
+            onClick={() => onChange(mode)}
+            className={`h-[18px] truncate border-r border-line px-1.5 text-2xs last:border-r-0 ${
+              value === mode ? "bg-active text-fg-bright" : "text-fg-dim hover:bg-active hover:text-fg"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

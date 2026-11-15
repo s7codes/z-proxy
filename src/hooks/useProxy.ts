@@ -149,6 +149,8 @@ export function sameProfile(a: FaultProfile, b: FaultProfile): boolean {
     a.jitterMs === b.jitterMs &&
     a.dropRate === b.dropRate &&
     a.statusMutation === b.statusMutation &&
-    a.mutationRate === b.mutationRate
+    a.mutationRate === b.mutationRate &&
+    (a.partialDropRate ?? 0) === (b.partialDropRate ?? 0) &&
+    (a.partialDropBytes ?? null) === (b.partialDropBytes ?? null)
   );
 }

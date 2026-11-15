@@ -5,9 +5,12 @@
 //! requires per-connection state and ownership of the socket. Routing and extraction stay
 //! in axum.
 
-use std::future;
+use std::convert::Infallible;
+use std::future::{self, Future};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
@@ -17,7 +20,7 @@ use axum::http::{request, StatusCode};
 use axum::response::Response;
 use axum::{Extension, Router};
 use fastrand::Rng;
-use hyper::body::Incoming;
+use hyper::body::{Frame, Incoming};
 use hyper_util::rt::TokioIo;
 use reqwest::Client;
 use tokio::net::{TcpListener, TcpStream};
@@ -44,6 +47,10 @@ use crate::telemetry::{now_us, TelemetryHub};
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+/// Pause between the last forwarded byte of a partial drop and the reset. Windows discards
+/// received but unread data when an RST arrives, so the client gets time to read the head
+/// and the leading bytes; otherwise the fault would look like a plain connection drop.
+const PARTIAL_DROP_SETTLE: Duration = Duration::from_millis(50);
 
 const FAULT_HEADER: &str = "x-zproxy-fault";
 const DELAY_HEADER: &str = "x-zproxy-injected-delay-us";
@@ -375,6 +382,46 @@ impl ProxyContext {
         reply.into_response()
     }
 
+    /// Writes the upstream head with the full Content-Length and the leading bytes of the
+    /// body (`after`, else half; always short of the whole), then resets the connection. An
+    /// empty body has nothing to cut and is forwarded.
+    fn truncate(
+        &self,
+        mut record: Exchange,
+        reply: Reply,
+        after: Option<u32>,
+        abort: &Arc<Notify>,
+    ) -> Response {
+        let total = reply.body.len();
+        if total == 0 {
+            return self.finish(record, reply);
+        }
+        let wanted = after.map_or(total / 2, |n| usize::try_from(n).unwrap_or(usize::MAX));
+        let kept = wanted.min(total - 1);
+        record.fault = Some(FaultKind::PartialBodyDrop);
+        record.status = Some(reply.status.as_u16());
+        record.response_bytes = byte_len(kept);
+        self.publish(record);
+
+        let Reply {
+            status,
+            mut headers,
+            body,
+        } = reply;
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(total));
+        if let Ok(value) = HeaderValue::try_from(format!("partial-body-{kept}")) {
+            headers.insert(HeaderName::from_static(FAULT_HEADER), value);
+        }
+        let mut response = Response::new(Body::new(TruncatedBody {
+            head: (kept > 0).then(|| body.slice(..kept)),
+            settle: Box::pin(tokio::time::sleep(PARTIAL_DROP_SETTLE)),
+            abort: Some(Arc::clone(abort)),
+        }));
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        response
+    }
+
     fn publish(&self, mut record: Exchange) {
         // Every GET counts, whatever its fate: a fan-out is client behaviour, and a dropped or
         // injected response does not make it less of one.
@@ -450,6 +497,36 @@ impl Reply {
     }
 }
 
+/// Body of a partial drop: one frame with the kept bytes, then a stall that ends in the
+/// connection task's RST teardown. It never reports end of stream, so hyper cannot close
+/// the message cleanly.
+struct TruncatedBody {
+    head: Option<Bytes>,
+    settle: Pin<Box<tokio::time::Sleep>>,
+    abort: Option<Arc<Notify>>,
+}
+
+impl hyper::body::Body for TruncatedBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        let this = self.get_mut();
+        if let Some(head) = this.head.take() {
+            return Poll::Ready(Some(Ok(Frame::data(head))));
+        }
+        if this.settle.as_mut().poll(cx).is_ready() {
+            if let Some(abort) = this.abort.take() {
+                abort.notify_one();
+            }
+        }
+        Poll::Pending
+    }
+}
+
 async fn proxy_handler(
     State(ctx): State<Arc<ProxyContext>>,
     Extension(conn): Extension<ConnContext>,
@@ -517,41 +594,50 @@ async fn proxy_handler(
             record.fault = Some(FaultKind::StatusMutation);
             ctx.finish(record, injected_reply(status))
         }
-        FaultAction::Forward => match forward(&ctx, &conn, parts, body).await {
-            Ok((mut reply, upstream_latency_us)) => {
-                record.upstream_latency_us = Some(upstream_latency_us);
-                // Only upstream answers are judged: an injected status or a 502 from the proxy
-                // itself says nothing about the service's contract.
-                if let Some(bound) = contract {
-                    record.violations =
-                        contract::check(&bound.contract, reply.status.as_u16(), Some(&reply.body));
-                    record.contract = Some(bound.label.clone());
+        FaultAction::Forward | FaultAction::PartialDrop { .. } => {
+            match forward(&ctx, &conn, parts, body).await {
+                Ok((mut reply, upstream_latency_us)) => {
+                    record.upstream_latency_us = Some(upstream_latency_us);
+                    // Only upstream answers are judged: an injected status or a 502 from the proxy
+                    // itself says nothing about the service's contract.
+                    if let Some(bound) = contract {
+                        record.violations = contract::check(
+                            &bound.contract,
+                            reply.status.as_u16(),
+                            Some(&reply.body),
+                        );
+                        record.contract = Some(bound.label.clone());
+                    }
+                    record.findings = linter::inspect(&ResponseView {
+                        method: &record.method,
+                        path: &record.path,
+                        credentialed,
+                        status: reply.status.as_u16(),
+                        headers: &reply.headers,
+                        body: &reply.body,
+                    });
+                    if record.injected_delay_us > 0 {
+                        reply.headers.insert(
+                            HeaderName::from_static(DELAY_HEADER),
+                            HeaderValue::from(record.injected_delay_us),
+                        );
+                    }
+                    // The checks above judged the upstream's answer; the cut is the proxy's.
+                    if let FaultAction::PartialDrop { after } = plan.action {
+                        return ctx.truncate(record, reply, after, &conn.abort);
+                    }
+                    ctx.finish(record, reply)
                 }
-                record.findings = linter::inspect(&ResponseView {
-                    method: &record.method,
-                    path: &record.path,
-                    credentialed,
-                    status: reply.status.as_u16(),
-                    headers: &reply.headers,
-                    body: &reply.body,
-                });
-                if record.injected_delay_us > 0 {
-                    reply.headers.insert(
-                        HeaderName::from_static(DELAY_HEADER),
-                        HeaderValue::from(record.injected_delay_us),
-                    );
+                Err(failure) => {
+                    let detail = failure.to_string();
+                    record.error = Some(detail.clone());
+                    ctx.finish(
+                        record,
+                        error_reply(failure.status(), "upstream_unavailable", &detail),
+                    )
                 }
-                ctx.finish(record, reply)
             }
-            Err(failure) => {
-                let detail = failure.to_string();
-                record.error = Some(detail.clone());
-                ctx.finish(
-                    record,
-                    error_reply(failure.status(), "upstream_unavailable", &detail),
-                )
-            }
-        },
+        }
     }
 }
 
@@ -1114,6 +1200,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_body_drop_cuts_the_body_mid_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut h = Harness::new().await;
+        let proxy = h.start().await;
+        h.arm(FaultProfile {
+            partial_drop_rate: Some(100),
+            partial_drop_bytes: Some(10),
+            ..FaultProfile::default()
+        })
+        .await;
+
+        // A client sees a complete head, then a body read that fails.
+        let response = h
+            .client
+            .get(format!("http://{proxy}/orders"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[FAULT_HEADER], "partial-body-10");
+        assert!(
+            response.bytes().await.is_err(),
+            "truncated body must not read cleanly"
+        );
+        match h.next_exchange().await {
+            TelemetryEvent::ProxyExchange {
+                status,
+                fault,
+                response_bytes,
+                upstream_latency_us,
+                ..
+            } => {
+                assert_eq!(status, Some(200));
+                assert_eq!(fault, Some(FaultKind::PartialBodyDrop));
+                assert_eq!(response_bytes, 10);
+                assert!(upstream_latency_us.is_some());
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+
+        // On the wire: the full Content-Length, exactly ten body bytes, then the reset.
+        let mut stream = TcpStream::connect(proxy).await.unwrap();
+        stream
+            .write_all(b"GET /orders HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut wire = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match tokio::time::timeout(EVENT_TIMEOUT, stream.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => wire.extend_from_slice(&buf[..n]),
+                Err(_) => panic!("connection was never torn down"),
+            }
+        }
+        let text = String::from_utf8_lossy(&wire).to_string();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        let declared: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(body.len(), 10, "{text}");
+        assert!(declared > 10, "{head}");
+        assert_eq!(h.hits.load(Ordering::SeqCst), 2);
+
+        // Disarmed, the same route answers in full again.
+        h.manager
+            .set_faults(false, FaultProfile::default())
+            .await
+            .unwrap();
+        let full = h
+            .client
+            .get(format!("http://{proxy}/orders"))
+            .send()
+            .await
+            .unwrap();
+        assert!(full.headers().get(FAULT_HEADER).is_none());
+        assert!(full.bytes().await.is_ok());
     }
 
     #[tokio::test]

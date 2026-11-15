@@ -12,7 +12,17 @@ export function summarizeProfile(profile: FaultProfile): string {
   if (profile.statusMutation !== "none" && profile.mutationRate > 0) {
     parts.push(`${profile.statusMutation}@${profile.mutationRate}%`);
   }
+  const partial = describePartialDrop(profile);
+  if (partial !== null) parts.push(partial);
   return parts.length === 0 ? "passthrough" : parts.join(" ");
+}
+
+/** `cut@10B 25%`, `cut@half 25%`; `null` while the partial-body drop is off. */
+export function describePartialDrop(profile: FaultProfile): string | null {
+  const rate = profile.partialDropRate ?? 0;
+  if (rate === 0) return null;
+  const at = profile.partialDropBytes ?? null;
+  return `cut@${at === null ? "half" : `${at}B`} ${rate}%`;
 }
 
 export function ruleLabel(rule: FaultRule): string {

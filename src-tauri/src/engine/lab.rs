@@ -2025,6 +2025,7 @@ mod tests {
             // The coupon admits one use; the quota holds the hardened run to exactly that.
             expected_max_successes: Some(1),
             idempotency_mode: false,
+            sync_mode: None,
         }
     }
 
@@ -2109,6 +2110,7 @@ mod tests {
             timeout_ms: 10_000,
             expected_max_successes: None,
             idempotency_mode: true,
+            sync_mode: None,
         };
         let created = |report: &crate::engine::types::BurstReport| {
             report
