@@ -432,6 +432,33 @@ pub struct DiscoveredRoute {
     pub sample_body: Option<String>,
     /// Documented responses of an OpenAPI operation.
     pub contract: Option<ResponseContract>,
+    /// Static reliability findings in the handler's source; empty for OpenAPI routes.
+    pub risks: Vec<RouteRisk>,
+}
+
+/// Declaration order is report order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RouteRiskKind {
+    /// A POST, PUT, PATCH or DELETE handler that reads the request body with no schema
+    /// validation in reach.
+    UnvalidatedMutation,
+    /// A collection read with no limit, take or pagination.
+    UnboundedQuery,
+    /// A side-effecting async call whose promise or error is dropped, or an async Express
+    /// handler with no error path.
+    FloatingAsync,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteRisk {
+    pub kind: RouteRiskKind,
+    /// 1-based line of the evidence in the route's file.
+    pub line: u32,
+    /// The evidence line, trimmed to 120 characters.
+    pub evidence: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

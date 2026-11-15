@@ -15,10 +15,11 @@ use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 
 use super::lex::{Lang, Source};
-use super::{axum, go, next, node, openapi};
+use super::{audit, axum, go, next, node, openapi};
 use crate::engine::error::{EngineError, EngineResult};
 use crate::engine::types::{
-    DiscoveredRoute, ResponseContract, RouteMethod, RouteScanReport, RouteSource, ScanIssue,
+    DiscoveredRoute, ResponseContract, RouteMethod, RouteRisk, RouteScanReport, RouteSource,
+    ScanIssue,
 };
 
 /// Build output, dependency and VCS trees: large, never hand-written, and full of route
@@ -60,6 +61,8 @@ pub struct RawRoute {
     pub sample_body: Option<String>,
     /// Documented responses of an OpenAPI operation.
     pub contract: Option<ResponseContract>,
+    /// Static reliability findings in the handler's source (`audit.rs`).
+    pub risks: Vec<RouteRisk>,
 }
 
 impl RawRoute {
@@ -72,6 +75,7 @@ impl RawRoute {
             prefix: None,
             sample_body: None,
             contract: None,
+            risks: Vec::new(),
         }
     }
 
@@ -296,6 +300,7 @@ pub fn discovered(route: RawRoute, file: &str) -> DiscoveredRoute {
         prefix,
         sample_body: route.sample_body,
         contract: route.contract,
+        risks: route.risks,
     }
 }
 
@@ -305,10 +310,21 @@ fn extract(kind: FileKind, components: &[String], src: &str) -> Result<Vec<RawRo
             let source = Source::new(src, Lang::Js);
             let mut routes = next::extract(components, &source);
             routes.extend(node::extract(&source));
+            audit::annotate(&source, Lang::Js, &mut routes);
             Ok(routes)
         }
-        FileKind::Rust => Ok(axum::extract(&Source::new(src, Lang::Rust))),
-        FileKind::Go => Ok(go::extract(&Source::new(src, Lang::Go))),
+        FileKind::Rust => {
+            let source = Source::new(src, Lang::Rust);
+            let mut routes = axum::extract(&source);
+            audit::annotate(&source, Lang::Rust, &mut routes);
+            Ok(routes)
+        }
+        FileKind::Go => {
+            let source = Source::new(src, Lang::Go);
+            let mut routes = go::extract(&source);
+            audit::annotate(&source, Lang::Go, &mut routes);
+            Ok(routes)
+        }
         FileKind::Json => openapi::from_json(src),
         FileKind::Yaml => openapi::from_yaml(src),
     }

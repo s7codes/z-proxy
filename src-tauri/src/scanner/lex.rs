@@ -64,8 +64,14 @@ impl Source {
     /// True when `at` lies inside a string literal: a call-shaped match there is fixture
     /// data or documentation (a test's embedded source, a doc example), not code.
     pub fn in_string(&self, at: usize) -> bool {
+        self.string_span(at).is_some()
+    }
+
+    /// Byte span (quotes included) of the string literal containing `at`.
+    pub fn string_span(&self, at: usize) -> Option<(usize, usize)> {
         let next = self.strings.partition_point(|&(start, _)| start <= at);
-        next > 0 && at < self.strings[next - 1].1
+        let span = *self.strings.get(next.checked_sub(1)?)?;
+        (at < span.1).then_some(span)
     }
 }
 

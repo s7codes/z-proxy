@@ -1,3 +1,4 @@
+mod audit;
 mod axum;
 mod go;
 mod lex;

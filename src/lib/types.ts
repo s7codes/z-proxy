@@ -308,6 +308,20 @@ export interface DiscoveredRoute {
   sampleBody: string | null;
   /** Documented responses of an OpenAPI operation. */
   contract: ResponseContract | null;
+  /** Static reliability findings in the handler's source; empty for OpenAPI routes. */
+  risks: RouteRisk[];
+}
+
+/** Declaration order is report order. */
+export type RouteRiskKind = "unvalidatedMutation" | "unboundedQuery" | "floatingAsync";
+
+export interface RouteRisk {
+  kind: RouteRiskKind;
+  /** 1-based line of the evidence in the route's file. */
+  line: number;
+  /** The evidence line, trimmed to 120 characters. */
+  evidence: string;
+  detail: string;
 }
 
 export interface ScanIssue {

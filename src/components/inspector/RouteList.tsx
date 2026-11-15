@@ -3,12 +3,16 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { FolderOpen, FolderTree, LoaderCircle, RefreshCw, Search } from "lucide-react";
 import type { RouteScanControl } from "../../hooks/useRouteScan";
 import { formatLatency } from "../../lib/format";
+import { RISK_KINDS, RISK_LABEL, RISK_SHORT } from "../../lib/risk";
 import { fileLabel, METHOD_BADGE, SOURCE_LABEL } from "../../lib/routes";
-import type { DiscoveredRoute, RouteScanReport, RouteSource } from "../../lib/types";
+import type { DiscoveredRoute, RouteRiskKind, RouteScanReport, RouteSource } from "../../lib/types";
 import { ErrorLine } from "../chaos/ErrorLine";
 
 const ROW_HEIGHT = 34;
 const MAX_LISTED_ISSUES = 20;
+
+/** `risky`: any static finding; a kind narrows to that finding. */
+type RiskFilter = "all" | "risky" | RouteRiskKind;
 
 interface RouteListProps {
   scan: RouteScanControl;
@@ -23,15 +27,21 @@ export function routeKey(route: DiscoveredRoute): string {
 
 export function RouteList({ scan, selected, onSelect, online }: RouteListProps) {
   const [filter, setFilter] = useState("");
+  const [riskFilter, setRiskFilter] = useState<RiskFilter>("all");
   const scrollRef = useRef<HTMLDivElement>(null);
   const { report } = scan;
 
   const routes = useMemo(() => {
     const all = report?.routes ?? [];
     const needle = filter.trim().toLowerCase();
-    if (needle === "") return all;
-    return all.filter((route) => `${route.method} ${route.path} ${route.file}`.toLowerCase().includes(needle));
-  }, [report, filter]);
+    return all.filter((route) => {
+      if (riskFilter === "risky" && route.risks.length === 0) return false;
+      if (riskFilter !== "all" && riskFilter !== "risky" && !route.risks.some((risk) => risk.kind === riskFilter)) {
+        return false;
+      }
+      return needle === "" || `${route.method} ${route.path} ${route.file}`.toLowerCase().includes(needle);
+    });
+  }, [report, filter, riskFilter]);
 
   const virtualizer = useVirtualizer({
     count: routes.length,
@@ -107,6 +117,7 @@ export function RouteList({ scan, selected, onSelect, online }: RouteListProps) 
           {filter !== "" && <span className="num shrink-0 text-2xs text-fg-faint">{routes.length}</span>}
         </label>
       )}
+      {report !== null && <RiskFilters report={report} value={riskFilter} onChange={setRiskFilter} />}
 
       <div
         ref={scrollRef}
@@ -117,7 +128,7 @@ export function RouteList({ scan, selected, onSelect, online }: RouteListProps) 
         className="relative min-h-0 flex-1 overflow-y-auto border-t border-line outline-none focus-visible:border-fg-faint"
       >
         {routes.length === 0 ? (
-          <EmptyState report={report} filtered={filter.trim() !== ""} online={online} />
+          <EmptyState report={report} filtered={filter.trim() !== "" || riskFilter !== "all"} online={online} />
         ) : (
           <div style={{ height: virtualizer.getTotalSize() }} className="relative w-full">
             {virtualizer.getVirtualItems().map((item) => {
@@ -132,7 +143,78 @@ export function RouteList({ scan, selected, onSelect, online }: RouteListProps) 
         )}
       </div>
 
+      {selected !== null && selected.risks.length > 0 && <SelectedRisks route={selected} />}
       {report !== null && report.issues.length > 0 && <Issues report={report} />}
+    </div>
+  );
+}
+
+/** Static audit counters; each narrows the list so the riskiest handlers are one click away. */
+function RiskFilters({
+  report,
+  value,
+  onChange,
+}: {
+  report: RouteScanReport;
+  value: RiskFilter;
+  onChange: (value: RiskFilter) => void;
+}) {
+  const risky = report.routes.filter((route) => route.risks.length > 0).length;
+  if (risky === 0) return null;
+  const counts = new Map<RouteRiskKind, number>();
+  for (const route of report.routes) {
+    for (const risk of route.risks) counts.set(risk.kind, (counts.get(risk.kind) ?? 0) + 1);
+  }
+  const option = (id: RiskFilter, label: string, count: number | null, title: string) => (
+    <button
+      key={id}
+      type="button"
+      title={title}
+      aria-pressed={value === id}
+      onClick={() => onChange(value === id && id !== "all" ? "all" : id)}
+      className={`num flex h-5 shrink-0 items-center gap-1 rounded-xs border px-1.5 text-2xs ${
+        value === id
+          ? id === "all"
+            ? "border-line-strong bg-active text-fg-bright"
+            : "border-warn/60 bg-warn/10 text-warn"
+          : "border-line text-fg-dim hover:border-line-strong hover:text-fg"
+      }`}
+    >
+      {label}
+      {count !== null && <span className={value === id ? "" : "text-fg-bright"}>{count}</span>}
+    </button>
+  );
+  return (
+    <div className="mx-2.5 mb-1 flex shrink-0 flex-wrap items-center gap-1" role="radiogroup" aria-label="Static risk filter">
+      {option("all", "all", null, "Every route")}
+      {option("risky", "at risk", risky, "Routes with at least one static finding")}
+      {RISK_KINDS.filter((kind) => (counts.get(kind) ?? 0) > 0).map((kind) =>
+        option(kind, RISK_SHORT[kind], counts.get(kind) ?? 0, RISK_LABEL[kind]),
+      )}
+    </div>
+  );
+}
+
+function SelectedRisks({ route }: { route: DiscoveredRoute }) {
+  return (
+    <div className="max-h-36 shrink-0 overflow-y-auto border-t border-line px-2.5 py-1.5">
+      <div className="label-caps pb-1 text-fg-faint">Static risks</div>
+      <div className="flex flex-col gap-1.5">
+        {route.risks.map((risk) => (
+          <div key={`${risk.kind}:${risk.line}`} className="border-l border-warn pl-2">
+            <div className="num flex items-center gap-1.5 text-2xs">
+              <span className="label-caps text-warn">{RISK_LABEL[risk.kind]}</span>
+              <span className="ml-auto truncate text-fg-faint" title={`${route.file}:${risk.line}`}>
+                {fileLabel(route.file, risk.line)}
+              </span>
+            </div>
+            <div className="text-xs text-fg">{risk.detail}</div>
+            <div className="num truncate text-2xs text-fg-dim select-text" title={risk.evidence}>
+              {risk.evidence}
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -186,6 +268,11 @@ const RouteRow = memo(function RouteRow({
             contract
           </span>
         )}
+        {route.risks.map((risk) => (
+          <span key={risk.kind} className="shrink-0 text-warn" title={`${RISK_LABEL[risk.kind]}: ${risk.detail}`}>
+            {RISK_SHORT[risk.kind]}
+          </span>
+        ))}
         <span className="ml-auto shrink-0">{SOURCE_LABEL[route.source]}</span>
       </div>
     </div>
@@ -278,7 +365,7 @@ function Issues({ report }: { report: RouteScanReport }) {
 
 function EmptyState({ report, filtered, online }: { report: RouteScanReport | null; filtered: boolean; online: boolean }) {
   const message = filtered
-    ? "No routes match the filter."
+    ? "No routes match the filters."
     : report !== null
       ? `No route declarations in ${report.filesParsed} source files.`
       : online
