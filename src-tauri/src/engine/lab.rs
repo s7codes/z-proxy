@@ -2404,6 +2404,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn proxy_audits_lab_traffic_passively() {
+        const LOOKUPS: usize = 12;
         let (hub, lab, base) = started(LabMode::Unprotected).await;
         let proxy = ProxyManager::new(Arc::clone(&hub)).unwrap();
         let listener = proxy
@@ -2417,14 +2418,15 @@ mod tests {
             .unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
 
-        // An order list rendered one row at a time: eight lookups fired together.
+        // An order list rendered one row at a time: twelve lookups fired together. Four more
+        // than the threshold, so a slow CI scheduler still lands eight inside one window.
         let audit = |mode: LabMode| {
             let client = client.clone();
             let listener = listener.clone();
             let mut events = hub.subscribe();
             async move {
                 let mut lookups = tokio::task::JoinSet::new();
-                for id in 1..=8 {
+                for id in 1..=LOOKUPS {
                     let request = client.get(format!("http://{listener}/api/v1/orders/{id}"));
                     lookups.spawn(async move { request.send().await.unwrap().status().as_u16() });
                 }
@@ -2441,7 +2443,7 @@ mod tests {
 
                 let mut findings = Vec::new();
                 let mut exchanges = 0;
-                while exchanges < 9 {
+                while exchanges < LOOKUPS + 1 {
                     let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
                         .await
                         .unwrap()
@@ -2465,7 +2467,7 @@ mod tests {
         assert_eq!(count(&unprotected, TrafficFindingKind::NPlusOneBurst), 1);
         assert_eq!(
             count(&unprotected, TrafficFindingKind::HeaderMisconfiguration),
-            9,
+            LOOKUPS + 1,
             "credentialed CORS wildcard on every response"
         );
         assert!(unprotected.contains(&(TrafficFindingKind::PassiveDisclosure, Severity::Fault)));
