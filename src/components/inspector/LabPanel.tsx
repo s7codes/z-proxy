@@ -139,7 +139,7 @@ export function LabPanel({ lab, online, onLoadTarget, routing, onRouteViaProxy, 
           disabled={!running}
           onClick={onLoadTarget}
           title="Target the lab in the inspector, proxy, burst and fuzzer; list its routes"
-          className="flex h-6 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-xs border border-line-strong bg-active px-2 text-xs font-medium text-fg-bright hover:border-fg-faint disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-fg-faint"
+          className="flex h-6 min-w-0 flex-1 items-center justify-center gap-1 rounded-xs border border-line-strong bg-active px-1.5 text-xs font-medium text-fg-bright hover:border-fg-faint disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-fg-faint"
         >
           <Crosshair size={11} strokeWidth={1.75} />
           <span className="truncate">Load Lab Target</span>
@@ -154,7 +154,7 @@ export function LabPanel({ lab, online, onLoadTarget, routing, onRouteViaProxy, 
               ? `Burst and fuzzer send to the proxy at ${routing.listener ?? "-"} (${routing.armed ? "armed" : "disarmed"}, ${routing.rules} route rule${routing.rules === 1 ? "" : "s"}); click to send directly to the lab`
               : `Start the proxy with the lab as upstream on port ${DEFAULT_LISTEN_PORT} if needed, and send burst and fuzzer traffic through it`
           }
-          className={`flex h-6 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-xs border px-2 text-xs font-medium disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-fg-faint ${
+          className={`flex h-6 min-w-0 flex-1 items-center justify-center gap-1 rounded-xs border px-1.5 text-xs font-medium disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-fg-faint ${
             routing.active
               ? routing.armed
                 ? "border-warn/60 bg-warn/10 text-warn hover:border-warn"
@@ -164,7 +164,7 @@ export function LabPanel({ lab, online, onLoadTarget, routing, onRouteViaProxy, 
         >
           <Waypoints size={11} strokeWidth={1.75} className="shrink-0" />
           <span className="num truncate">
-            {routing.active ? `Via ${routing.listener?.replace(/^127\.0\.0\.1/, "") ?? "proxy"}` : "Route via Proxy"}
+            {routing.active ? `Via ${routing.listener?.replace(/^127\.0\.0\.1/, "") ?? "proxy"}` : "Via Proxy"}
           </span>
         </button>
         <ToolButton label="Reset" disabled={!controllable} title="Clear coupon ledger and counters" onClick={lab.reset}>
