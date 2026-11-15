@@ -83,7 +83,9 @@ pub fn require_plaintext(target: &GuardedTarget) -> EngineResult<()> {
 pub fn loopback_addr(target: &GuardedTarget) -> SocketAddr {
     match target.host_kind {
         HostKind::Ipv6 => SocketAddr::from((Ipv6Addr::LOCALHOST, target.port)),
-        HostKind::Ipv4 | HostKind::Localhost => SocketAddr::from((Ipv4Addr::LOCALHOST, target.port)),
+        HostKind::Ipv4 | HostKind::Localhost => {
+            SocketAddr::from((Ipv4Addr::LOCALHOST, target.port))
+        }
     }
 }
 
@@ -175,7 +177,9 @@ mod tests {
     use axum::Router;
 
     async fn serve(router: Router) -> SocketAddr {
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         addr
@@ -186,7 +190,10 @@ mod tests {
         let addr = serve(Router::new().route("/", get(|| async { StatusCode::IM_A_TEAPOT }))).await;
         let client = probe_client().unwrap();
 
-        for input in [format!("http://127.0.0.1:{}", addr.port()), format!("localhost:{}", addr.port())] {
+        for input in [
+            format!("http://127.0.0.1:{}", addr.port()),
+            format!("localhost:{}", addr.port()),
+        ] {
             let target = guard::validate_url(&input).unwrap();
             match probe(&client, &target).await {
                 ProbeResult::Reachable { status, .. } => assert_eq!(status, 418, "{input}"),
@@ -199,7 +206,13 @@ mod tests {
     async fn redirect_to_non_loopback_is_blocked() {
         let router = Router::new().route(
             "/",
-            get(|| async { (StatusCode::FOUND, [(header::LOCATION, "http://10.255.255.1/")]).into_response() }),
+            get(|| async {
+                (
+                    StatusCode::FOUND,
+                    [(header::LOCATION, "http://10.255.255.1/")],
+                )
+                    .into_response()
+            }),
         );
         let addr = serve(router).await;
         let client = probe_client().unwrap();
@@ -216,7 +229,10 @@ mod tests {
     #[tokio::test]
     async fn redirect_within_loopback_is_followed() {
         let router = Router::new()
-            .route("/", get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/ok")]).into_response() }))
+            .route(
+                "/",
+                get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/ok")]).into_response() }),
+            )
             .route("/ok", get(|| async { StatusCode::NO_CONTENT }));
         let addr = serve(router).await;
         let client = probe_client().unwrap();

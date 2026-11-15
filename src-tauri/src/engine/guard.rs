@@ -169,20 +169,34 @@ mod tests {
             "example.com",
         ];
         for input in cases {
-            assert_eq!(rejected_code(input), "NON_LOOPBACK_TARGET_REJECTED", "{input}");
+            assert_eq!(
+                rejected_code(input),
+                "NON_LOOPBACK_TARGET_REJECTED",
+                "{input}"
+            );
         }
     }
 
     #[test]
     fn rejects_unsupported_schemes() {
-        for input in ["file:///etc/passwd", "ftp://127.0.0.1", "gopher://localhost:70"] {
+        for input in [
+            "file:///etc/passwd",
+            "ftp://127.0.0.1",
+            "gopher://localhost:70",
+        ] {
             assert_eq!(rejected_code(input), "UNSUPPORTED_SCHEME", "{input}");
         }
     }
 
     #[test]
     fn rejects_malformed_and_credentialed_input() {
-        for input in ["", "   ", "http://", "http://evil.test@localhost", "http://u:p@127.0.0.1"] {
+        for input in [
+            "",
+            "   ",
+            "http://",
+            "http://evil.test@localhost",
+            "http://u:p@127.0.0.1",
+        ] {
             assert_eq!(rejected_code(input), "INVALID_TARGET", "{input}");
         }
     }
