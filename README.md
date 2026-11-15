@@ -439,9 +439,11 @@ Every value the engine writes onto the wire, so upstream logs can attribute test
 
 ## Requirements
 
-- Node.js 20+
+- Node.js 20.19+ (Vite 8)
 - Rust 1.90+
 - Windows: WebView2 runtime and MSVC build tools
+- Linux: WebKitGTK 4.1 development packages (`libwebkit2gtk-4.1-dev`, `libxdo-dev`,
+  `libssl-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`)
 
 ## Commands
 
@@ -450,8 +452,23 @@ npm install
 npm run tauri dev          # desktop app with HMR
 npm run build              # tsc + vite build
 cd src-tauri
+cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
 `src-tauri/Cargo.toml` denies `unwrap_used`, `expect_used` and `panic` outside tests.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+| Job                    | Runner                         | Steps                                                       |
+|------------------------|--------------------------------|-------------------------------------------------------------|
+| `frontend`             | ubuntu-24.04, Node 24          | `npm ci`, `npm run build`                                   |
+| `rust (ubuntu-24.04)`  | ubuntu-24.04, stable toolchain | WebKitGTK 4.1 packages, `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` |
+| `rust (windows-2025)`  | windows-2025, stable toolchain | `cargo clippy` and `cargo test` as above                    |
+
+The Windows job runs the same integration tests (barrier burst, lab race, `SO_LINGER=0`
+resets, listener release) on the platform whose timer resolution and socket teardown they
+were written against. `--locked` fails the build when `Cargo.lock` is stale.
