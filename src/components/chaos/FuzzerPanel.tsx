@@ -26,6 +26,7 @@ const CLASSES: ReadonlyArray<{ id: MutationClass; label: string; short: string }
   { id: "missingFields", label: "Missing fields", short: "missing" },
   { id: "schemaContractBounds", label: "Schema contract", short: "contract" },
   { id: "pathParamValidation", label: "Path parameters", short: "path" },
+  { id: "delimiterEscaping", label: "Delimiter escaping", short: "delimiter" },
 ];
 
 /** Classes whose case bodies cannot seed a base payload, which must be a plain JSON object. */

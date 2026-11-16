@@ -33,7 +33,8 @@ pub const OVERSIZED_LEN: usize = 64 * 1024;
 const MAX_TIMEOUT_MS: u32 = 60_000;
 const MAX_BASE_BYTES: usize = 256 * 1024;
 /// A field yields at most 16 cases across all per-field classes (a number: null, empty,
-/// 8 boundaries, 4 confusions, omission, `1e309`). 48 fields, the whole-body cases, 8
+/// 8 boundaries, 4 confusions, omission, `1e309`; a string 13, five of them delimiter
+/// values). 48 fields, the whole-body cases, 8
 /// duplicate keys and 8 path slots of 7 values each keep every suite below `MAX_CASES`
 /// without silently dropping mutations.
 const MAX_FIELDS: usize = 48;
@@ -64,7 +65,7 @@ const UTF8_FIELD: &str = "zproxyUtf8";
 /// to emit (a bare `NaN`, invalid UTF-8).
 const MARKER: &str = "__zproxy_marker_7f3a__";
 
-const ALL_CLASSES: [MutationClass; 9] = [
+const ALL_CLASSES: [MutationClass; 10] = [
     MutationClass::NullInjection,
     MutationClass::EmptyStrings,
     MutationClass::BoundaryNumbers,
@@ -74,6 +75,21 @@ const ALL_CLASSES: [MutationClass; 9] = [
     MutationClass::MissingFields,
     MutationClass::SchemaContractBounds,
     MutationClass::PathParamValidation,
+    MutationClass::DelimiterEscaping,
+];
+
+/// Values a correct service stores verbatim or refuses with a 4xx: a company name with an
+/// apostrophe and ampersand, a product label with a double quote and backslash, a list
+/// separator with parentheses, SQL `LIKE` / glob wildcards, and a combining accent followed
+/// by a zero-width space. Each is plain catalogue text; a 5xx or a leaked driver error means
+/// the value reached a string-built query, path or pattern unescaped. Labels spell the
+/// invisible code points out.
+const DELIMITER_VALUES: [(&str, &str); 5] = [
+    ("\"O'Reilly & Sons\"", "O'Reilly & Sons"),
+    (r#""15\" display \\ rev-2""#, "15\" display \\ rev-2"),
+    ("\"item; category(1)\"", "item; category(1)"),
+    ("\"100%_discount_*\"", "100%_discount_*"),
+    ("\"cafe<U+0301><U+200B>test\"", "cafe\u{0301}\u{200B}test"),
 ];
 
 /// Single-flight guard and cancel flag for the fuzzer; lives in `AppState`.
@@ -347,6 +363,13 @@ pub fn generate(
             MutationClass::PathParamValidation => {
                 if let Some(path) = path {
                     cases.extend(path_cases(base, path));
+                }
+            }
+            MutationClass::DelimiterEscaping => {
+                for field in fields.iter().filter(|f| f.kind == Kind::String) {
+                    for (label, value) in DELIMITER_VALUES {
+                        cases.push(field_case(class, field, label, Some(json!(value))));
+                    }
                 }
             }
         }
@@ -804,7 +827,8 @@ fn classify(
         Outcome::Response { status, .. } if *status >= 400 => (FuzzVerdict::Rejected, None),
         // Accepting these is itself the finding: a structurally invalid body (lenient parser,
         // or the body is never read), a body outside the schema contract, or a boundary
-        // identifier the route treated as valid. Other accepted mutations may be legitimate.
+        // identifier the route treated as valid. Other accepted mutations may be legitimate;
+        // a delimiter value stored verbatim is the correct outcome.
         Outcome::Response { .. } => (
             FuzzVerdict::Accepted,
             matches!(
@@ -1223,9 +1247,10 @@ mod tests {
                 (MutationClass::MissingFields, 9),
                 (MutationClass::SchemaContractBounds, 14),
                 (MutationClass::PathParamValidation, 0),
+                (MutationClass::DelimiterEscaping, 15),
             ]
         );
-        assert_eq!(generate(&default_template(), &ALL_CLASSES, None).len(), 100);
+        assert_eq!(generate(&default_template(), &ALL_CLASSES, None).len(), 115);
     }
 
     #[test]
@@ -1238,12 +1263,15 @@ mod tests {
             generate(&base, &ALL_CLASSES, path.as_ref()),
             generate(&base, &ALL_CLASSES, path.as_ref())
         );
-        // Appended classes never shift the indices of the original seven.
+        // Appended classes never shift the indices of earlier ones.
+        let all = generate(&base, &ALL_CLASSES, path.as_ref());
         let original = &ALL_CLASSES[..7];
-        assert_eq!(
-            generate(&base, original, None)[..],
-            generate(&base, &ALL_CLASSES, path.as_ref())[..86]
-        );
+        assert_eq!(generate(&base, original, None)[..], all[..86]);
+        let before_delimiters = generate(&base, &ALL_CLASSES[..9], path.as_ref());
+        assert_eq!(before_delimiters[..], all[..before_delimiters.len()]);
+        assert!(all[before_delimiters.len()..]
+            .iter()
+            .all(|case| case.class == MutationClass::DelimiterEscaping));
 
         let ordered: Map<String, Value> = serde_json::from_str(r#"{"z":1,"a":{"b":"x"}}"#).unwrap();
         let cases = generate(
@@ -1306,6 +1334,57 @@ mod tests {
         assert!(utf8.windows(2).any(|pair| pair == [0xC3, 0x28]));
         assert!(body_of(&cases, "bare NaN at /id").starts_with(br#"{"id":NaN,"#));
         assert!(body_of(&cases, "empty body").is_empty());
+    }
+
+    #[test]
+    fn delimiter_escaping_targets_string_fields_with_exact_values() {
+        let cases = cases_of(MutationClass::DelimiterEscaping);
+        let pointers: Vec<&str> = cases
+            .iter()
+            .filter_map(|case| case.pointer.as_deref())
+            .collect();
+        assert_eq!(pointers.len(), 15);
+        assert!(pointers
+            .iter()
+            .all(|p| matches!(*p, "/name" | "/email" | "/meta/source")));
+
+        let name_cases: Vec<&Case> = cases
+            .iter()
+            .filter(|case| case.pointer.as_deref() == Some("/name"))
+            .collect();
+        let labels: Vec<&str> = name_cases.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                r#"/name = "O'Reilly & Sons""#,
+                r#"/name = "15\" display \\ rev-2""#,
+                r#"/name = "item; category(1)""#,
+                r#"/name = "100%_discount_*""#,
+                r#"/name = "cafe<U+0301><U+200B>test""#,
+            ]
+        );
+        // Each body is valid JSON whose field decodes to the exact value; every other field
+        // keeps the base value.
+        for (case, (_, value)) in name_cases.iter().zip(DELIMITER_VALUES) {
+            let parsed: Value = serde_json::from_slice(&case.body).unwrap();
+            assert_eq!(parsed["name"], value, "{}", case.label);
+            assert_eq!(parsed["email"], "fuzz@zproxy.invalid");
+            assert_eq!(parsed["meta"]["source"], "z-proxy");
+        }
+        let wire =
+            String::from_utf8(body_of(&cases, r#"/name = "15\" display \\ rev-2""#).to_vec())
+                .unwrap();
+        assert!(wire.contains(r#""name":"15\" display \\ rev-2""#), "{wire}");
+        // The combining accent and the zero-width space travel as raw UTF-8: 13 bytes, 10
+        // scalar values, so byte- and character-length checks disagree.
+        let unicode: Value =
+            serde_json::from_slice(body_of(&cases, r#"/name = "cafe<U+0301><U+200B>test""#))
+                .unwrap();
+        let text = unicode["name"].as_str().unwrap();
+        assert_eq!((text.len(), text.chars().count()), (13, 10));
+
+        let numeric: Map<String, Value> = serde_json::from_str(r#"{"qty":2,"ok":true}"#).unwrap();
+        assert!(generate(&numeric, &[MutationClass::DelimiterEscaping], None).is_empty());
     }
 
     #[test]
@@ -1647,7 +1726,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.baseline.status, Some(201));
-        assert_eq!(report.cases.len(), 100);
+        assert_eq!(report.cases.len(), 115);
         assert_eq!(report.fields, 8);
         assert_eq!(report.classes, ALL_CLASSES);
         assert_eq!(report.path_template, None);
@@ -1732,12 +1811,22 @@ mod tests {
             .find(|s| s.class == MutationClass::MalformedJson)
             .unwrap();
         assert_eq!((malformed.cases, malformed.rejected), (8, 8));
+        // The service stores delimiter values verbatim: accepted, and not a finding.
+        let delimiters = report
+            .summary
+            .iter()
+            .find(|s| s.class == MutationClass::DelimiterEscaping)
+            .unwrap();
+        assert_eq!(
+            (delimiters.cases, delimiters.accepted, delimiters.faults),
+            (15, 15, 0)
+        );
 
         let mut kinds = (0, 0, 0);
         while let Ok(event) = events.try_recv() {
             match event {
                 TelemetryEvent::FuzzerStarted { cases, .. } => {
-                    assert_eq!(cases, 100);
+                    assert_eq!(cases, 115);
                     kinds.0 += 1;
                 }
                 TelemetryEvent::FuzzerCaseCompleted { .. } => kinds.1 += 1,
@@ -1748,7 +1837,7 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(kinds, (1, 101, 1));
+        assert_eq!(kinds, (1, 116, 1));
     }
 
     /// Express default error handler in development mode: malformed JSON is rejected with
@@ -1918,7 +2007,7 @@ mod tests {
             .iter()
             .filter(|c| c.verdict == FuzzVerdict::Skipped)
             .count();
-        assert!(skipped > 0 && skipped < 100, "skipped {skipped}");
+        assert!(skipped > 0 && skipped < 115, "skipped {skipped}");
         assert!(
             report.notes[0].contains("rejected with 422"),
             "{:?}",

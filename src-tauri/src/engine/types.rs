@@ -269,6 +269,11 @@ pub enum MutationClass {
     SchemaContractBounds,
     /// Boundary identifiers in each `{param}` slot of the target path; the body stays the base.
     PathParamValidation,
+    /// Each string field set to ordinary business values carrying quote, backslash,
+    /// separator, wildcard and invisible-Unicode delimiters. A service that binds or escapes
+    /// its strings stores them or refuses them cleanly; one that splices them into a query,
+    /// path or pattern fails.
+    DelimiterEscaping,
 }
 
 #[derive(Debug, Clone, Deserialize)]

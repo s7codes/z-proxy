@@ -1756,8 +1756,8 @@ mod tests {
                 Some(DisclosureKind::SqlError),
             ),
             (
-                "quoted sku",
-                with("sku", json!("KB' OR '1'='1")),
+                "apostrophe sku",
+                with("sku", json!("O'Reilly & Sons")),
                 server_error,
                 Some(DisclosureKind::SqlError),
             ),
@@ -1792,6 +1792,24 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert!(sql.contains("near '[object Object]'"), "{sql}");
+        // The string-built lookup breaks on the apostrophe of an ordinary company name.
+        let quoted = match unprotected_checkout(&with("sku", json!("O'Reilly & Sons"))) {
+            Checkout::Leak(leak) => leak.body,
+            other => panic!("{other:?}"),
+        };
+        assert!(quoted.contains("near ''Reilly & Sons'"), "{quoted}");
+        for harmless in [
+            "15\" display \\ rev-2",
+            "item; category(1)",
+            "100%_discount_*",
+            "cafe\u{0301}\u{200B}test",
+        ] {
+            assert_eq!(
+                unprotected_checkout(&with("sku", json!(harmless))),
+                Checkout::UnknownSku,
+                "{harmless}"
+            );
+        }
     }
 
     #[test]
@@ -1844,9 +1862,25 @@ mod tests {
             hardened_checkout(&omit("giftWrap")),
             Checkout::Created { .. }
         ));
+        // Delimiters are data: a free-text field stores them, the patterned SKU refuses them.
+        for name in [
+            "O'Reilly & Sons",
+            "15\" display \\ rev-2",
+            "cafe\u{0301}\u{200B}test",
+        ] {
+            assert!(
+                matches!(
+                    hardened_checkout(&with("customer.name", json!(name))),
+                    Checkout::Created { .. }
+                ),
+                "{name}"
+            );
+        }
 
         let invalid = [
             with("sku", Value::Null),
+            with("sku", json!("O'Reilly & Sons")),
+            with("sku", json!("100%_discount_*")),
             with("sku", json!("lab-kb-01")),
             with("sku", json!("NOPE-1")),
             with("quantity", json!(0)),
@@ -2280,6 +2314,22 @@ mod tests {
             assert_eq!(case.verdict, FuzzVerdict::Rejected);
             assert!(case.disclosure.is_some(), "{}", case.label);
         }
+        let apostrophe = |report: &crate::engine::types::FuzzReport| {
+            report
+                .cases
+                .iter()
+                .find(|c| c.label == r#"/sku = "O'Reilly & Sons""#)
+                .cloned()
+                .expect("delimiter case on /sku")
+        };
+        let case = apostrophe(&report);
+        assert_eq!(case.class, Some(MutationClass::DelimiterEscaping));
+        assert_eq!(case.verdict, FuzzVerdict::ServerError);
+        assert_eq!(case.severity, Some(Severity::Fault));
+        assert_eq!(
+            case.disclosure.map(|d| d.kind),
+            Some(DisclosureKind::SqlError)
+        );
 
         lab.set_mode(LabMode::Hardened).await;
         let report = fuzzer::run(checkout_fuzz(&base), &hub, &slot)
@@ -2294,6 +2344,9 @@ mod tests {
             .cases
             .iter()
             .all(|c| matches!(c.status, Some(201) | Some(422))));
+        let case = apostrophe(&report);
+        assert_eq!((case.status, case.severity), (Some(422), None));
+        assert!(case.disclosure.is_none());
         lab.stop().await;
     }
 

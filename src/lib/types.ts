@@ -205,7 +205,8 @@ export type MutationClass =
   | "malformedJson"
   | "missingFields"
   | "schemaContractBounds"
-  | "pathParamValidation";
+  | "pathParamValidation"
+  | "delimiterEscaping";
 
 export interface FuzzSpec {
   /** May hold `{param}` placeholders in the path; path vectors vary each slot. */
