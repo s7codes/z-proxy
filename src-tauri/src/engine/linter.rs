@@ -1129,10 +1129,33 @@ fn body_checks(
     content_type(media, json_media, json_body, body, out);
     if (200..300).contains(&view.status) && (json_media || json_body) {
         collection(view.headers, body, out);
+        field_leak(view, body, out);
     }
     if media.is_none_or(is_textual) {
         leak(view.status, body, out);
     }
+}
+
+/// A stored-model field in a successful JSON response: credential material is a fault, a
+/// credential returned outside a route that issues it a warning.
+fn field_leak(view: &ResponseView<'_>, body: &[u8], out: &mut Vec<TrafficFinding>) {
+    let Some(found) = disclosure::field_leak(body, view.path) else {
+        return;
+    };
+    out.push(finding(
+        TrafficFindingKind::PassiveDisclosure,
+        if found.credential {
+            Severity::Fault
+        } else {
+            Severity::Warn
+        },
+        format!(
+            "{} in a {} JSON response; project the stored model onto a response DTO",
+            disclosure::label(found.disclosure.kind),
+            view.status
+        ),
+        Some(found.disclosure.evidence),
+    ));
 }
 
 fn header<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<&'a str> {
@@ -1924,6 +1947,39 @@ mod tests {
         cut.resize(DISCLOSURE_SCAN_BYTES - 1, b' ');
         cut.extend_from_slice("\u{00e9}".as_bytes());
         assert_eq!(inspect_with("GET", "/q", 500, &[], &cut).len(), 1);
+    }
+
+    #[test]
+    fn sensitive_fields_in_successful_json_responses() {
+        let order = br#"{"id":7,"customer":{"email":"operator@lab.local","passwordHash":"$2b$12$ZproxyLabFixtureSalt00NotARealCredentialOnlyAFixture0"}}"#;
+        let found = inspect_with("GET", "/api/v1/orders/7", 200, &[JSON], order);
+        assert_eq!(
+            kinds(&found),
+            [(TrafficFindingKind::PassiveDisclosure, Severity::Fault)]
+        );
+        assert_eq!(
+            found[0].detail,
+            "Sensitive field in a 200 JSON response; project the stored model onto a response DTO"
+        );
+        assert_eq!(
+            found[0].evidence.as_deref(),
+            Some(r#"/customer/passwordHash = "$2b$12$..." (60 chars)"#)
+        );
+        // An issued credential is expected from the route that issues it, a warning elsewhere;
+        // error responses are not judged.
+        let issued = br#"{"clientId":"ci","clientSecret":"cs-7d1f2a9b"}"#;
+        assert!(inspect_with("POST", "/api/oauth/clients", 201, &[JSON], issued).is_empty());
+        assert_eq!(
+            kinds(&inspect_with(
+                "GET",
+                "/api/projects/7",
+                200,
+                &[JSON],
+                issued
+            )),
+            [(TrafficFindingKind::PassiveDisclosure, Severity::Warn)]
+        );
+        assert!(inspect_with("GET", "/api/v1/orders/7", 404, &[JSON], order).is_empty());
     }
 
     fn gzip(bytes: &[u8]) -> Vec<u8> {

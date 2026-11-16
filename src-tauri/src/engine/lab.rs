@@ -79,6 +79,18 @@ const NAME_MAX: usize = 64;
 const NOTE_MAX: usize = 256;
 const QUANTITY_MAX: i64 = 10_000;
 const CHECKOUT_FIELDS: [&str; 5] = ["sku", "quantity", "customer", "note", "giftWrap"];
+/// Fields of the documented `Order` response; the handler sets them after spreading the
+/// body, so an undeclared field of the same name never replaces one.
+const ORDER_FIELDS: [&str; 6] = ["id", "orderId", "status", "sku", "quantity", "totalCents"];
+/// Account behind the seeded order history and the checkout sample.
+const LAB_ACCOUNT: &str = "operator@lab.local";
+/// bcrypt-shaped fixture (cost 12, 22-character salt, 31-character digest) that no
+/// password produces; what an unprojected account row puts in a response.
+const LAB_PASSWORD_HASH: &str = "$2b$12$ZproxyLabFixtureSalt00NotARealCredentialOnlyAFixture0";
+/// Undeclared scalar fields an unprotected order document keeps; anything larger is dropped
+/// like a value that fits no column, so the ledger stays bounded.
+const MAX_STORED_EXTRAS: usize = 8;
+const MAX_EXTRA_CHARS: usize = 64;
 const CATALOG: [(&str, i64); 3] = [
     ("LAB-KB-01", 4_999),
     ("LAB-MS-02", 2_999),
@@ -158,25 +170,49 @@ struct StoredOrder {
     sku: String,
     quantity: i64,
     total_cents: i64,
+    /// Email of the account that placed the order.
+    customer: String,
+    /// Undeclared fields the unprotected checkout stored from the request body.
+    extras: Vec<(String, Value)>,
 }
 
 impl StoredOrder {
     /// The documented `Order` schema. Unprotected serializes the total through a decimal
     /// formatter that yields a string, the drift a client parsing `totalCents` as an integer
-    /// trips over.
+    /// trips over. It also returns the stored document rather than a DTO: the joined account
+    /// row, password hash included, and every undeclared field the checkout body carried
+    /// (`Order.create({ ...req.body })` in a schemaless store). Hardened projects exactly the
+    /// documented fields.
     fn to_json(&self, mode: LabMode) -> Value {
         let total = match mode {
             LabMode::Unprotected => Value::String(self.total_cents.to_string()),
             LabMode::Hardened => Value::from(self.total_cents),
         };
-        json!({
+        let mut body = json!({
             "id": self.id,
             "orderId": format!("ord-{:06}", self.id),
             "status": "confirmed",
             "sku": self.sku,
             "quantity": self.quantity,
             "totalCents": total,
-        })
+        });
+        if mode == LabMode::Unprotected {
+            if let Some(fields) = body.as_object_mut() {
+                fields.insert(
+                    "customer".to_owned(),
+                    json!({
+                        "accountId": "acct-1001",
+                        "email": self.customer,
+                        "passwordHash": LAB_PASSWORD_HASH,
+                        "resetToken": null,
+                    }),
+                );
+                for (key, value) in &self.extras {
+                    fields.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        body
     }
 }
 
@@ -215,6 +251,8 @@ impl Shared {
                 sku: (*sku).to_owned(),
                 quantity: *quantity,
                 total_cents: price(sku).unwrap_or(0) * quantity,
+                customer: LAB_ACCOUNT.to_owned(),
+                extras: Vec::new(),
             });
         }
         self.ledger()
@@ -638,6 +676,9 @@ enum Checkout {
         sku: String,
         quantity: i64,
         total_cents: i64,
+        customer: String,
+        /// Undeclared top-level fields kept from the body; always empty when hardened.
+        extras: Vec<(String, Value)>,
     },
     /// Hardened: 422 with every violation found.
     Invalid(Vec<Value>),
@@ -672,16 +713,25 @@ async fn checkout(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: B
             sku,
             quantity,
             total_cents,
+            customer,
+            extras,
         } => {
+            let outcome = if extras.is_empty() {
+                "order confirmed"
+            } else {
+                "order confirmed: undeclared fields stored"
+            };
             let order = StoredOrder {
                 id: shared.next_order.fetch_add(1, Ordering::SeqCst),
                 sku,
                 quantity,
                 total_cents,
+                customer,
+                extras,
             };
             let body = order.to_json(mode);
             shared.ledger().confirm(order);
-            json_reply(StatusCode::CREATED, &body, "order confirmed")
+            json_reply(StatusCode::CREATED, &body, outcome)
         }
         rejected => checkout_rejection(rejected),
     }
@@ -736,12 +786,16 @@ fn idempotent_checkout(shared: &Shared, key: &HeaderValue, body: &[u8]) -> Respo
             sku,
             quantity,
             total_cents,
+            customer,
+            extras,
         } => {
             let order = StoredOrder {
                 id: shared.next_order.fetch_add(1, Ordering::SeqCst),
                 sku,
                 quantity,
                 total_cents,
+                customer,
+                extras,
             };
             let text = order.to_json(LabMode::Hardened).to_string();
             ledger.confirm(order);
@@ -841,11 +895,11 @@ fn unprotected_checkout(body: &[u8]) -> Checkout {
         Some(Value::String(text)) => return postgres_invalid_input(text),
         Some(_) => return node_not_a_function("quantity.toFixed", "computeTotal", 57),
     };
-    match value.get("customer") {
+    let email = match value.get("customer") {
         None => return node_null("undefined", "email", "normalizeCustomer", 64),
         Some(Value::Null) => return node_null("null", "email", "normalizeCustomer", 64),
         Some(Value::Object(customer)) => {
-            match customer.get("email") {
+            let email = match customer.get("email") {
                 None => return node_null("undefined", "toLowerCase", "normalizeCustomer", 65),
                 Some(Value::Null) => {
                     return node_null("null", "toLowerCase", "normalizeCustomer", 65)
@@ -853,7 +907,7 @@ fn unprotected_checkout(body: &[u8]) -> Checkout {
                 Some(Value::String(email)) if email.chars().count() > EMAIL_MAX => {
                     return python_truncation("customer_email", EMAIL_MAX)
                 }
-                Some(Value::String(_)) => {}
+                Some(Value::String(email)) => email.as_str(),
                 Some(_) => {
                     return node_not_a_function(
                         "customer.email.toLowerCase",
@@ -861,7 +915,7 @@ fn unprotected_checkout(body: &[u8]) -> Checkout {
                         65,
                     )
                 }
-            }
+            };
             match customer.get("name") {
                 None => return node_null("undefined", "trim", "normalizeCustomer", 66),
                 Some(Value::Null) => return node_null("null", "trim", "normalizeCustomer", 66),
@@ -873,10 +927,11 @@ fn unprotected_checkout(body: &[u8]) -> Checkout {
                     return node_not_a_function("customer.name.trim", "normalizeCustomer", 66)
                 }
             }
+            email
         }
         // `"text".email` is `undefined` in JavaScript, so the crash is one property later.
         Some(_) => return node_null("undefined", "toLowerCase", "normalizeCustomer", 65),
-    }
+    };
     match value.get("note") {
         None => {}
         Some(Value::Null) => return node_null("null", "slice", "formatNote", 79),
@@ -899,7 +954,30 @@ fn unprotected_checkout(body: &[u8]) -> Checkout {
         sku: sku.to_owned(),
         quantity: quantity as i64,
         total_cents: total as i64,
+        customer: email.to_owned(),
+        extras: undeclared_scalars(&value),
     }
+}
+
+/// Top-level fields of the body that neither the request nor the response schema declares,
+/// as the unprotected order document stores them: scalars only, first `MAX_STORED_EXTRAS`.
+fn undeclared_scalars(body: &Value) -> Vec<(String, Value)> {
+    let Some(fields) = body.as_object() else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .filter(|(key, _)| {
+            !CHECKOUT_FIELDS.contains(&key.as_str()) && !ORDER_FIELDS.contains(&key.as_str())
+        })
+        .filter(|(_, value)| match value {
+            Value::Bool(_) | Value::Number(_) => true,
+            Value::String(text) => text.chars().count() <= MAX_EXTRA_CHARS,
+            _ => false,
+        })
+        .take(MAX_STORED_EXTRAS)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 fn hardened_checkout(body: &[u8]) -> Checkout {
@@ -959,19 +1037,20 @@ fn hardened_checkout(body: &[u8]) -> Checkout {
             None
         }
     };
+    let mut email = None;
     match object.get("customer") {
         Some(Value::Object(customer)) => {
             violations.extend(unknown_fields(customer, &["email", "name"], "/customer"));
-            let email_ok = customer
+            email = customer
                 .get("email")
                 .and_then(Value::as_str)
-                .is_some_and(|email| {
+                .filter(|email| {
                     (3..=EMAIL_MAX).contains(&email.chars().count())
                         && email.matches('@').count() == 1
                         && !email.starts_with('@')
                         && !email.ends_with('@')
                 });
-            if !email_ok {
+            if email.is_none() {
                 violations.push(violation(
                     "/customer/email",
                     &format!("required address of at most {EMAIL_MAX} characters"),
@@ -1005,11 +1084,13 @@ fn hardened_checkout(body: &[u8]) -> Checkout {
         violations.push(violation("/giftWrap", "optional boolean"));
     }
 
-    match (sku, quantity) {
-        (Some(sku), Some(quantity)) if violations.is_empty() => Checkout::Created {
+    match (sku, quantity, email) {
+        (Some(sku), Some(quantity), Some(email)) if violations.is_empty() => Checkout::Created {
             sku: sku.to_owned(),
             quantity,
             total_cents: price(sku).unwrap_or(0) * quantity,
+            customer: email.to_owned(),
+            extras: Vec::new(),
         },
         _ => Checkout::Invalid(violations),
     }
@@ -1819,7 +1900,9 @@ mod tests {
             Checkout::Created {
                 sku: "LAB-KB-01".to_owned(),
                 quantity: 2,
-                total_cents: 9_998
+                total_cents: 9_998,
+                customer: LAB_ACCOUNT.to_owned(),
+                extras: Vec::new(),
             }
         );
         for body in [
@@ -1845,13 +1928,78 @@ mod tests {
     }
 
     #[test]
+    fn unprotected_orders_return_the_stored_document_and_hardened_a_dto() {
+        let long = "x".repeat(MAX_EXTRA_CHARS + 1);
+        let body = duplicated(&format!(
+            r#""isAdmin":true,"zproxyExtra":"unexpected","status":"refunded","zproxyPad":"{long}","tags":["x"]"#
+        ));
+        let Checkout::Created {
+            customer, extras, ..
+        } = unprotected_checkout(&body)
+        else {
+            panic!("unprotected checkout should accept undeclared fields");
+        };
+        assert_eq!(customer, LAB_ACCOUNT);
+        // Scalars that fit a column are stored; a documented response field, an oversized
+        // string and an array are not.
+        assert_eq!(
+            extras,
+            [
+                ("isAdmin".to_owned(), json!(true)),
+                ("zproxyExtra".to_owned(), json!("unexpected")),
+            ]
+        );
+        let order = StoredOrder {
+            id: 9,
+            sku: "LAB-KB-01".to_owned(),
+            quantity: 2,
+            total_cents: 9_998,
+            customer,
+            extras,
+        };
+        let stored = order.to_json(LabMode::Unprotected);
+        assert_eq!(stored["isAdmin"], true);
+        assert_eq!(stored["status"], "confirmed");
+        assert_eq!(stored["customer"]["passwordHash"], LAB_PASSWORD_HASH);
+        let leak = disclosure::field_leak(stored.to_string().as_bytes(), "/api/v1/orders/checkout")
+            .unwrap();
+        assert!(leak.credential);
+        assert_eq!(
+            leak.disclosure.evidence,
+            r#"/customer/passwordHash = "$2b$12$..." (60 chars)"#
+        );
+
+        let projected = order.to_json(LabMode::Hardened);
+        let fields: Vec<&str> = projected
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(fields, ORDER_FIELDS);
+        assert!(disclosure::field_leak(
+            projected.to_string().as_bytes(),
+            "/api/v1/orders/checkout"
+        )
+        .is_none());
+        match hardened_checkout(&body) {
+            Checkout::Invalid(violations) => {
+                assert!(violations.iter().any(|v| v["pointer"] == "/isAdmin"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn hardened_checkout_rejects_everything_invalid_with_clean_bodies() {
         assert_eq!(
             hardened_checkout(CHECKOUT_SAMPLE.as_bytes()),
             Checkout::Created {
                 sku: "LAB-KB-01".to_owned(),
                 quantity: 2,
-                total_cents: 9_998
+                total_cents: 9_998,
+                customer: LAB_ACCOUNT.to_owned(),
+                extras: Vec::new(),
             }
         );
         assert!(matches!(
@@ -1967,6 +2115,8 @@ mod tests {
             sku: "LAB-MS-02".to_owned(),
             quantity: 3,
             total_cents: 8_997,
+            customer: LAB_ACCOUNT.to_owned(),
+            extras: Vec::new(),
         };
         let shared = Shared {
             hub: Arc::new(TelemetryHub::new()),
@@ -2764,7 +2914,13 @@ mod tests {
             outcome("+/zproxyNest = 1024 nested objects"),
             (Some(500), fault)
         );
-        assert_eq!(outcome("+/isAdmin = true"), (Some(201), warn));
+        // Undeclared top-level scalars are stored and echoed: a mass assignment. The nested
+        // extra is accepted but never comes back, which stays a contract warning.
+        assert_eq!(outcome("+/isAdmin = true"), (Some(201), fault));
+        assert_eq!(
+            outcome("+/zproxyExtra = \"unexpected\""),
+            (Some(201), fault)
+        );
         assert_eq!(
             outcome("+/customer/zproxyExtra = \"unexpected\""),
             (Some(201), warn)
@@ -2774,6 +2930,38 @@ mod tests {
             .cases
             .iter()
             .all(|c| matches!(c.status, Some(201) | Some(500))));
+        let echoed: Vec<(&str, &str)> = report
+            .cases
+            .iter()
+            .filter_map(|c| c.mass_assignment.as_ref())
+            .map(|m| (m.echoed_at.as_str(), m.detail.as_str()))
+            .collect();
+        assert_eq!(
+            echoed,
+            [
+                (
+                    "/zproxyExtra",
+                    "mass-assignment: undeclared field 'zproxyExtra' was accepted and echoed in 2xx response"
+                ),
+                (
+                    "/isAdmin",
+                    "mass-assignment: undeclared field 'isAdmin' was accepted and echoed in 2xx response"
+                ),
+            ]
+        );
+        assert_eq!(report.mass_assignments, 2);
+        // The joined account row leaks on every order response; the baseline carries it and
+        // the cases repeating it are not charged with it.
+        assert_eq!(
+            report.baseline.disclosure.as_ref().map(|d| d.kind),
+            Some(DisclosureKind::SensitiveFieldLeak)
+        );
+        assert!(report.notes.iter().any(|note| note
+            .starts_with("baseline response exposes a sensitive field (/customer/passwordHash")));
+        assert!(report.cases.iter().all(|c| c
+            .disclosure
+            .as_ref()
+            .is_none_or(|d| d.kind != DisclosureKind::SensitiveFieldLeak)));
 
         lab.set_mode(LabMode::Hardened).await;
         let report = fuzzer::run(spec(), &hub, &slot).await.unwrap();

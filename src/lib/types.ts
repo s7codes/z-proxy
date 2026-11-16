@@ -232,12 +232,29 @@ export type DisclosureKind =
   | "goPanic"
   | "jvmStackTrace"
   | "dotNetStackTrace"
-  | "sqlError";
+  | "sqlError"
+  /**
+   * A 2xx JSON body carrying a stored-model field a response DTO would drop: a password, its
+   * hash or salt, a private key, a reset or two-factor secret, a client secret, API key or
+   * refresh token outside a route that issues one, or a value in a password-hash format.
+   */
+  | "sensitiveFieldLeak";
 
 export interface Disclosure {
   kind: DisclosureKind;
-  /** Matched fragment, trimmed to 160 characters. */
+  /** Matched fragment, trimmed to 160 characters; a sensitive field shows its pointer and value shape only. */
   evidence: string;
+}
+
+/** An undeclared field a case sent that came back in its 2xx JSON response. */
+export interface MassAssignment {
+  /** RFC 6901 pointer of the undeclared field as sent. */
+  pointer: string;
+  /** Where the response carried it back; differs from `pointer` under one envelope key (`/data`). */
+  echoedAt: string;
+  /** The value as sent and echoed, compact JSON. */
+  value: string;
+  detail: string;
 }
 
 export interface FuzzCaseResult {
@@ -254,10 +271,15 @@ export interface FuzzCaseResult {
   responsePreview: string | null;
   verdict: FuzzVerdict;
   severity: Severity | null;
-  /** Found in the preview whatever the status; raises a clean mutation case to `warn`. */
+  /**
+   * Found in the preview whatever the status, or a sensitive field in a 2xx JSON body the baseline
+   * did not already expose; raises a clean mutation case to `warn`.
+   */
   disclosure: Disclosure | null;
   /** Drift from the spec's `contract`; empty without one. Raises a clean mutation case to `warn`. */
   violations: ContractViolation[];
+  /** The undeclared field this case added, echoed by a 2xx response; raises the case to `fault`. */
+  massAssignment: MassAssignment | null;
   error: string | null;
 }
 
@@ -281,10 +303,12 @@ export interface FuzzReport {
   summary: ClassSummary[];
   faults: number;
   warnings: number;
-  /** Mutation cases whose response disclosed a stack trace or database error. */
+  /** Mutation cases whose response disclosed a stack trace, database error or sensitive field. */
   disclosures: number;
   /** Requests, baseline included, whose response broke the documented contract. */
   contractViolations: number;
+  /** Mutation cases whose undeclared field came back in a 2xx response. */
+  massAssignments: number;
   aborted: string | null;
   notes: string[];
   /** Base payload exactly as sent in the baseline; with `classes` and `pathTemplate` it reproduces any case. */

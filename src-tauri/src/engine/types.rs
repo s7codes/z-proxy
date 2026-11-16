@@ -321,6 +321,26 @@ pub enum DisclosureKind {
     JvmStackTrace,
     DotNetStackTrace,
     SqlError,
+    /// A 2xx JSON body carrying a stored-model field a response DTO would drop: a password,
+    /// its hash or salt, a private key, a reset or two-factor secret, a client secret, API
+    /// key or refresh token outside a route that issues one, or any value in a bcrypt,
+    /// argon2, scrypt or PBKDF2 hash format.
+    SensitiveFieldLeak,
+}
+
+/// An undeclared field a case sent that came back in its 2xx JSON response: the service
+/// bound request input it does not document onto the stored model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MassAssignment {
+    /// RFC 6901 pointer of the undeclared field as sent.
+    pub pointer: String,
+    /// Where the response carried it back; under one envelope key (`/data`) it differs from
+    /// `pointer`.
+    pub echoed_at: String,
+    /// The value as sent and echoed, compact JSON.
+    pub value: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -348,12 +368,16 @@ pub struct FuzzCaseResult {
     pub response_preview: Option<String>,
     pub verdict: FuzzVerdict,
     pub severity: Option<Severity>,
-    /// Stack trace or database error found in the preview, whatever the status. Raises an
+    /// Stack trace or database error found in the preview, whatever the status, or a
+    /// sensitive field in a 2xx JSON body that the baseline did not already expose. Raises an
     /// otherwise clean mutation case to `Severity::Warn`.
     pub disclosure: Option<Disclosure>,
     /// Drift from the spec's `contract`; empty without one. Raises an otherwise clean
     /// mutation case to `Severity::Warn`.
     pub violations: Vec<ContractViolation>,
+    /// The undeclared field this case added, echoed by a 2xx response. Raises the case to
+    /// `Severity::Fault`.
+    pub mass_assignment: Option<MassAssignment>,
     pub error: Option<String>,
 }
 
@@ -384,10 +408,13 @@ pub struct FuzzReport {
     pub summary: Vec<ClassSummary>,
     pub faults: u32,
     pub warnings: u32,
-    /// Mutation cases whose response disclosed a stack trace or database error.
+    /// Mutation cases whose response disclosed a stack trace, database error or sensitive
+    /// field.
     pub disclosures: u32,
     /// Requests, baseline included, whose response broke the documented contract.
     pub contract_violations: u32,
+    /// Mutation cases whose undeclared field came back in a 2xx response.
+    pub mass_assignments: u32,
     /// Set when the run stopped early: target unreachable or operator cancel.
     pub aborted: Option<String>,
     /// Context that changes how results read, such as a baseline that was not accepted.

@@ -8,4 +8,5 @@ export const DISCLOSURE_LABEL: Record<DisclosureKind, string> = {
   jvmStackTrace: "JVM stack trace",
   dotNetStackTrace: ".NET stack trace",
   sqlError: "SQL error",
+  sensitiveFieldLeak: "Sensitive field",
 };

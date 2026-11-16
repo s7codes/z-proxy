@@ -119,6 +119,11 @@ impl RequestTemplate {
         self.headers.contains_key(name)
     }
 
+    /// Origin-form target as validated: path and query.
+    pub fn origin_form(&self) -> &Uri {
+        &self.uri
+    }
+
     pub fn request(&self, body: Bytes) -> Request<Full<Bytes>> {
         self.request_at(&self.uri, body)
     }

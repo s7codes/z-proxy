@@ -318,6 +318,7 @@ function toRow(event: TelemetryEvent): Row {
         detail:
           result.error ??
           [
+            result.massAssignment === null ? null : result.massAssignment.detail,
             result.disclosure === null ? null : `leak ${DISCLOSURE_LABEL[result.disclosure.kind]}: ${result.disclosure.evidence}`,
             result.violations.length === 0 ? null : `drift ${summarizeViolations(result.violations) ?? ""}`,
             `req ${formatBytes(result.requestBytes)}`,

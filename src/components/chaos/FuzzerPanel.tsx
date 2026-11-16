@@ -393,7 +393,15 @@ function FuzzReportView({
 
   return (
     <>
-      <Section title="Result" aside={<span className="num text-2xs text-fg-faint">{report.id.slice(0, 8)}</span>}>
+      <Section
+        title="Result"
+        aside={
+          <span className="num text-2xs text-fg-faint">
+            {`${formatLatency(report.wallUs)}  `}
+            {report.id.slice(0, 8)}
+          </span>
+        }
+      >
         <div className="num mb-2 grid grid-cols-3 gap-px border border-line bg-line text-xs">
           <Metric label="cases" value={executed === report.cases.length ? String(executed) : `${executed}/${report.cases.length}`} />
           <Metric label="faults" value={String(report.faults)} tone={report.faults > 0 ? "fault" : undefined} />
@@ -404,7 +412,11 @@ function FuzzReportView({
             value={String(report.contractViolations)}
             tone={report.contractViolations > 0 ? "warn" : undefined}
           />
-          <Metric label="wall" value={formatLatency(report.wallUs)} />
+          <Metric
+            label="echo"
+            value={String(report.massAssignments)}
+            tone={report.massAssignments > 0 ? "fault" : undefined}
+          />
         </div>
         <div className="num grid grid-cols-[64px_1fr_auto] items-center text-xs">
           <span className="text-fg-faint">baseline</span>
@@ -469,7 +481,7 @@ function FuzzReportView({
         {findings.length === 0 ? (
           <div className="flex items-center gap-1.5 text-xs text-ok">
             <StatusSquare className="bg-ok" />
-            No 5xx, transport failures, leaked traces or contract drift across {executed} cases
+            No 5xx, transport failures, leaks, mass assignments or contract drift across {executed} cases
           </div>
         ) : (
           <div className="flex flex-col gap-1.5">
@@ -532,6 +544,12 @@ function FindingRow({
         </span>
       </button>
       {result.error !== null && <div className="num text-2xs text-fg-dim">{result.error}</div>}
+      {result.massAssignment !== null && (
+        <div className="num flex min-w-0 items-center gap-1.5 text-2xs" title={result.massAssignment.detail}>
+          <span className="shrink-0 text-fault">Mass assignment</span>
+          <span className="truncate text-fg-dim">{`${result.massAssignment.echoedAt} = ${result.massAssignment.value}`}</span>
+        </div>
+      )}
       {result.disclosure !== null && (
         <div className="num flex min-w-0 items-center gap-1.5 text-2xs" title={result.disclosure.evidence}>
           <span className="shrink-0 text-warn">{DISCLOSURE_LABEL[result.disclosure.kind]}</span>

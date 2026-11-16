@@ -24,8 +24,9 @@ use super::http1::{self, OpenError, RequestTemplate, CONNECT_TIMEOUT};
 use super::net;
 use super::pathparam::{self, PathTemplate};
 use super::types::{
-    BurstMethod, ClassSummary, ContractViolation, FuzzCasePayload, FuzzCaseRef, FuzzCaseResult,
-    FuzzReport, FuzzSpec, FuzzVerdict, MutationClass, ResponseContract, Severity, TelemetryEvent,
+    BurstMethod, ClassSummary, ContractViolation, Disclosure, DisclosureKind, FuzzCasePayload,
+    FuzzCaseRef, FuzzCaseResult, FuzzReport, FuzzSpec, FuzzVerdict, MassAssignment, MutationClass,
+    ResponseContract, Severity, TelemetryEvent,
 };
 use crate::telemetry::{now_us, TelemetryHub};
 
@@ -135,6 +136,9 @@ pub struct Case {
     pub body: Bytes,
     /// Origin-form target of a path case; `None` sends the suite target.
     pub path: Option<Uri>,
+    /// Value of the undeclared field this case adds at `pointer`; a 2xx response that
+    /// carries it back is a mass assignment.
+    pub undeclared: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +305,7 @@ pub fn generate(
         pointer: Some(field.pointer.clone()),
         body: Bytes::from(encode(&mutate(base, &field.path, value))),
         path: None,
+        undeclared: None,
     };
 
     for &class in classes {
@@ -385,6 +390,7 @@ fn whole(class: MutationClass, label: &str, pointer: Option<String>, body: Vec<u
         pointer,
         body: Bytes::from(body),
         path: None,
+        undeclared: None,
     }
 }
 
@@ -446,12 +452,14 @@ fn contract_bounds(base: &Map<String, Value>, fields: &[Field]) -> Vec<Case> {
     }
 
     let mut extra = |path: Vec<String>, value: Value| {
-        cases.push(whole(
+        let mut case = whole(
             class,
             &format!("+{} = {value}", pointer(&path)),
             Some(pointer(&path)),
-            encode(&mutate(base, &path, Some(value))),
-        ));
+            encode(&mutate(base, &path, Some(value.clone()))),
+        );
+        case.undeclared = Some(value);
+        cases.push(case);
     };
     extra(vec![EXTRA_FIELD.to_owned()], json!("unexpected"));
     if !base.contains_key(PRIVILEGE_FIELD) {
@@ -504,6 +512,7 @@ fn path_cases(base: &Map<String, Value>, path: &PathTemplate) -> Vec<Case> {
                 pointer: None,
                 body: body.clone(),
                 path: Some(uri),
+                undeclared: None,
             });
         }
     }
@@ -604,9 +613,9 @@ struct Plan {
 
 impl Plan {
     /// Body bytes kept per response: the disclosure preview, or the whole body (bounded) when
-    /// a contract needs it parsed.
-    fn capture_limit(&self) -> usize {
-        if self.contract.is_some() {
+    /// a contract or an echo check (`probe`) needs it parsed.
+    fn capture_limit(&self, probe: bool) -> usize {
+        if self.contract.is_some() || probe {
             contract::MAX_BODY_BYTES
         } else {
             PREVIEW_BYTES
@@ -762,7 +771,7 @@ enum Outcome {
     },
 }
 
-async fn send(plan: &Plan, index: u32, body: Bytes, path: Option<&Uri>) -> Outcome {
+async fn send(plan: &Plan, index: u32, body: Bytes, path: Option<&Uri>, capture: usize) -> Outcome {
     let opened =
         tokio::time::timeout(plan.connect_timeout, http1::open(&plan.template.target)).await;
     let mut sender = match opened {
@@ -791,7 +800,7 @@ async fn send(plan: &Plan, index: u32, body: Bytes, path: Option<&Uri>) -> Outco
 
     let started = Instant::now();
     let request = plan.request(index, body, path);
-    let exchange = http1::exchange(&mut sender, request, plan.capture_limit());
+    let exchange = http1::exchange(&mut sender, request, capture);
     match tokio::time::timeout(plan.timeout, exchange).await {
         Ok(Ok(received)) => Outcome::Response {
             status: received.status,
@@ -815,6 +824,7 @@ async fn send(plan: &Plan, index: u32, body: Bytes, path: Option<&Uri>) -> Outco
 }
 
 /// `flagged`: the response leaked internals or broke the documented contract.
+/// A mass assignment raises the case to a fault after this (see `to_result`).
 fn classify(
     class: Option<MutationClass>,
     outcome: &Outcome,
@@ -858,21 +868,50 @@ struct CaseMeta<'a> {
     label: &'a str,
     pointer: Option<String>,
     request_bytes: usize,
+    undeclared: Option<&'a Value>,
 }
 
-fn to_result(
-    meta: CaseMeta<'_>,
-    outcome: &Outcome,
-    contract: Option<&ResponseContract>,
-) -> FuzzCaseResult {
+/// What every response of a suite is judged against.
+#[derive(Clone, Copy)]
+struct Judge<'a> {
+    contract: Option<&'a ResponseContract>,
+    /// Path of the suite target; routes that issue credentials may return them.
+    route_path: &'a str,
+    /// Sensitive field the baseline already exposed: the route's, not a case's.
+    baseline_leak: Option<&'a Disclosure>,
+}
+
+fn to_result(meta: CaseMeta<'_>, outcome: &Outcome, judge: Judge<'_>) -> FuzzCaseResult {
     let CaseMeta {
         index,
         class,
         label,
         pointer,
         request_bytes,
+        undeclared,
     } = meta;
-    let violations = match (contract, outcome) {
+    let success = match outcome {
+        Outcome::Response {
+            status,
+            bytes,
+            preview,
+            ..
+        } if (200..300).contains(status) => Some((
+            preview.as_slice(),
+            usize::try_from(*bytes).is_ok_and(|total| total <= preview.len()),
+        )),
+        _ => None,
+    };
+    let leak = success
+        .filter(|(body, _)| json_like(body))
+        .and_then(|(body, _)| disclosure::field_leak(body, judge.route_path))
+        .map(|found| found.disclosure)
+        .filter(|found| judge.baseline_leak != Some(found));
+    let mass_assignment = match (pointer.as_deref(), undeclared, success) {
+        (Some(pointer), Some(sent), Some((body, true))) => echo(body, pointer, sent),
+        _ => None,
+    };
+    let violations = match (judge.contract, outcome) {
         (
             Some(contract),
             Outcome::Response {
@@ -895,9 +934,12 @@ fn to_result(
         }
         _ => None,
     };
-    let disclosure = preview.as_deref().and_then(disclosure::detect);
+    let disclosure = preview.as_deref().and_then(disclosure::detect).or(leak);
     let flagged = disclosure.is_some() || !violations.is_empty();
-    let (verdict, severity) = classify(class, outcome, flagged);
+    let (verdict, mut severity) = classify(class, outcome, flagged);
+    if mass_assignment.is_some() && class.is_some() {
+        severity = Some(Severity::Fault);
+    }
     let mut result = FuzzCaseResult {
         index,
         class,
@@ -912,6 +954,7 @@ fn to_result(
         severity,
         disclosure,
         violations,
+        mass_assignment,
         error: None,
     };
     match outcome {
@@ -949,8 +992,49 @@ fn skipped(index: u32, case: &Case) -> FuzzCaseResult {
         severity: None,
         disclosure: None,
         violations: Vec::new(),
+        mass_assignment: None,
         error: None,
     }
+}
+
+/// A body that opens like a JSON document; text bodies are not walked for fields.
+fn json_like(body: &[u8]) -> bool {
+    matches!(
+        body.iter().find(|b| !b.is_ascii_whitespace()),
+        Some(b'{' | b'[')
+    )
+}
+
+/// The undeclared `sent` value at `pointer` of a complete 2xx JSON `body`, or at `pointer`
+/// under one top-level envelope key (`{"data": {...}}`).
+fn echo(body: &[u8], pointer: &str, sent: &Value) -> Option<MassAssignment> {
+    let parsed: Value = serde_json::from_slice(body).ok()?;
+    let echoed_at = if parsed.pointer(pointer) == Some(sent) {
+        pointer.to_owned()
+    } else {
+        parsed.as_object()?.iter().find_map(|(key, envelope)| {
+            (envelope.is_object() && envelope.pointer(pointer) == Some(sent))
+                .then(|| format!("/{}{pointer}", key.replace('~', "~0").replace('/', "~1")))
+        })?
+    };
+    let field = pointer
+        .trim_start_matches('/')
+        .split('/')
+        .map(|segment| segment.replace("~1", "/").replace("~0", "~"))
+        .collect::<Vec<_>>()
+        .join(".");
+    let mut detail = format!(
+        "mass-assignment: undeclared field '{field}' was accepted and echoed in 2xx response"
+    );
+    if echoed_at != pointer {
+        detail.push_str(&format!(" (at {echoed_at})"));
+    }
+    Some(MassAssignment {
+        pointer: pointer.to_owned(),
+        echoed_at,
+        value: sent.to_string(),
+        detail,
+    })
 }
 
 async fn execute(
@@ -980,7 +1064,12 @@ async fn execute(
         });
     };
 
-    let outcome = send(plan, 0, plan.base.clone(), None).await;
+    let outcome = send(plan, 0, plan.base.clone(), None, plan.capture_limit(false)).await;
+    let judge = Judge {
+        contract: plan.contract.as_ref(),
+        route_path: plan.template.origin_form().path(),
+        baseline_leak: None,
+    };
     let baseline = to_result(
         CaseMeta {
             index: 0,
@@ -988,9 +1077,10 @@ async fn execute(
             label: "baseline",
             pointer: None,
             request_bytes: plan.base.len(),
+            undeclared: None,
         },
         &outcome,
-        plan.contract.as_ref(),
+        judge,
     );
     emit(&baseline);
 
@@ -1015,12 +1105,26 @@ async fn execute(
         )),
         _ => {}
     }
+    let baseline_leak = baseline
+        .disclosure
+        .as_ref()
+        .filter(|found| found.kind == DisclosureKind::SensitiveFieldLeak);
     if let Some(disclosure) = &baseline.disclosure {
-        notes.push(format!(
-            "baseline response already discloses internals ({}); disclosures below may not be caused by their mutation",
-            disclosure.evidence
-        ));
+        notes.push(match baseline_leak {
+            Some(_) => format!(
+                "baseline response exposes a sensitive field ({}); accepted cases exposing the same field are not listed",
+                disclosure.evidence
+            ),
+            None => format!(
+                "baseline response already discloses internals ({}); disclosures below may not be caused by their mutation",
+                disclosure.evidence
+            ),
+        });
     }
+    let judge = Judge {
+        baseline_leak,
+        ..judge
+    };
     if let Some(first) = baseline.violations.first() {
         notes.push(format!(
             "baseline response breaks the documented contract ({}); mutation cases inherit the drift",
@@ -1041,7 +1145,8 @@ async fn execute(
             continue;
         }
 
-        let outcome = send(plan, index, case.body.clone(), case.path.as_ref()).await;
+        let capture = plan.capture_limit(case.undeclared.is_some());
+        let outcome = send(plan, index, case.body.clone(), case.path.as_ref(), capture).await;
         let result = to_result(
             CaseMeta {
                 index,
@@ -1049,9 +1154,10 @@ async fn execute(
                 label: &case.label,
                 pointer: case.pointer.clone(),
                 request_bytes: case.body.len(),
+                undeclared: case.undeclared.as_ref(),
             },
             &outcome,
-            plan.contract.as_ref(),
+            judge,
         );
         emit(&result);
         if result.verdict == FuzzVerdict::Unreachable {
@@ -1092,6 +1198,12 @@ async fn execute(
             .count(),
     );
     let disclosures = count_u32(results.iter().filter(|r| r.disclosure.is_some()).count());
+    let mass_assignments = count_u32(
+        results
+            .iter()
+            .filter(|r| r.mass_assignment.is_some())
+            .count(),
+    );
     let contract_violations = count_u32(
         std::iter::once(&baseline)
             .chain(results.iter())
@@ -1126,6 +1238,7 @@ async fn execute(
         warnings,
         disclosures,
         contract_violations,
+        mass_assignments,
         aborted,
         notes,
         base_body: String::from_utf8_lossy(&plan.base).into_owned(),
