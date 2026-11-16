@@ -1,5 +1,6 @@
 import type { GuardState } from "../hooks/useGuardValidator";
 import type { AuditRecord, TrafficAudit } from "../hooks/useTelemetry";
+import { sameDispatch, SYNC_LABEL, SYNC_MODES, type SyncRuns } from "./burst";
 import { describeViolation } from "./contract";
 import { formatBytes, formatLatency, formatPercent } from "./format";
 import { RISK_KINDS, RISK_LABEL } from "./risk";
@@ -9,6 +10,7 @@ import { AUDIT_KINDS, AUDIT_LABEL, type AuditKind } from "./traffic";
 import type {
   Anomaly,
   BurstReport,
+  BurstSyncMode,
   ContractViolation,
   ClassSummary,
   EngineStatus,
@@ -33,8 +35,10 @@ import type {
 /** Version 2 added the passive traffic audit, contract drift, static route risks and the
  * idempotency replay summary. Version 3 added the burst sync mode and burst contract drift,
  * value-constraint violations, retry storms, latency regressions, mid-body drops in the
- * fault profile, and route risks found in imported handlers (`routeFile` next to `file`). */
-export const AUDIT_SCHEMA = "z-proxy.audit/3";
+ * fault profile, and route risks found in imported handlers (`routeFile` next to `file`).
+ * Version 4 added `burstSync` (the latest burst of each barrier sync mode with its dispatch
+ * spread) and the `delimiterEscaping` fuzz class. */
+export const AUDIT_SCHEMA = "z-proxy.audit/4";
 /** Findings listed in Markdown; the JSON rendering carries all of them. */
 const MARKDOWN_FINDINGS = 200;
 
@@ -49,6 +53,8 @@ export interface AuditInputs {
   labCounters: LabCounters | null;
   proxy: ProxyStatus | null;
   burst: BurstReport | null;
+  /** Latest burst of each sync mode, `burst` among them. */
+  burstRuns: SyncRuns;
   fuzz: FuzzReport | null;
   /** Passive findings and contract drift folded from proxied exchanges. */
   traffic: TrafficAudit;
@@ -141,6 +147,22 @@ export interface AuditRoutes {
   risks: AuditRouteRisk[];
 }
 
+/** One barrier sync mode's latest burst, reduced to what the spread comparison needs. */
+export interface AuditBurstSync {
+  syncMode: BurstSyncMode;
+  runId: string;
+  target: string;
+  method: BurstReport["method"];
+  workers: number;
+  /** First worker past the barrier to the last, measured right before each worker's write. */
+  dispatchSpreadUs: number | null;
+  wallUs: number;
+  ttfbP50Us: number | null;
+  anomalies: number;
+  /** Same target, method and worker count as `burst`, so the spreads compare directly. */
+  sameDispatch: boolean;
+}
+
 export interface AuditIdempotency {
   key: string;
   target: string;
@@ -188,6 +210,8 @@ export interface AuditReport {
     rules: AuditRule[];
   } | null;
   burst: BurstReport | null;
+  /** Latest burst of each sync mode run in this session, in `SYNC_MODES` order. */
+  burstSync: AuditBurstSync[];
   idempotency: AuditIdempotency | null;
   fuzz: AuditFuzz | null;
   traffic: AuditTraffic;
@@ -268,6 +292,31 @@ function buildRoutes(report: RouteScanReport | null): AuditRoutes | null {
   };
 }
 
+function buildBurstSync(burst: BurstReport | null, runs: SyncRuns): AuditBurstSync[] {
+  return SYNC_MODES.flatMap((mode) => {
+    const run = burst?.syncMode === mode ? burst : runs[mode];
+    if (run === undefined) return [];
+    return [
+      {
+        syncMode: mode,
+        runId: run.id,
+        target: run.target,
+        method: run.method,
+        workers: run.workers,
+        dispatchSpreadUs: run.dispatchSpreadUs,
+        wallUs: run.wallUs,
+        ttfbP50Us: run.ttfb?.p50Us ?? null,
+        anomalies: run.anomalies.length,
+        sameDispatch: burst !== null && sameDispatch(run, burst),
+      },
+    ];
+  });
+}
+
+function latencyOrDash(us: number | null): string {
+  return us === null ? "-" : formatLatency(us);
+}
+
 function buildIdempotency(burst: BurstReport | null): AuditIdempotency | null {
   if (burst === null || burst.idempotencyKey === null) return null;
   const successes = burst.samples.filter((s) => s.status !== null && s.status >= 200 && s.status < 300);
@@ -331,6 +380,7 @@ export function buildAuditReport(inputs: AuditInputs): AuditReport {
             })),
           },
     burst: inputs.burst,
+    burstSync: buildBurstSync(inputs.burst, inputs.burstRuns),
     idempotency: buildIdempotency(inputs.burst),
     traffic: buildTraffic(inputs.traffic),
     contracts: buildContracts(inputs),
@@ -445,11 +495,14 @@ function overview(report: AuditReport): string[][] {
   } else {
     const faults = burst.anomalies.filter((a) => a.severity === "fault").length;
     const kinds = burst.anomalies.map((a) => `${a.kind} (${a.severity})`).join(", ");
+    const dispatch = `${SYNC_LABEL[burst.syncMode]} sync, dispatch spread ${latencyOrDash(burst.dispatchSpreadUs)}`;
     rows.push([
       "Concurrency burst",
       burst.anomalies.length === 0
-        ? `uniform across ${count(burst.workers, "worker")}`
-        : cell(`${count(burst.anomalies.length, "anomaly", "anomalies")} (${count(faults, "fault")}): ${kinds}`),
+        ? cell(`uniform across ${count(burst.workers, "worker")}; ${dispatch}`)
+        : cell(
+            `${count(burst.anomalies.length, "anomaly", "anomalies")} (${count(faults, "fault")}): ${kinds}; ${dispatch}`,
+          ),
     ]);
   }
   if (fuzz === null) {
@@ -628,10 +681,10 @@ function renderMarkdown(report: AuditReport): string {
             ? "last byte: every request byte but the final one written before release"
             : "pre-connected: connections handshaken before release",
         ],
+        ["Dispatch spread", `${latencyOrDash(burst.dispatchSpreadUs)} (${SYNC_LABEL[burst.syncMode]})`],
         ["Success quota", burst.expectedMaxSuccesses === null ? "none" : `at most ${burst.expectedMaxSuccesses} 2xx`],
         ["Idempotency-Key", burst.idempotencyKey === null ? "not replayed" : `${code(burst.idempotencyKey)} from every worker`],
         ["Wall time", formatLatency(burst.wallUs)],
-        ["Dispatch spread", burst.dispatchSpreadUs === null ? "-" : formatLatency(burst.dispatchSpreadUs)],
         ["Distinct bodies", String(burst.distinctBodies)],
         ["Contract drift", `${burst.contractViolations} of ${total} responses`],
         [
@@ -654,6 +707,30 @@ function renderMarkdown(report: AuditReport): string {
         ]),
       ),
     );
+    if (report.burstSync.length > 1) {
+      const comparable = report.burstSync.every((run) => run.sameDispatch);
+      push(
+        "### Dispatch spread by sync mode",
+        `Latest burst of each mode. Spread runs from the first worker past the barrier to the last, measured right before each worker's write (its final byte in last-byte mode). ${
+          comparable
+            ? "Both bursts sent the same request from as many workers, so the spreads compare directly."
+            : "The bursts differ in request or worker count; compare the spreads with that in mind."
+        }`,
+        table(
+          ["Sync", "Run", "Request", "Workers", "Dispatch spread", "TTFB p50", "Wall", "Anomalies"],
+          report.burstSync.map((run) => [
+            run.syncMode === burst.syncMode ? `${SYNC_LABEL[run.syncMode]} (reported)` : SYNC_LABEL[run.syncMode],
+            code(run.runId.slice(0, 8)),
+            `${run.method} ${code(run.target)}`,
+            String(run.workers),
+            latencyOrDash(run.dispatchSpreadUs),
+            latencyOrDash(run.ttfbP50Us),
+            formatLatency(run.wallUs),
+            String(run.anomalies),
+          ]),
+        ),
+      );
+    }
     if (burst.latency !== null) {
       push(
         "### Latency",

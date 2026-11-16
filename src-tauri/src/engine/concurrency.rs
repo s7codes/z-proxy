@@ -160,6 +160,7 @@ pub async fn run(spec: BurstSpec, hub: &TelemetryHub) -> EngineResult<BurstRepor
         id,
         ts_us: now_us(),
         wall_us: report.wall_us,
+        sync_mode: report.sync_mode,
         dispatch_spread_us: report.dispatch_spread_us,
         anomalies: count_u32(report.anomalies.len()),
         errors: count_u32(errors),
@@ -167,6 +168,7 @@ pub async fn run(spec: BurstSpec, hub: &TelemetryHub) -> EngineResult<BurstRepor
     tracing::info!(
         %id,
         wall_us = report.wall_us,
+        sync = ?report.sync_mode,
         spread_us = ?report.dispatch_spread_us,
         anomalies = report.anomalies.len(),
         "concurrency burst completed"

@@ -823,6 +823,9 @@ pub enum TelemetryEvent {
         id: Uuid,
         ts_us: u64,
         wall_us: u64,
+        /// What the barrier released, so a spread is never read without the mode it was
+        /// measured under.
+        sync_mode: BurstSyncMode,
         dispatch_spread_us: Option<u64>,
         anomalies: u32,
         errors: u32,

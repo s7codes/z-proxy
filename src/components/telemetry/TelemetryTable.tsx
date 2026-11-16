@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { TelemetryStore } from "../../hooks/useTelemetry";
 import { TELEMETRY_CAPACITY } from "../../hooks/useTelemetry";
+import { SYNC_LABEL } from "../../lib/burst";
 import { summarizeViolations } from "../../lib/contract";
 import { AUDIT_SHORT, type AuditKind } from "../../lib/traffic";
 import { DISCLOSURE_LABEL } from "../../lib/disclosure";
@@ -277,7 +278,7 @@ function toRow(event: TelemetryEvent): Row {
         result: event.anomalies > 0 ? `${event.anomalies} ANOMALY` : "UNIFORM",
         resultTone: event.anomalies > 0 ? "fault" : "ok",
         latency: formatLatency(event.wallUs),
-        detail: `spread ${event.dispatchSpreadUs === null ? "-" : formatLatency(event.dispatchSpreadUs)}  errors ${event.errors}`,
+        detail: `spread ${event.dispatchSpreadUs === null ? "-" : formatLatency(event.dispatchSpreadUs)} ${SYNC_LABEL[event.syncMode]}  errors ${event.errors}`,
       };
     case "routeScanCompleted":
       return {

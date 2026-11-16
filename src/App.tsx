@@ -223,6 +223,7 @@ export function App() {
     labCounters: lab.counters,
     proxy: proxyStatus,
     burst: burst.report,
+    burstRuns: burst.bySync,
     fuzz: fuzzer.report,
     traffic: telemetry.audit,
     routes: routeScan.report,

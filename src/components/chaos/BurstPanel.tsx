@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { Zap } from "lucide-react";
 import type { BurstControl } from "../../hooks/useBurst";
+import { comparableRuns, SYNC_LABEL, type SyncRuns } from "../../lib/burst";
 import { contractSummary, summarizeViolations } from "../../lib/contract";
 import { formatBytes, formatLatency, formatPercent } from "../../lib/format";
 import type { BurstPreset } from "../../lib/risk";
@@ -166,7 +167,7 @@ export function BurstPanel({
           </div>
         </Section>
 
-        {burst.report !== null && <ReportView report={burst.report} />}
+        {burst.report !== null && <ReportView report={burst.report} runs={burst.bySync} />}
       </div>
 
       <div className="flex h-9 shrink-0 items-center gap-2 border-t border-line px-2.5">
@@ -193,7 +194,7 @@ export function BurstPanel({
   );
 }
 
-function ReportView({ report }: { report: BurstReport }) {
+function ReportView({ report, runs }: { report: BurstReport; runs: SyncRuns }) {
   const total = report.samples.length;
   const errors = report.samples.filter((s) => s.status === null).length;
 
@@ -203,7 +204,7 @@ function ReportView({ report }: { report: BurstReport }) {
         title="Result"
         aside={
           <span className="num text-2xs text-fg-faint">
-            {report.syncMode === "lastByte" ? "last byte  " : "pre-connected  "}
+            {`${SYNC_LABEL[report.syncMode]}  `}
             {report.id.slice(0, 8)}
           </span>
         }
@@ -219,6 +220,7 @@ function ReportView({ report }: { report: BurstReport }) {
             tone={report.contractViolations > 0 ? "fault" : undefined}
           />
         </div>
+        <SpreadBySync report={report} runs={runs} />
         {report.idempotencyKey !== null && (
           <div className="num mb-1.5 flex min-w-0 items-center gap-1.5 text-2xs" title={report.idempotencyKey}>
             <span className="shrink-0 text-fg-faint">Idempotency-Key</span>
@@ -279,6 +281,36 @@ function ReportView({ report }: { report: BurstReport }) {
 
       {report.contractViolations > 0 && <DriftedWorkers report={report} />}
     </>
+  );
+}
+
+/**
+ * Dispatch spread of the latest run of each sync mode that sent this request from as many
+ * workers; shown once both modes have run, so the release mechanisms read side by side.
+ */
+function SpreadBySync({ report, runs }: { report: BurstReport; runs: SyncRuns }) {
+  const comparable = comparableRuns(report, runs);
+  if (comparable.length < 2) return null;
+  return (
+    <div className="num mb-2 border border-line text-xs">
+      <div className="grid h-5 grid-cols-[1fr_72px_64px] items-center border-b border-line bg-bg px-1.5 text-2xs text-fg-faint">
+        <span>sync</span>
+        <span className="text-right">spread</span>
+        <span className="text-right">run</span>
+      </div>
+      {comparable.map((run) => (
+        <div
+          key={run.syncMode}
+          className="grid h-5 grid-cols-[1fr_72px_64px] items-center border-b border-line/60 px-1.5 last:border-b-0"
+        >
+          <span className={run.id === report.id ? "text-fg-bright" : "text-fg-dim"}>{SYNC_LABEL[run.syncMode]}</span>
+          <span className="text-right text-fg-bright">
+            {run.dispatchSpreadUs === null ? "-" : formatLatency(run.dispatchSpreadUs)}
+          </span>
+          <span className="text-right text-2xs text-fg-faint">{run.id.slice(0, 8)}</span>
+        </div>
+      ))}
+    </div>
   );
 }
 

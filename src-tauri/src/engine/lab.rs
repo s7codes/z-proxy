@@ -1638,7 +1638,7 @@ mod tests {
     use crate::engine::fuzzer::{self, FuzzerSlot};
     use crate::engine::proxy::ProxyManager;
     use crate::engine::types::{
-        AnomalyKind, BurstMethod, BurstSpec, BurstSyncMode, ContractViolation,
+        AnomalyKind, BurstMethod, BurstReport, BurstSpec, BurstSyncMode, ContractViolation,
         ContractViolationKind, DisclosureKind, FuzzSpec, FuzzVerdict, HeaderPair, MutationClass,
         ProxyConfig, ResponseContract, RouteContract, RouteMethod, Severity, TrafficFindingKind,
         WorkerSample,
@@ -2261,6 +2261,127 @@ mod tests {
         assert_eq!(replayed.status(), StatusCode::CREATED);
         assert_eq!(replayed.headers()[REPLAYED_HEADER], "true");
         assert_eq!(lab.status().await.counters.orders, 1);
+        lab.stop().await;
+    }
+
+    /// The idempotent checkout burst released by its final request byte: every duplicate
+    /// carrying the key completes parsing within one write, the tightest overlap a client can
+    /// produce. Spreads of both sync modes are measured against the same request and reported
+    /// with the mode; neither is asserted against the other, since both depend on the host
+    /// scheduler rather than on the service.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn last_byte_release_replays_one_idempotency_key_only_when_hardened() {
+        let (hub, lab, base) = started(LabMode::Unprotected).await;
+        let mut events = hub.subscribe();
+        let contract = lab_contract(&base, RouteMethod::Post, "/api/v1/orders/checkout");
+        let burst = |sync_mode| BurstSpec {
+            target: format!("{base}/api/v1/orders/checkout"),
+            method: BurstMethod::Post,
+            workers: 24,
+            headers: vec![HeaderPair {
+                name: "Content-Type".to_owned(),
+                value: "application/json".to_owned(),
+            }],
+            body: Some(CHECKOUT_SAMPLE.to_owned()),
+            timeout_ms: 10_000,
+            expected_max_successes: None,
+            idempotency_mode: true,
+            sync_mode: Some(sync_mode),
+            contract: Some(contract.clone()),
+        };
+        let created = |report: &BurstReport| {
+            report
+                .samples
+                .iter()
+                .filter(|s| s.status == Some(201))
+                .count()
+        };
+
+        // Unprotected ignores the key: every worker creates an order of its own, and every
+        // body carries `totalCents` as a string.
+        let report = concurrency::run(burst(BurstSyncMode::LastByte), &hub)
+            .await
+            .unwrap();
+        assert_eq!(report.sync_mode, BurstSyncMode::LastByte);
+        let key = report.idempotency_key.clone().expect("generated key");
+        assert_eq!(created(&report), 24, "{:?}", report.status_histogram);
+        assert_eq!(report.distinct_bodies, 24);
+        let kinds: Vec<AnomalyKind> = report.anomalies.iter().map(|a| a.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                AnomalyKind::IdempotencyViolation,
+                AnomalyKind::ContractDrift
+            ]
+        );
+        assert!(report
+            .anomalies
+            .iter()
+            .all(|a| a.severity == Severity::Fault));
+        assert_eq!(report.anomalies[0].workers.len(), 23);
+        assert_eq!(report.contract_violations, 24);
+        assert!(report
+            .samples
+            .iter()
+            .all(|s| s.dispatch_offset_us.is_some()));
+        assert_eq!(lab.status().await.counters.orders, 24);
+
+        let mut started_with = None;
+        let mut completed_with = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                TelemetryEvent::BurstStarted {
+                    id,
+                    sync_mode,
+                    idempotency_key,
+                    ..
+                } if id == report.id => started_with = Some((sync_mode, idempotency_key)),
+                TelemetryEvent::BurstCompleted {
+                    id,
+                    sync_mode,
+                    dispatch_spread_us,
+                    ..
+                } if id == report.id => completed_with = Some((sync_mode, dispatch_spread_us)),
+                _ => {}
+            }
+        }
+        assert_eq!(started_with, Some((BurstSyncMode::LastByte, Some(key))));
+        assert_eq!(
+            completed_with,
+            Some((BurstSyncMode::LastByte, report.dispatch_spread_us))
+        );
+
+        // Hardened claims the key, creates and records under one lock: one order per burst,
+        // whichever way the barrier releases, and every 2xx is the stored response.
+        lab.set_mode(LabMode::Hardened).await;
+        let mut spreads = Vec::with_capacity(2);
+        for sync_mode in [BurstSyncMode::LastByte, BurstSyncMode::PreConnected] {
+            let orders = lab.status().await.counters.orders;
+            let report = concurrency::run(burst(sync_mode), &hub).await.unwrap();
+            assert_eq!(report.sync_mode, sync_mode);
+            assert_eq!(
+                created(&report),
+                24,
+                "{sync_mode:?} {:?}",
+                report.status_histogram
+            );
+            assert_eq!(report.distinct_bodies, 1, "{sync_mode:?}");
+            assert!(
+                report.anomalies.is_empty(),
+                "{sync_mode:?} {:?}",
+                report.anomalies
+            );
+            assert_eq!(report.contract_violations, 0);
+            assert_eq!(lab.status().await.counters.orders, orders + 1);
+            spreads.push((sync_mode, report.dispatch_spread_us.expect("measured")));
+        }
+        // Loose bound only: neither mode leaves TCP connects inside the dispatch.
+        for (sync_mode, spread) in spreads {
+            assert!(
+                spread < 250_000,
+                "{sync_mode:?} dispatch spread {spread} us"
+            );
+        }
         lab.stop().await;
     }
 

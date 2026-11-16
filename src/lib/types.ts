@@ -601,6 +601,8 @@ export type TelemetryEvent =
       id: string;
       tsUs: number;
       wallUs: number;
+      /** What the barrier released; the spread below was measured under it. */
+      syncMode: BurstSyncMode;
       dispatchSpreadUs: number | null;
       anomalies: number;
       errors: number;
