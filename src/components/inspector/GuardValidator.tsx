@@ -3,7 +3,7 @@ import { Crosshair, LoaderCircle } from "lucide-react";
 import type { GuardState } from "../../hooks/useGuardValidator";
 import { formatLatency } from "../../lib/format";
 import { guardTone, httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
-import { StatusSquare } from "../shell/PanelHeader";
+import { StatusDot } from "../shell/PanelHeader";
 
 interface GuardValidatorProps {
   value: string;
@@ -15,11 +15,11 @@ interface GuardValidatorProps {
 export function GuardValidator({ value, onChange, state, inputRef }: GuardValidatorProps) {
   const tone = guardTone(state);
   const borderTone =
-    state.phase === "rejected" ? "border-fault/60" : state.phase === "accepted" ? "border-ok/40" : "border-line";
+    state.phase === "rejected" ? "!border-fault" : state.phase === "accepted" ? "!border-ok/70" : "";
 
   return (
     <div className="flex flex-col gap-2">
-      <label className={`flex h-7 items-center gap-1.5 rounded-xs border bg-bg px-2 ${borderTone} focus-within:border-fg-faint`}>
+      <label className={`field flex h-[26px] items-center gap-1.5 px-2 ${borderTone}`}>
         <Crosshair size={13} strokeWidth={1.5} className="shrink-0 text-fg-faint" />
         <input
           ref={inputRef}
@@ -39,7 +39,7 @@ export function GuardValidator({ value, onChange, state, inputRef }: GuardValida
       <dl className="grid grid-cols-[64px_1fr] gap-x-2 gap-y-0.5 text-xs">
         <Row label="Verdict">
           <span className={`flex items-center gap-1.5 font-medium ${TONE_TEXT[verdictTone(state)]}`}>
-            <StatusSquare className={TONE_BG[verdictTone(state)]} />
+            <StatusDot className={TONE_BG[verdictTone(state)]} />
             {verdictLabel(state)}
           </span>
         </Row>
@@ -125,14 +125,14 @@ function verdictTone(state: GuardState): Tone {
 function verdictLabel(state: GuardState): string {
   switch (state.phase) {
     case "empty":
-      return "NO TARGET";
+      return "No target";
     case "pending":
-      return "VALIDATING";
+      return "Validating";
     case "accepted":
-      return "ACCEPT";
+      return "Accepted";
     case "rejected":
-      return "REJECT";
+      return "Rejected";
     case "offline":
-      return "ENGINE OFFLINE";
+      return "Engine offline";
   }
 }

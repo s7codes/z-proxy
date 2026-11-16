@@ -10,7 +10,7 @@ export function OriginRow({ origin }: { origin: RequestOrigin | null }) {
   const title = origin === null ? undefined : origin.via === null ? origin.url : `${origin.url} -> ${origin.via}`;
   return (
     <div className="flex h-6 shrink-0 items-center gap-2 border-b border-line px-2.5 text-2xs">
-      <span className="label-caps text-fg-faint">Origin</span>
+      <span className="caption text-fg-faint">Origin</span>
       <span className="num min-w-0 truncate text-fg" title={title}>
         {origin?.url ?? "no validated target"}
       </span>
@@ -26,7 +26,7 @@ export function OriginRow({ origin }: { origin: RequestOrigin | null }) {
 
 export function MethodPicker({ value, onChange }: { value: BurstMethod; onChange: (method: BurstMethod) => void }) {
   return (
-    <div className="mb-2 grid grid-cols-5 border border-line">
+    <div className="mb-2 grid grid-cols-5 overflow-hidden rounded-xs border border-line-strong">
       {METHODS.map((m) => (
         <button
           key={m}
@@ -34,7 +34,7 @@ export function MethodPicker({ value, onChange }: { value: BurstMethod; onChange
           onClick={() => onChange(m)}
           aria-pressed={value === m}
           className={`num h-6 border-r border-line text-2xs last:border-r-0 ${
-            value === m ? "bg-active text-fg-bright" : "text-fg-dim hover:bg-active hover:text-fg"
+            value === m ? "bg-select text-select-fg" : "bg-control text-fg hover:bg-active"
           }`}
         >
           {m}
@@ -69,7 +69,7 @@ export function PathField({
         onChange={(e) => onChange(e.target.value)}
         spellCheck={false}
         aria-label="Request path"
-        className="num h-5 w-full min-w-0 rounded-xs border border-line bg-bg px-1.5 text-xs text-fg-bright outline-none focus:border-fg-faint"
+        className="num h-5 w-full min-w-0 field px-1.5 text-xs"
       />
     </Field>
   );
@@ -114,7 +114,7 @@ export function SampleHint({ active, onLoad }: { active: boolean; onLoad: () => 
 export function Metric({ label, value, tone }: { label: string; value: string; tone?: Tone | undefined }) {
   return (
     <div className="flex flex-col bg-bg px-1.5 py-1">
-      <span className="label-caps text-fg-faint">{label}</span>
+      <span className="caption text-fg-faint">{label}</span>
       <span className={tone === undefined ? "text-fg-bright" : TONE_TEXT[tone]}>{value}</span>
     </div>
   );

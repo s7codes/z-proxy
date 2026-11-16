@@ -5,7 +5,7 @@ import type { Tone } from "../../lib/tone";
 import { TONE_BG, TONE_TEXT } from "../../lib/tone";
 import type { LabMode } from "../../lib/types";
 import { ErrorLine } from "../chaos/ErrorLine";
-import { StatusSquare, ToolButton } from "../shell/PanelHeader";
+import { StatusDot, ToolButton } from "../shell/PanelHeader";
 
 const MODES: ReadonlyArray<{ id: LabMode; label: string; tone: Tone; title: string }> = [
   {
@@ -56,7 +56,7 @@ export function LabPanel({ lab, online, onLoadTarget, routing, onRouteViaProxy, 
   return (
     <div className="flex flex-col">
       <div className="flex h-6 items-center gap-1.5 text-xs">
-        <StatusSquare className={running ? "bg-ok" : "bg-muted"} />
+        <StatusDot className={running ? "bg-ok" : "bg-muted"} />
         <span className="num min-w-0 truncate text-fg-dim" title={status?.baseUrl ?? undefined}>
           {running ? (status?.listener ?? "-") : "lab offline"}
         </span>
@@ -78,7 +78,7 @@ export function LabPanel({ lab, online, onLoadTarget, routing, onRouteViaProxy, 
         </div>
       </div>
 
-      <div className="mb-1.5 grid grid-cols-2 border border-line" role="radiogroup" aria-label="Lab mode">
+      <div className="mb-1.5 grid grid-cols-2 overflow-hidden rounded-xs border border-line-strong" role="radiogroup" aria-label="Lab mode">
         {MODES.map((m) => {
           const active = mode === m.id;
           return (
@@ -94,7 +94,7 @@ export function LabPanel({ lab, online, onLoadTarget, routing, onRouteViaProxy, 
                 active ? `bg-active ${TONE_TEXT[m.tone]}` : "text-fg-dim hover:bg-active hover:text-fg"
               }`}
             >
-              <StatusSquare className={active ? TONE_BG[m.tone] : "bg-muted"} />
+              <StatusDot className={active ? TONE_BG[m.tone] : "bg-muted"} />
               {m.label}
             </button>
           );
@@ -139,10 +139,10 @@ export function LabPanel({ lab, online, onLoadTarget, routing, onRouteViaProxy, 
           disabled={!running}
           onClick={onLoadTarget}
           title="Target the lab in the inspector, proxy, burst and fuzzer; list its routes"
-          className="flex h-6 min-w-0 flex-1 items-center justify-center gap-1 rounded-xs border border-line-strong bg-active px-1.5 text-xs font-medium text-fg-bright hover:border-fg-faint disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-fg-faint"
+          className="btn min-w-0 flex-1 justify-center px-1.5"
         >
           <Crosshair size={11} strokeWidth={1.75} />
-          <span className="truncate">Load Lab Target</span>
+          <span className="truncate">Load lab target</span>
         </button>
         <button
           type="button"
@@ -154,17 +154,17 @@ export function LabPanel({ lab, online, onLoadTarget, routing, onRouteViaProxy, 
               ? `Burst and fuzzer send to the proxy at ${routing.listener ?? "-"} (${routing.armed ? "armed" : "disarmed"}, ${routing.rules} route rule${routing.rules === 1 ? "" : "s"}); click to send directly to the lab`
               : `Start the proxy with the lab as upstream on port ${DEFAULT_LISTEN_PORT} if needed, and send burst and fuzzer traffic through it`
           }
-          className={`flex h-6 min-w-0 flex-1 items-center justify-center gap-1 rounded-xs border px-1.5 text-xs font-medium disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-fg-faint ${
+          className={`btn min-w-0 flex-1 justify-center px-1.5 ${
             routing.active
               ? routing.armed
-                ? "border-warn/60 bg-warn/10 text-warn hover:border-warn"
-                : "border-ok/50 bg-ok/10 text-ok hover:border-ok"
-              : "border-line-strong bg-active text-fg-bright hover:border-fg-faint"
+                ? "!border-warn/70 !bg-warn/15"
+                : "!border-ok/60 !bg-ok/12"
+              : ""
           }`}
         >
           <Waypoints size={11} strokeWidth={1.75} className="shrink-0" />
           <span className="num truncate">
-            {routing.active ? `Via ${routing.listener?.replace(/^127\.0\.0\.1/, "") ?? "proxy"}` : "Via Proxy"}
+            {routing.active ? `Via ${routing.listener?.replace(/^127\.0\.0\.1/, "") ?? "proxy"}` : "Via proxy"}
           </span>
         </button>
         <ToolButton label="Reset" disabled={!controllable} title="Clear coupon ledger and counters" onClick={lab.reset}>

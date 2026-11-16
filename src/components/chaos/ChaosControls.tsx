@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { Link2, Play, Power, RotateCcw, Square, X } from "lucide-react";
 import type { BurstControl } from "../../hooks/useBurst";
 import type { EngineLink } from "../../hooks/useEngineStatus";
@@ -10,7 +9,7 @@ import { contractFor } from "../../lib/contract";
 import type { RequestOrigin } from "../../lib/request";
 import { METHOD_BADGE, type RequestTarget } from "../../lib/routes";
 import type { BurstPreset, FuzzPreset } from "../../lib/risk";
-import { DEFAULT_LISTEN_PORT, summarizeProfile } from "../../lib/rules";
+import { summarizeProfile } from "../../lib/rules";
 import { AUDIT_KINDS, AUDIT_LABEL, type AuditKind } from "../../lib/traffic";
 import type {
   DiscoveredRoute,
@@ -20,7 +19,7 @@ import type {
   RouteMethod,
   StatusMutation,
 } from "../../lib/types";
-import { PanelHeader, Section, StatusSquare, ToolButton } from "../shell/PanelHeader";
+import { Section, StatusDot, TabStrip, ToolButton } from "../shell/PanelHeader";
 import { BurstPanel } from "./BurstPanel";
 import { ErrorLine } from "./ErrorLine";
 import { FuzzerPanel } from "./FuzzerPanel";
@@ -53,6 +52,9 @@ interface ChaosControlsProps {
   /** Where Burst and Fuzzer send requests: the validated target or the proxy listener. */
   requestOrigin: RequestOrigin | null;
   proxy: ProxyControl;
+  /** Listener port; shared with the main toolbar's Start proxy command. */
+  listenPort: number;
+  onListenPort: (port: number) => void;
   burst: BurstControl;
   fuzzer: FuzzerControl;
   fuzzerProgress: FuzzerProgress | null;
@@ -99,12 +101,17 @@ export function ChaosControls(props: ChaosControlsProps) {
       : { method: target.method, path: target.path };
 
   return (
-    <div className="flex h-full flex-col bg-panel">
-      <PanelHeader title="Chaos">
-        <ToolButton label="Faults" active={tab === "faults"} onClick={() => onTab("faults")} />
-        <ToolButton label="Burst" active={tab === "burst"} onClick={() => onTab("burst")} />
-        <ToolButton label="Fuzzer" active={tab === "fuzzer"} onClick={() => onTab("fuzzer")} />
-      </PanelHeader>
+    <div className="flex h-full flex-col bg-bg">
+      <TabStrip<ChaosTab>
+        label="Tools"
+        value={tab}
+        onChange={onTab}
+        tabs={[
+          { id: "faults", label: "Faults" },
+          { id: "burst", label: "Burst" },
+          { id: "fuzzer", label: "Fuzzer" },
+        ]}
+      />
       {tab === "faults" && (
         <FaultsTab
           profile={props.profile}
@@ -112,6 +119,8 @@ export function ChaosControls(props: ChaosControlsProps) {
           link={link}
           guard={guard}
           proxy={props.proxy}
+          listenPort={props.listenPort}
+          onListenPort={props.onListenPort}
           ruleTarget={ruleTarget}
           audit={props.audit}
           onAuditFilter={props.onAuditFilter}
@@ -167,13 +176,25 @@ interface FaultsTabProps {
   link: EngineLink;
   guard: GuardState;
   proxy: ProxyControl;
+  listenPort: number;
+  onListenPort: (port: number) => void;
   ruleTarget: RuleTarget;
   audit: TrafficAudit;
   onAuditFilter: (kind: AuditKind | null) => void;
 }
 
-function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget, audit, onAuditFilter }: FaultsTabProps) {
-  const [listenPort, setListenPort] = useState(DEFAULT_LISTEN_PORT);
+function FaultsTab({
+  profile,
+  onChange,
+  link,
+  guard,
+  proxy,
+  listenPort,
+  onListenPort: setListenPort,
+  ruleTarget,
+  audit,
+  onAuditFilter,
+}: FaultsTabProps) {
   const online = link.state === "online" && proxy.status !== null;
   const running = proxy.status?.running ?? false;
   const armed = proxy.status?.armed ?? false;
@@ -187,13 +208,13 @@ function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget, audit, o
           bound address stays readable. */}
       <div className="flex min-h-7 shrink-0 flex-wrap items-center gap-x-1.5 gap-y-1 border-b border-line px-2.5 py-[3px] text-xs">
         <div className="flex min-w-0 flex-1 basis-36 items-center gap-1.5">
-          <StatusSquare className={running ? "bg-ok" : "bg-muted"} />
+          <StatusDot className={running ? "bg-ok" : "bg-muted"} />
           <span className="num truncate text-fg-dim">
             {running ? `listener ${proxy.status?.listener ?? "-"}` : "listener offline"}
           </span>
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-1">
-          <label className="flex h-5 items-center rounded-xs border border-line bg-bg pl-1.5 focus-within:border-fg-faint">
+          <label className="flex h-5 items-center field pl-1.5">
             <span className="text-2xs text-fg-faint">port</span>
             <input
               type="number"
@@ -227,7 +248,7 @@ function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget, audit, o
       </div>
 
       <div className="flex h-6 shrink-0 items-center gap-2 border-b border-line px-2.5 text-2xs">
-        <span className="label-caps text-fg-faint">Upstream</span>
+        <span className="caption text-fg-faint">Upstream</span>
         <span className="num truncate text-fg" title={proxy.status?.upstream ?? upstream ?? undefined}>
           {proxy.status?.upstream ?? upstream ?? "no validated target"}
         </span>
@@ -280,8 +301,8 @@ function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget, audit, o
           </div>
         </Section>
 
-        <Section title="Status Mutation">
-          <div className="mb-2 grid grid-cols-6 border border-line">
+        <Section title="Status mutation">
+          <div className="mb-2 grid grid-cols-6 overflow-hidden rounded-xs border border-line-strong">
             {MUTATIONS.map((m) => (
               <button
                 key={m}
@@ -289,7 +310,7 @@ function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget, audit, o
                 onClick={() => set("statusMutation", m)}
                 aria-pressed={profile.statusMutation === m}
                 className={`num h-6 border-r border-line text-xs last:border-r-0 ${
-                  profile.statusMutation === m ? "bg-active text-fg-bright" : "text-fg-dim hover:bg-active hover:text-fg"
+                  profile.statusMutation === m ? "bg-select text-select-fg" : "bg-control text-fg hover:bg-active"
                 }`}
               >
                 {m === "none" ? "off" : m}
@@ -316,15 +337,15 @@ function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget, audit, o
           onApply={proxy.applyRules}
         />
 
-        <Section title="Engine Profile">
-          <pre className="num overflow-x-auto rounded-xs border border-line bg-bg p-2 text-2xs leading-4 text-fg-dim">
+        <Section title="Engine profile" defaultOpen={false}>
+          <pre className="num overflow-x-auto rounded-xs border border-line bg-field p-2 text-2xs leading-4 text-fg-dim">
             {proxy.status === null ? "engine unavailable" : JSON.stringify({ armed, ...proxy.status.profile }, null, 2)}
           </pre>
         </Section>
       </div>
 
       <div className="flex h-9 shrink-0 items-center gap-2 border-t border-line px-2.5">
-        <StatusSquare className={armed ? "bg-warn" : "bg-muted"} />
+        <StatusDot className={armed ? "bg-warn" : "bg-muted"} />
         <span className="min-w-0 truncate text-2xs text-fg-faint">
           {armed
             ? running
@@ -339,10 +360,10 @@ function FaultsTab({ profile, onChange, link, guard, proxy, ruleTarget, audit, o
           disabled={!online}
           aria-pressed={armed}
           onClick={() => proxy.applyFaults(!armed, profile)}
-          className={`ml-auto flex h-6 items-center gap-1.5 rounded-xs border px-2.5 text-xs font-medium disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-fg-faint ${
+          className={`btn ml-auto ${
             armed
-              ? "border-warn/60 bg-warn/10 text-warn hover:border-warn"
-              : "border-line-strong bg-active text-fg-bright hover:border-fg-faint"
+              ? "!border-warn/70 !bg-warn/15"
+              : "btn-primary"
           }`}
         >
           <Power size={11} strokeWidth={1.75} />
@@ -366,7 +387,7 @@ function CutPointField({
   return (
     <div className={`flex h-5 items-center gap-2 text-xs ${disabled ? "opacity-40" : ""}`}>
       <span className="w-[52px] shrink-0 text-fg-dim">Cut at</span>
-      <label className="flex h-5 w-[92px] shrink-0 items-center rounded-xs border border-line bg-bg pr-1.5 focus-within:border-fg-faint">
+      <label className="flex h-5 w-[92px] shrink-0 items-center field pr-1.5">
         <input
           type="number"
           min={0}
@@ -405,7 +426,7 @@ function TrafficAuditSection({
   const total = AUDIT_KINDS.reduce((sum, kind) => sum + audit.counts[kind], 0);
   return (
     <Section
-      title="Traffic Audit"
+      title="Traffic audit"
       aside={
         <button
           type="button"
@@ -473,7 +494,7 @@ function RouteRules({
 
   return (
     <Section
-      title="Route Rules"
+      title="Route rules"
       aside={
         rules.length > 0 ? (
           <ToolButton label="Clear" disabled={disabled} onClick={() => onApply([])} />
@@ -516,7 +537,7 @@ function RouteRules({
         disabled={disabled || target.path.trim() === ""}
         onClick={bind}
         title={`Bind ${summarizeProfile(profile)} to ${label}`}
-        className="flex h-6 w-full min-w-0 items-center gap-1.5 rounded-xs border border-line px-2 text-xs text-fg-dim hover:border-line-strong hover:bg-active hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+        className="btn w-full min-w-0"
       >
         <Link2 size={11} strokeWidth={1.5} className="shrink-0" />
         <span className="shrink-0">{bound ? "Rebind" : "Bind"} profile to</span>

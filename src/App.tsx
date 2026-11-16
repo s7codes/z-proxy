@@ -7,6 +7,7 @@ import {
   FlaskConical,
   FileDown,
   FolderOpen,
+  ListFilter,
   PanelBottom,
   PanelLeft,
   PanelRight,
@@ -29,9 +30,11 @@ import {
 import type { LabRouting } from "./components/inspector/LabPanel";
 import { TargetInspector } from "./components/inspector/TargetInspector";
 import { CommandPalette, type PaletteCommand } from "./components/shell/CommandPalette";
-import { Kbd } from "./components/shell/PanelHeader";
+import { TabStrip } from "./components/shell/PanelHeader";
 import { StatusBar } from "./components/shell/StatusBar";
+import { Toolbar } from "./components/shell/Toolbar";
 import { Workspace } from "./components/shell/Workspace";
+import { EventInspector, EventRaw } from "./components/telemetry/EventInspector";
 import { TelemetryTable } from "./components/telemetry/TelemetryTable";
 import { TopologyCanvas } from "./components/topology/TopologyCanvas";
 import { useAuditExport } from "./hooks/useAuditExport";
@@ -42,7 +45,7 @@ import { useGuardValidator } from "./hooks/useGuardValidator";
 import { useLab } from "./hooks/useLab";
 import { sameProfile, useProxy } from "./hooks/useProxy";
 import { useRouteScan } from "./hooks/useRouteScan";
-import { useTelemetry } from "./hooks/useTelemetry";
+import { TELEMETRY_CAPACITY, useTelemetry } from "./hooks/useTelemetry";
 import { routeContracts } from "./lib/contract";
 import type { AuditKind } from "./lib/traffic";
 import { ipcAvailable } from "./lib/ipc";
@@ -50,7 +53,6 @@ import { originOf, withHeaders, type RequestOrigin } from "./lib/request";
 import { AUTO_TARGET } from "./lib/risk";
 import { toBurstMethod, type RequestTarget } from "./lib/routes";
 import { DEFAULT_LISTEN_PORT } from "./lib/rules";
-import { TONE_TEXT } from "./lib/tone";
 import type { DiscoveredRoute, FaultProfile, HeaderPair, RouteRiskKind } from "./lib/types";
 
 // Slider drags emit a value per pixel; one IPC round trip per settled position is enough.
@@ -80,6 +82,9 @@ export function App() {
   const [burstHeaders, setBurstHeaders] = useState("");
   const [fuzzPayload, setFuzzPayload] = useState("");
   const [chaosPreset, setChaosPreset] = useState<ChaosPreset | null>(null);
+  const [listenPort, setListenPort] = useState(DEFAULT_LISTEN_PORT);
+  const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
+  const [detailTab, setDetailTab] = useState<DetailTab>("topology");
 
   const { status: proxyStatus, applyFaults, stop: stopProxy, applyContracts } = proxy;
 
@@ -122,9 +127,10 @@ export function App() {
   }, [faultProfile, proxyStatus, applyFaults]);
 
   const targetRef = useRef<HTMLInputElement>(null);
+  const filterRef = useRef<HTMLInputElement>(null);
   const inspectorRef = useRef<PanelImperativeHandle | null>(null);
   const chaosRef = useRef<PanelImperativeHandle | null>(null);
-  const telemetryRef = useRef<PanelImperativeHandle | null>(null);
+  const detailRef = useRef<PanelImperativeHandle | null>(null);
 
   // Auto-target: a static finding becomes a live test of the same handler. The route is
   // selected (method, path, sample body, contract) and the matching tab opens preset for the
@@ -187,7 +193,7 @@ export function App() {
   const { routeTo: routeProxyTo } = proxy;
   const routeViaProxy = useCallback(() => {
     if (labBaseUrl === null) return;
-    void routeProxyTo(labBaseUrl, DEFAULT_LISTEN_PORT).then((status) => {
+    void routeProxyTo(labBaseUrl, listenPort).then((status) => {
       if (status === null) return;
       setViaProxy(true);
       if (targetInput === labBaseUrl) {
@@ -196,7 +202,7 @@ export function App() {
         loadLabTarget();
       }
     });
-  }, [labBaseUrl, routeProxyTo, targetInput, loadLabTarget]);
+  }, [labBaseUrl, routeProxyTo, listenPort, targetInput, loadLabTarget]);
   const routeDirect = useCallback(() => setViaProxy(false), []);
 
   const proxyListener = proxyStatus?.running === true ? proxyStatus.listener : null;
@@ -236,9 +242,14 @@ export function App() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const key = e.key.toLowerCase();
+      if (key === "k") {
         e.preventDefault();
         setPaletteOpen((open) => !open);
+      } else if (key === "f") {
+        e.preventDefault();
+        filterRef.current?.select();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -249,7 +260,6 @@ export function App() {
   const showAudit = useCallback(
     (kind: AuditKind | null) => {
       setTelemetryFilter({ kind: "findings", audit: kind });
-      telemetryRef.current?.expand();
     },
     [setTelemetryFilter],
   );
@@ -344,8 +354,9 @@ export function App() {
       ...(fuzzing
         ? [{ id: "cancel-fuzzer", group: "Fuzzer", label: "Cancel fuzzer suite", icon: CircleStop, run: cancelFuzzer }]
         : []),
-      { id: "pause", group: "Telemetry", label: paused ? "Resume stream" : "Pause stream", icon: Pause, run: () => setPaused(!paused) },
-      { id: "clear", group: "Telemetry", label: "Clear buffer", icon: Trash2, run: clear },
+      { id: "filter", group: "Events", label: "Filter events", icon: ListFilter, shortcut: "Ctrl F", run: () => filterRef.current?.select() },
+      { id: "pause", group: "Events", label: paused ? "Resume capture" : "Pause capture", icon: Pause, run: () => setPaused(!paused) },
+      { id: "clear", group: "Events", label: "Clear event buffer", icon: Trash2, run: clear },
       { id: "reset-fault", group: "Fault Injection", label: "Reset fault profile", icon: RotateCcw, run: () => setFaultProfile(DEFAULT_FAULT_PROFILE) },
       ...(proxyStatus === null
         ? []
@@ -364,9 +375,9 @@ export function App() {
       { id: "export-md", group: "Report", label: "Export audit report (.md)", icon: FileDown, run: () => saveReport("markdown") },
       { id: "export-json", group: "Report", label: "Export audit report (.json)", icon: FileDown, run: () => saveReport("json") },
       { id: "copy-report", group: "Report", label: "Copy audit report as Markdown", icon: ClipboardCopy, run: copyReport },
-      { id: "toggle-inspector", group: "Layout", label: "Toggle inspector panel", icon: PanelLeft, run: toggle(inspectorRef) },
-      { id: "toggle-chaos", group: "Layout", label: "Toggle chaos panel", icon: PanelRight, run: toggle(chaosRef) },
-      { id: "toggle-telemetry", group: "Layout", label: "Toggle telemetry panel", icon: PanelBottom, run: toggle(telemetryRef) },
+      { id: "toggle-inspector", group: "Layout", label: "Toggle target sidebar", icon: PanelLeft, run: toggle(inspectorRef) },
+      { id: "toggle-chaos", group: "Layout", label: "Toggle tools pane", icon: PanelRight, run: toggle(chaosRef) },
+      { id: "toggle-detail", group: "Layout", label: "Toggle detail pane", icon: PanelBottom, run: toggle(detailRef) },
     ];
   }, [
     saveReport,
@@ -408,54 +419,41 @@ export function App() {
     }
   }, [fuzzer.report, requestTarget.path]);
 
+  const selectedEvent = useMemo(
+    () => (selectedSeq === null ? null : (telemetry.events.find((e) => e.seq === selectedSeq) ?? null)),
+    [selectedSeq, telemetry.events],
+  );
+  const selectEvent = useCallback((seq: number) => {
+    setSelectedSeq(seq);
+    setDetailTab((tab) => (tab === "topology" ? "event" : tab));
+  }, []);
+
   return (
-    <div className="flex h-full flex-col bg-bg text-fg">
-      <header className="flex h-8 shrink-0 items-center gap-3 border-b border-line bg-panel px-2.5">
-        <span className="text-sm font-semibold tracking-tight text-fg-bright">z-proxy</span>
-        <span className="h-3.5 w-px bg-line" />
-        <span className="text-xs text-fg-dim">workspace</span>
-        <span className="num text-xs text-fg">local</span>
-        {audit.notice !== null && (
-          <span
-            className={`num ml-auto min-w-0 truncate text-2xs ${TONE_TEXT[audit.notice.tone]}`}
-            title={audit.notice.text}
-            role="status"
-          >
-            {audit.notice.text}
-          </span>
-        )}
-        <div
-          className={`flex h-5 shrink-0 items-center rounded-xs border border-line ${audit.notice === null ? "ml-auto" : ""}`}
-          role="group"
-          aria-label="Export audit report"
-        >
-          <span className="label-caps flex h-full items-center border-r border-line px-1.5 text-fg-faint">Report</span>
-          <ReportButton label=".md" title="Export audit report as Markdown" disabled={audit.busy} onClick={() => saveReport("markdown")}>
-            <FileDown size={11} strokeWidth={1.5} />
-          </ReportButton>
-          <ReportButton label=".json" title="Export audit report as JSON" disabled={audit.busy} onClick={() => saveReport("json")}>
-            <FileDown size={11} strokeWidth={1.5} />
-          </ReportButton>
-          <ReportButton label="Copy" title="Copy the Markdown report to the clipboard" onClick={copyReport}>
-            <ClipboardCopy size={11} strokeWidth={1.5} />
-          </ReportButton>
-        </div>
-        <button
-          type="button"
-          onClick={() => setPaletteOpen(true)}
-          className="flex h-5 w-64 shrink-0 items-center gap-2 rounded-xs border border-line bg-bg px-2 text-xs text-fg-faint hover:border-line-strong"
-        >
-          <span>Search commands</span>
-          <span className="ml-auto flex gap-0.5">
-            <Kbd>Ctrl</Kbd>
-            <Kbd>K</Kbd>
-          </span>
-        </button>
-      </header>
+    <div className="flex h-full flex-col bg-panel text-fg">
+      <Toolbar
+        online={link.state === "online"}
+        proxy={proxy}
+        upstream={validated}
+        listenPort={listenPort}
+        faultProfile={faultProfile}
+        paused={paused}
+        onTogglePause={() => setPaused(!paused)}
+        onClear={() => {
+          clear();
+          setSelectedSeq(null);
+        }}
+        lab={lab}
+        onLoadLab={loadLabTarget}
+        exportBusy={audit.busy}
+        notice={audit.notice}
+        onExport={saveReport}
+        onCopyReport={copyReport}
+        onOpenPalette={() => setPaletteOpen(true)}
+      />
 
       <Workspace
-        panelRefs={{ inspector: inspectorRef, chaos: chaosRef, telemetry: telemetryRef }}
-        inspector={
+        panelRefs={{ sidebar: inspectorRef, tools: chaosRef, detail: detailRef }}
+        sidebar={
           <TargetInspector
             input={targetInput}
             onInput={setTargetInput}
@@ -473,10 +471,29 @@ export function App() {
             onRouteDirect={routeDirect}
           />
         }
-        topology={
-          <TopologyCanvas link={link} guard={guard} proxy={proxyStatus} route={selectedRoute} fuzz={endpointFuzz} />
+        traffic={<TelemetryTable store={telemetry} selected={selectedSeq} onSelect={selectEvent} queryRef={filterRef} />}
+        detail={
+          <div className="flex h-full flex-col bg-bg">
+            <TabStrip
+              label="Detail"
+              value={detailTab}
+              onChange={setDetailTab}
+              tabs={[
+                { id: "event", label: "Inspector" },
+                { id: "raw", label: "Raw" },
+                { id: "topology", label: "Topology" },
+              ]}
+            />
+            <div className="min-h-0 flex-1">
+              {detailTab === "event" && <EventInspector event={selectedEvent} />}
+              {detailTab === "raw" && <EventRaw event={selectedEvent} />}
+              {detailTab === "topology" && (
+                <TopologyCanvas link={link} guard={guard} proxy={proxyStatus} route={selectedRoute} fuzz={endpointFuzz} />
+              )}
+            </div>
+          </div>
         }
-        chaos={
+        tools={
           <ChaosControls
             tab={chaosTab}
             onTab={setChaosTab}
@@ -486,6 +503,8 @@ export function App() {
             guard={guard}
             requestOrigin={requestOrigin}
             proxy={proxy}
+            listenPort={listenPort}
+            onListenPort={setListenPort}
             burst={burst}
             fuzzer={fuzzer}
             fuzzerProgress={telemetry.fuzzerProgress}
@@ -506,38 +525,20 @@ export function App() {
             preset={chaosPreset}
           />
         }
-        telemetry={<TelemetryTable store={telemetry} />}
       />
 
-      <StatusBar link={link} />
+      <StatusBar
+        link={link}
+        proxy={proxyStatus}
+        paused={paused}
+        buffered={telemetry.events.length}
+        capacity={TELEMETRY_CAPACITY}
+        received={telemetry.totalReceived}
+        viaProxy={requestOrigin?.via != null}
+      />
       <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} commands={commands} />
     </div>
   );
 }
 
-function ReportButton({
-  label,
-  title,
-  disabled = false,
-  onClick,
-  children,
-}: {
-  label: string;
-  title: string;
-  disabled?: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      title={title}
-      disabled={disabled}
-      onClick={onClick}
-      className="num flex h-full items-center gap-1 border-r border-line px-1.5 text-2xs text-fg-dim last:border-r-0 hover:bg-active hover:text-fg disabled:cursor-not-allowed disabled:text-fg-faint"
-    >
-      {children}
-      {label}
-    </button>
-  );
-}
+type DetailTab = "event" | "raw" | "topology";

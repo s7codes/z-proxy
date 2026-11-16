@@ -17,7 +17,7 @@ import type {
   LatencyStats,
   ResponseContract,
 } from "../../lib/types";
-import { Section, StatusSquare } from "../shell/PanelHeader";
+import { Section, StatusDot } from "../shell/PanelHeader";
 import { ErrorLine } from "./ErrorLine";
 import { Field, MethodPicker, Metric, OriginRow, PathField, SampleHint } from "./RequestFields";
 import { Slider } from "./Slider";
@@ -138,7 +138,7 @@ export function BurstPanel({
               placeholder="Idempotency-Key: order-42"
               spellCheck={false}
               rows={2}
-              className="num w-full min-w-0 resize-y rounded-xs border border-line bg-bg px-1.5 py-1 text-xs text-fg-bright outline-none placeholder:text-fg-faint focus:border-fg-faint"
+              className="num w-full min-w-0 resize-y field px-1.5 py-1 text-xs placeholder:text-fg-faint"
             />
           </Field>
           <Field label="Body">
@@ -148,7 +148,7 @@ export function BurstPanel({
               placeholder='{"amount":100}'
               spellCheck={false}
               rows={3}
-              className="num w-full min-w-0 resize-y rounded-xs border border-line bg-bg px-1.5 py-1 text-xs text-fg-bright outline-none placeholder:text-fg-faint focus:border-fg-faint"
+              className="num w-full min-w-0 resize-y field px-1.5 py-1 text-xs placeholder:text-fg-faint"
             />
             {bodyOrigin !== null && (
               <div className="num truncate pt-0.5 text-2xs text-warn" title={bodyOrigin}>
@@ -200,7 +200,7 @@ export function BurstPanel({
           disabled={!canFire}
           onClick={compare}
           title="Run this burst pre-connected, then last byte, and compare the dispatch spreads. A stateful target answers the second run after the first; reset the lab to compare outcomes too."
-          className="ml-auto flex h-6 shrink-0 items-center gap-1.5 rounded-xs border border-line px-2.5 text-xs text-fg hover:border-fg-faint disabled:cursor-not-allowed disabled:text-fg-faint"
+          className="btn ml-auto shrink-0"
         >
           <GitCompareArrows size={11} strokeWidth={1.75} />
           {burst.comparing !== null ? `${burst.comparing.step}/${burst.comparing.of}` : "Compare sync"}
@@ -209,7 +209,7 @@ export function BurstPanel({
           type="button"
           disabled={!canFire}
           onClick={fire}
-          className="flex h-6 shrink-0 items-center gap-1.5 rounded-xs border border-line-strong bg-active px-2.5 text-xs font-medium text-fg-bright hover:border-fg-faint disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-fg-faint"
+          className="btn btn-primary shrink-0"
         >
           <Zap size={11} strokeWidth={1.75} />
           {burst.running && burst.comparing === null ? "Running" : `Fire ${workers}`}
@@ -292,7 +292,7 @@ function ReportView({ report, runs }: { report: BurstReport; runs: SyncRuns }) {
       >
         {report.anomalies.length === 0 ? (
           <div className="flex items-center gap-1.5 text-xs text-ok">
-            <StatusSquare className="bg-ok" />
+            <StatusDot className="bg-ok" />
             Uniform responses across {total} workers
           </div>
         ) : (
@@ -319,7 +319,7 @@ function SpreadBySync({ report, runs }: { report: BurstReport; runs: SyncRuns })
   const delta = spreadDelta(Object.fromEntries(comparable.map((run) => [run.syncMode, run])));
   return (
     <div className="num mb-2 border border-line text-xs">
-      <div className="grid h-5 grid-cols-[1fr_72px_64px] items-center border-b border-line bg-bg px-1.5 text-2xs text-fg-faint">
+      <div className="grid h-5 grid-cols-[1fr_72px_64px] items-center border-b border-line bg-panel px-1.5 text-2xs text-fg-dim">
         <span>sync</span>
         <span className="text-right">spread</span>
         <span className="text-right">run</span>
@@ -351,7 +351,7 @@ function DriftedWorkers({ report }: { report: BurstReport }) {
   const listed = drifted.slice(0, MAX_LISTED_WORKERS);
   return (
     <Section
-      title="Contract Drift"
+      title="Contract drift"
       aside={<span className="num text-2xs text-fg-faint">{`${drifted.length}/${report.samples.length}`}</span>}
     >
       <div className="num flex flex-col border-t border-line/60 text-xs">
@@ -387,7 +387,7 @@ const LATENCY_ROWS: ReadonlyArray<{ label: string; key: keyof LatencyStats }> = 
 function LatencyGrid({ ttfb, total }: { ttfb: LatencyStats | null; total: LatencyStats }) {
   return (
     <div className="num border border-line text-xs">
-      <div className="grid h-5 grid-cols-[40px_1fr_1fr_1fr] items-center border-b border-line bg-bg px-1.5 text-2xs text-fg-faint">
+      <div className="grid h-5 grid-cols-[40px_1fr_1fr_1fr] items-center border-b border-line bg-panel px-1.5 text-2xs text-fg-dim">
         <span />
         <span className="text-right">ttfb</span>
         <span className="text-right">total</span>
@@ -413,7 +413,7 @@ function SyncField({ value, onChange }: { value: BurstSyncMode; onChange: (value
   return (
     <div className="flex h-5 items-center gap-2 text-xs">
       <span className="w-[52px] shrink-0 text-fg-dim">Sync</span>
-      <div className="grid min-w-0 flex-1 grid-cols-2 border border-line" role="radiogroup" aria-label="Barrier sync mode">
+      <div className="grid min-w-0 flex-1 grid-cols-2 overflow-hidden rounded-xs border border-line-strong" role="radiogroup" aria-label="Barrier sync mode">
         {SYNC_MODES.map(({ mode, label, title }) => (
           <button
             key={mode}
@@ -423,7 +423,7 @@ function SyncField({ value, onChange }: { value: BurstSyncMode; onChange: (value
             title={title}
             onClick={() => onChange(mode)}
             className={`h-[18px] truncate border-r border-line px-1.5 text-2xs last:border-r-0 ${
-              value === mode ? "bg-active text-fg-bright" : "text-fg-dim hover:bg-active hover:text-fg"
+              value === mode ? "bg-select text-select-fg" : "bg-control text-fg hover:bg-active"
             }`}
           >
             {label}
@@ -448,7 +448,7 @@ function QuotaField({ value, max, onChange }: { value: number; max: number; onCh
           const next = Number(e.target.value);
           if (Number.isInteger(next) && next >= 0 && next <= 65_535) onChange(next);
         }}
-        className="num h-5 w-12 rounded-xs border border-line bg-bg px-1 text-right text-xs text-fg-bright outline-none focus:border-fg-faint [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+        className="num h-5 w-12 field px-1 text-right text-xs [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
       />
       <span className="min-w-0 truncate text-2xs text-fg-faint">
         {value === 0 ? "no quota; race needs a conflict response" : `more than ${value} success${value === 1 ? "" : "es"} is a race`}
@@ -501,7 +501,7 @@ function AnomalyRow({ anomaly }: { anomaly: Anomaly }) {
   const overflow = anomaly.workers.length - listed.length;
   return (
     <div className={`border-l pl-2 ${tone === "fault" ? "border-fault" : "border-warn"}`}>
-      <div className={`label-caps ${TONE_TEXT[tone]}`}>{ANOMALY_LABEL[anomaly.kind]}</div>
+      <div className={`caption ${TONE_TEXT[tone]}`}>{ANOMALY_LABEL[anomaly.kind]}</div>
       <div className="text-xs text-fg">{anomaly.detail}</div>
       {listed.length > 0 && (
         <div className="num pt-0.5 text-2xs text-fg-faint">

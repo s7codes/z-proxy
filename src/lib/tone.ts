@@ -16,13 +16,6 @@ export const TONE_BG: Record<Tone, string> = {
   muted: "bg-muted",
 };
 
-export const TONE_HEX: Record<Tone, string> = {
-  ok: "#10B981",
-  warn: "#F59E0B",
-  fault: "#EF4444",
-  muted: "#64748B",
-};
-
 export function httpStatusTone(status: number | null): Tone {
   if (status === null) return "fault";
   if (status >= 500) return "fault";

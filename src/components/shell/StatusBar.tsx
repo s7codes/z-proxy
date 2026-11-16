@@ -1,45 +1,71 @@
 import type { EngineLink } from "../../hooks/useEngineStatus";
-import { formatUptime } from "../../lib/format";
-import { Kbd, StatusSquare } from "./PanelHeader";
+import { formatCount, formatUptime } from "../../lib/format";
+import type { ProxyStatus } from "../../lib/types";
+import { StatusDot } from "./PanelHeader";
 
-export function StatusBar({ link }: { link: EngineLink }) {
+interface StatusBarProps {
+  link: EngineLink;
+  proxy: ProxyStatus | null;
+  paused: boolean;
+  buffered: number;
+  capacity: number;
+  received: number;
+  viaProxy: boolean;
+}
+
+/** Counters and active engine options, in the order a capture tool's status bar lists them. */
+export function StatusBar({ link, proxy, paused, buffered, capacity, received, viaProxy }: StatusBarProps) {
   const online = link.state === "online";
-  const label = online ? "ENGINE ONLINE" : link.state === "connecting" ? "CONNECTING" : "ENGINE OFFLINE";
+  const label = online ? "Engine online" : link.state === "connecting" ? "Connecting" : "Engine offline";
   const tone = online ? "bg-ok" : link.state === "connecting" ? "bg-muted" : "bg-fault";
+  const listening = proxy?.running === true;
 
   return (
-    <footer className="num flex h-[22px] shrink-0 items-center gap-4 border-t border-line bg-panel px-2.5 text-2xs text-fg-dim">
-      <span className="flex items-center gap-1.5 font-medium text-fg">
-        <StatusSquare className={tone} />
+    <footer className="flex h-[22px] shrink-0 items-center gap-3 overflow-hidden whitespace-nowrap border-t border-line bg-panel px-2.5 text-xs text-fg-dim">
+      <span className="flex items-center gap-1.5 text-fg">
+        <StatusDot className={tone} />
         {label}
       </span>
-      {online ? (
-        <>
-          <Item k="uptime" v={formatUptime(link.status.uptimeMs)} />
-          <Item k="subs" v={String(link.status.telemetrySubscribers)} />
-          <Item k="guard" v={link.status.guardMode} />
-          <Item k="proxy" v={link.status.proxyListener ?? "offline"} />
-        </>
-      ) : link.state === "unavailable" ? (
-        <span className="text-fg-faint">{link.reason}</span>
-      ) : null}
-      <span className="ml-auto flex items-center gap-4">
-        <span className="flex items-center gap-1 text-fg-faint">
-          <Kbd>Ctrl</Kbd>
-          <Kbd>K</Kbd>
-          <span>commands</span>
-        </span>
-        <span className="text-fg-faint">v{online ? link.status.version : "-"}</span>
+      <Divider />
+      <span className="num">
+        Events: {formatCount(received)} <span className="text-fg-faint">·</span> Buffered: {formatCount(buffered)}/
+        {formatCount(capacity)}
+      </span>
+      <Divider />
+      <span className="num">{listening ? `Listening ${proxy?.listener ?? "-"}` : "Proxy stopped"}</span>
+      <div className="flex items-center gap-1">
+        {paused && <Pill tone="warn">capture_paused</Pill>}
+        {proxy?.armed === true && <Pill tone="warn">faults_armed</Pill>}
+        {(proxy?.rules.length ?? 0) > 0 && <Pill tone="neutral">{`route_rules=${proxy?.rules.length ?? 0}`}</Pill>}
+        {(proxy?.contracts ?? 0) > 0 && <Pill tone="neutral">{`contracts=${proxy?.contracts ?? 0}`}</Pill>}
+        {viaProxy && <Pill tone="neutral">via_proxy</Pill>}
+      </div>
+      {link.state === "unavailable" && <span className="min-w-0 truncate text-fg-faint">{link.reason}</span>}
+      <span className="num ml-auto flex items-center gap-3 text-fg-faint">
+        {online && (
+          <>
+            <span>guard {link.status.guardMode}</span>
+            <span>up {formatUptime(link.status.uptimeMs)}</span>
+          </>
+        )}
+        <span>z-proxy {online ? link.status.version : ""}</span>
       </span>
     </footer>
   );
 }
 
-function Item({ k, v }: { k: string; v: string }) {
+function Divider() {
+  return <span className="h-3 w-px bg-line-strong" aria-hidden />;
+}
+
+function Pill({ tone, children }: { tone: "warn" | "neutral"; children: string }) {
   return (
-    <span>
-      <span className="text-fg-faint">{k} </span>
-      {v}
+    <span
+      className={`num rounded-xs border px-1 text-2xs leading-[14px] ${
+        tone === "warn" ? "border-warn/60 bg-warn/12 text-fg" : "border-line-strong bg-control text-fg-dim"
+      }`}
+    >
+      {children}
     </span>
   );
 }

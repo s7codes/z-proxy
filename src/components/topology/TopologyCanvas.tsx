@@ -17,8 +17,8 @@ import { formatLatency } from "../../lib/format";
 import { fileLabel, SOURCE_LABEL } from "../../lib/routes";
 import { matchingRule, summarizeProfile, type RuleMatch } from "../../lib/rules";
 import type { DiscoveredRoute, FuzzReport, ProxyStatus } from "../../lib/types";
-import { guardTone, TONE_HEX, type Tone } from "../../lib/tone";
-import { PanelHeader } from "../shell/PanelHeader";
+import { useSchemeColors, type SchemeColors } from "../../hooks/useSchemeColors";
+import { guardTone, type Tone } from "../../lib/tone";
 import { nodeTypes, type TopoNode, type TopoNodeData } from "./nodes";
 
 interface TopologyCanvasProps {
@@ -93,11 +93,11 @@ export function TopologyCanvas({ link, guard, proxy, route, fuzz }: TopologyCanv
     () => nodes.map((n) => ({ ...n, hidden: n.id === "endpoint" && !hasRoute, data: dataById[n.id as NodeId] })),
     [nodes, dataById, hasRoute],
   );
-  const edges = useMemo(() => buildEdges(link, guard, proxy, route), [link, guard, proxy, route]);
+  const colors = useSchemeColors();
+  const edges = useMemo(() => buildEdges(link, guard, proxy, route, colors), [link, guard, proxy, route, colors]);
 
   return (
-    <div className="flex h-full flex-col">
-      <PanelHeader title="Topology" meta={`${hasRoute ? 5 : 4} nodes / ${edges.length} links`} />
+    <div className="flex h-full flex-col bg-bg">
       <div ref={containerRef} className="relative min-h-0 flex-1">
         <ReactFlow<TopoNode, Edge>
           nodes={displayNodes}
@@ -113,10 +113,10 @@ export function TopologyCanvas({ link, guard, proxy, route, fuzz }: TopologyCanv
           fitViewOptions={FIT_VIEW}
           minZoom={0.4}
           maxZoom={2}
-          colorMode="dark"
+          colorMode={colors.dark ? "dark" : "light"}
           proOptions={{ hideAttribution: false }}
         >
-          <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="#1F2430" />
+          <Background variant={BackgroundVariant.Dots} gap={20} size={1.2} color={colors.grid} />
           <Controls showInteractive={false} position="bottom-left" />
         </ReactFlow>
       </div>
@@ -205,7 +205,15 @@ function buildNodeData(
   };
 }
 
-function buildEdges(link: EngineLink, guard: GuardState, proxy: ProxyStatus | null, route: DiscoveredRoute | null): Edge[] {
+function buildEdges(
+  link: EngineLink,
+  guard: GuardState,
+  proxy: ProxyStatus | null,
+  route: DiscoveredRoute | null,
+  colors: SchemeColors,
+): Edge[] {
+  const edge = (source: NodeId, target: NodeId, tone: Tone, label: string | undefined, dashed = false) =>
+    styledEdge(colors, source, target, tone, label, dashed);
   const online = link.state === "online";
   const proxying = online && proxy?.running === true;
   const tone = guardTone(guard);
@@ -236,8 +244,15 @@ function endpointRule(proxy: ProxyStatus | null, route: DiscoveredRoute | null):
   return match === null ? null : { ...match, active: proxy.running && proxy.armed };
 }
 
-function edge(source: NodeId, target: NodeId, tone: Tone, label: string | undefined, dashed = false): Edge {
-  const color = TONE_HEX[tone];
+function styledEdge(
+  colors: SchemeColors,
+  source: NodeId,
+  target: NodeId,
+  tone: Tone,
+  label: string | undefined,
+  dashed: boolean,
+): Edge {
+  const color = colors.tone[tone];
   const base: Edge = {
     id: `${source}-${target}`,
     source,
@@ -247,9 +262,9 @@ function edge(source: NodeId, target: NodeId, tone: Tone, label: string | undefi
     style: { stroke: color, strokeWidth: 1, strokeDasharray: dashed ? "4 3" : undefined },
     markerEnd: { type: MarkerType.ArrowClosed, color, width: 14, height: 14 },
     labelStyle: { fill: color },
-    labelBgStyle: { fill: "#090A0D" },
+    labelBgStyle: { fill: colors.surface },
     labelBgPadding: [4, 2],
-    labelBgBorderRadius: 0,
+    labelBgBorderRadius: 2,
   };
   return label === undefined ? base : { ...base, label };
 }

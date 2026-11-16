@@ -51,13 +51,13 @@ export function TargetInspector({
 
   return (
     <div className="flex h-full flex-col bg-panel">
-      <PanelHeader title="Target & Routes" />
+      <PanelHeader title="Target" meta={online ? "loopback only" : undefined} />
       <div className="shrink-0">
-        <Section title="Loopback Guard" aside={<span className="num text-2xs text-fg-faint">strict</span>}>
+        <Section title="Loopback guard" aside={<span className="num text-2xs text-fg-faint">strict</span>}>
           <GuardValidator value={input} onChange={onInput} state={guard} inputRef={inputRef} />
         </Section>
 
-        <Section title="Allowlist" aside={<span className="num text-2xs text-fg-faint">exact match</span>}>
+        <Section title="Allowlist" defaultOpen={false} aside={<span className="num text-2xs text-fg-faint">exact match</span>}>
           <ul className="flex flex-col">
             {allowlist.map((host) => (
               <li
@@ -72,7 +72,7 @@ export function TargetInspector({
         </Section>
 
         <Section
-          title="Target Lab"
+          title="Target lab"
           aside={
             labMode === null ? undefined : (
               <span className={`num text-2xs ${TONE_TEXT[LAB_MODE_TONE[labMode]]}`}>{labMode}</span>
@@ -94,7 +94,7 @@ export function TargetInspector({
           never pushes the guard input out of view. */}
       <section className="flex min-h-0 flex-1 flex-col">
         <div className="flex h-6 shrink-0 items-center px-2.5">
-          <span className="label-caps text-fg-faint">Routes</span>
+          <span className="caption text-fg">Routes</span>
           <span className="num ml-auto text-2xs text-fg-faint">{scan.report?.routes.length ?? 0}</span>
         </div>
         <RouteList

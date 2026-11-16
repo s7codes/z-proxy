@@ -79,7 +79,7 @@ export function RouteList({ scan, selected, onSelect, onAutoTarget, online }: Ro
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex shrink-0 items-center gap-1 px-2.5 pb-1.5">
-        <label className="flex h-6 min-w-0 flex-1 items-center gap-1.5 rounded-xs border border-line bg-bg px-1.5 focus-within:border-fg-faint">
+        <label className="flex h-6 min-w-0 flex-1 items-center gap-1.5 field px-1.5">
           <FolderTree size={12} strokeWidth={1.5} className="shrink-0 text-fg-faint" />
           <input
             value={scan.root}
@@ -111,7 +111,7 @@ export function RouteList({ scan, selected, onSelect, onAutoTarget, online }: Ro
       {report !== null && <ScanSummary report={report} />}
 
       {report !== null && report.routes.length > 0 && (
-        <label className="mx-2.5 mb-1 flex h-5 shrink-0 items-center gap-1.5 rounded-xs border border-line bg-bg px-1.5 focus-within:border-fg-faint">
+        <label className="mx-2.5 mb-1 flex h-5 shrink-0 items-center gap-1.5 field px-1.5">
           <Search size={11} strokeWidth={1.5} className="shrink-0 text-fg-faint" />
           <input
             value={filter}
@@ -218,12 +218,12 @@ function SelectedRisks({
 }) {
   return (
     <div className="max-h-44 shrink-0 overflow-y-auto border-t border-line px-2.5 py-1.5">
-      <div className="label-caps pb-1 text-fg-faint">Static risks</div>
+      <div className="caption pb-1 text-fg-faint">Static risks</div>
       <div className="flex flex-col gap-1.5">
         {route.risks.map((risk) => (
           <div key={`${risk.kind}:${risk.file ?? ""}:${risk.line}`} className="border-l border-warn pl-2">
             <div className="num flex min-w-0 items-center gap-1.5 text-2xs">
-              <span className="label-caps shrink-0 text-warn">{RISK_LABEL[risk.kind]}</span>
+              <span className="caption shrink-0 text-warn">{RISK_LABEL[risk.kind]}</span>
               <span className="min-w-0 truncate text-fg-faint" title={`${risk.file ?? route.file}:${risk.line}`}>
                 {fileLabel(risk.file ?? route.file, risk.line)}
               </span>

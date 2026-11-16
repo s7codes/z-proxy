@@ -18,7 +18,7 @@ import type {
   MutationClass,
   ResponseContract,
 } from "../../lib/types";
-import { Section, StatusSquare } from "../shell/PanelHeader";
+import { Section, StatusDot } from "../shell/PanelHeader";
 import { ErrorLine } from "./ErrorLine";
 import { Field, MethodPicker, Metric, OriginRow, PathField } from "./RequestFields";
 import { Slider } from "./Slider";
@@ -168,7 +168,7 @@ export function FuzzerPanel({
               placeholder="Authorization: Bearer dev-token"
               spellCheck={false}
               rows={2}
-              className="num w-full min-w-0 resize-y rounded-xs border border-line bg-bg px-1.5 py-1 text-xs text-fg-bright outline-none placeholder:text-fg-faint focus:border-fg-faint"
+              className="num w-full min-w-0 resize-y field px-1.5 py-1 text-xs placeholder:text-fg-faint"
             />
           </Field>
           <Field label="Payload" error={payloadError}>
@@ -178,7 +178,7 @@ export function FuzzerPanel({
               placeholder="empty: built-in template"
               spellCheck={false}
               rows={5}
-              className="num w-full min-w-0 resize-y rounded-xs border border-line bg-bg px-1.5 py-1 text-xs text-fg-bright outline-none placeholder:text-fg-faint focus:border-fg-faint"
+              className="num w-full min-w-0 resize-y field px-1.5 py-1 text-xs placeholder:text-fg-faint"
             />
             <div className="flex items-center gap-2 pt-0.5 text-2xs text-fg-faint">
               <span className="truncate">
@@ -287,7 +287,7 @@ export function FuzzerPanel({
               type="button"
               disabled={fuzzer.cancelling}
               onClick={fuzzer.cancel}
-              className="ml-auto flex h-6 shrink-0 items-center gap-1.5 rounded-xs border border-line-strong px-2.5 text-xs text-fg hover:border-fg-faint disabled:cursor-not-allowed disabled:text-fg-faint"
+              className="btn ml-auto shrink-0"
             >
               <Square size={10} strokeWidth={1.75} />
               {fuzzer.cancelling ? "Cancelling" : "Cancel"}
@@ -297,7 +297,7 @@ export function FuzzerPanel({
               type="button"
               disabled={!canRun}
               onClick={run}
-              className="ml-auto flex h-6 shrink-0 items-center gap-1.5 rounded-xs border border-line-strong bg-active px-2.5 text-xs font-medium text-fg-bright hover:border-fg-faint disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-fg-faint"
+              className="btn btn-primary ml-auto shrink-0"
             >
               <FlaskConical size={11} strokeWidth={1.75} />
               Run suite
@@ -440,7 +440,7 @@ function FuzzReportView({
         </div>
         {report.aborted !== null && (
           <div className="num flex items-center gap-1.5 pt-1.5 text-2xs text-warn">
-            <StatusSquare className="bg-warn" />
+            <StatusDot className="bg-warn" />
             {report.aborted}
           </div>
         )}
@@ -490,7 +490,7 @@ function FuzzReportView({
         )}
         {findings.length === 0 ? (
           <div className="flex items-center gap-1.5 text-xs text-ok">
-            <StatusSquare className="bg-ok" />
+            <StatusDot className="bg-ok" />
             No 5xx, transport failures, leaks, mass assignments or contract drift across {executed} cases
           </div>
         ) : (
@@ -542,9 +542,9 @@ function FindingRow({
       >
         <span className="num flex w-full items-center gap-1.5 text-2xs">
           <span className="text-fg-faint">#{result.index}</span>
-          <span className={`label-caps ${TONE_TEXT[tone]}`}>{result.class === null ? "baseline" : SHORT[result.class]}</span>
+          <span className={`caption ${TONE_TEXT[tone]}`}>{result.class === null ? "baseline" : SHORT[result.class]}</span>
           <span className={`ml-auto flex items-center gap-1 ${TONE_TEXT[tone]}`}>
-            <StatusSquare className={TONE_BG[tone]} />
+            <StatusDot className={TONE_BG[tone]} />
             {result.status ?? VERDICT_LABEL[result.verdict]}
           </span>
           <span className="w-14 text-right text-fg-faint">{result.latencyUs === 0 ? "-" : formatLatency(result.latencyUs)}</span>
@@ -580,7 +580,7 @@ function FindingRow({
         <div className="num text-2xs text-fg-faint">+{result.violations.length - MAX_LISTED_VIOLATIONS} more drift</div>
       )}
       {expanded && result.responsePreview !== null && (
-        <pre className="num mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-xs border border-line bg-bg p-1.5 text-2xs leading-4 text-fg-dim select-text">
+        <pre className="num mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-xs border border-line bg-field p-1.5 text-2xs leading-4 text-fg-dim select-text">
           {result.responsePreview}
         </pre>
       )}

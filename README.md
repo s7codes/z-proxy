@@ -36,7 +36,7 @@ src/                       React operator UI
   lib/types.ts             TypeScript mirror of the Rust IPC contract
   lib/ipc.ts               Typed command wrappers, telemetry Channel subscription
   hooks/                   Engine status, guard validation, proxy and burst control
-  components/              Inspector, topology canvas, chaos panel, telemetry table
+  components/              Toolbar, target sidebar, event list and inspector, topology, tool notebook
 src-tauri/
   capabilities/default.json
   src/lib.rs               Builder, state, command registration
@@ -70,6 +70,29 @@ src-tauri/
   src/scanner/tsconfig.rs  compilerOptions.paths / baseUrl through relative extends chains;
                            package.json subpath imports
 ```
+
+## Interface
+
+Three panes under one toolbar, laid out like a capture tool:
+
+- Toolbar: Start/Stop proxy, Pause/Resume capture, Clear, Arm faults, Start lab, Target lab,
+  Export report, and the command palette (`Ctrl+K`). Commands that cannot run are disabled,
+  never hidden.
+- Target sidebar: loopback guard input and verdict, allowlist, target lab, route list.
+- Event list (centre): every telemetry event in one virtualized table (No., Time, Source,
+  Request, Status, Duration, Info). Rows with an injected fault or a finding carry a tinted
+  background and a left stripe in the status color. `Ctrl+F` focuses the text filter; arrow
+  keys, Page Up/Down, Home and End move the selection.
+- Detail pane: Inspector (every field of the selected event, dotted paths, microsecond fields
+  formatted, a timing breakdown for proxy exchanges and burst samples), Raw (event JSON),
+  Topology (live node graph).
+- Tool notebook (right): Faults, Burst, Fuzzer.
+- Status bar: engine state, received and buffered event counts, listener address, and the
+  active options as flags (`faults_armed`, `route_rules=N`, `contracts=N`, `via_proxy`,
+  `capture_paused`).
+
+The palette follows the OS appearance setting (light or dark). Chrome uses the system UI font;
+methods, paths, status codes, timings and payloads use the system monospace font.
 
 ## Loopback guard
 
@@ -711,7 +734,7 @@ body synthesis as a scanned project), preselects the redeem route with its sampl
 opens the Burst tab. Every request the lab serves is reported as a `labExchange` event with
 the handler outcome and live counters.
 
-"Via Proxy" in the inspector ("Route lab traffic via proxy" in the command palette) chains the proxy in front of the lab in one
+"Via proxy" in the target sidebar ("Route lab traffic via proxy" in the command palette) chains the proxy in front of the lab in one
 step: it reuses a listener that already forwards to the lab, restarts one that forwards
 elsewhere, or starts one on port 8787, then sends Burst and Fuzzer traffic to the listener.
 The fault profile and route rules survive the restart. The inspector keeps the lab as the
@@ -730,7 +753,7 @@ listener runs armed, and the rule is marked inactive otherwise.
 
 ## Audit report
 
-The header's Report group and the command palette export the session state as one report:
+The toolbar's Export report menu and the command palette export the session state as one report:
 guard verdict and probe, request origin (direct or via proxy), target lab mode and counters,
 proxy listener, global profile (mid-body drop included) and route rules, the latest burst
 report (barrier sync mode with the dispatch spread measured under it, status histogram, TTFB

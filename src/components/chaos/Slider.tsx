@@ -36,7 +36,7 @@ export function Slider({ label, unit, min, max, step, value, disabled = false, o
         disabled={disabled}
         onChange={(e) => commit(e.target.value)}
       />
-      <div className="flex h-5 items-center rounded-xs border border-line bg-bg pr-1.5 focus-within:border-fg-faint">
+      <div className="flex h-5 items-center field pr-1.5">
         <input
           type="number"
           min={min}

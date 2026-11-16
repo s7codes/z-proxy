@@ -25,12 +25,12 @@ export function CommandPalette({ open, onOpenChange, commands }: CommandPaletteP
       onOpenChange={onOpenChange}
       label="Command palette"
       loop
-      overlayClassName="fixed inset-0 z-40 bg-bg/70"
-      contentClassName="fixed left-1/2 top-[14%] z-50 w-[540px] -translate-x-1/2 border border-line-strong bg-panel"
+      overlayClassName="fixed inset-0 z-40 bg-black/25"
+      contentClassName="fixed left-1/2 top-[12%] z-50 w-[560px] -translate-x-1/2 overflow-hidden rounded-xs border border-line-strong bg-panel shadow-menu"
     >
       <Command.Input
         placeholder="Type a command"
-        className="h-9 w-full border-b border-line bg-transparent px-3 text-base text-fg-bright outline-none placeholder:text-fg-faint"
+        className="h-9 w-full border-b border-line bg-field px-3 text-base text-fg-bright outline-none placeholder:text-fg-faint"
       />
       <Command.List className="max-h-[320px] overflow-y-auto py-1">
         <Command.Empty className="px-3 py-2 text-xs text-fg-faint">No matching command.</Command.Empty>
@@ -38,7 +38,7 @@ export function CommandPalette({ open, onOpenChange, commands }: CommandPaletteP
           <Command.Group
             key={group}
             heading={group}
-            className="[&_[cmdk-group-heading]]:label-caps [&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-fg-faint"
+            className="[&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:pt-1.5 [&_[cmdk-group-heading]]:pb-0.5 [&_[cmdk-group-heading]]:text-2xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:text-fg-dim"
           >
             {commands
               .filter((c) => c.group === group)
@@ -50,12 +50,12 @@ export function CommandPalette({ open, onOpenChange, commands }: CommandPaletteP
                     c.run();
                     onOpenChange(false);
                   }}
-                  className="flex h-7 cursor-default items-center gap-2 px-3 text-sm text-fg data-[selected=true]:bg-active data-[selected=true]:text-fg-bright"
+                  className="group flex h-[26px] cursor-default items-center gap-2 px-3 text-sm text-fg data-[selected=true]:bg-select data-[selected=true]:text-select-fg"
                 >
-                  <c.icon size={13} strokeWidth={1.5} className="text-fg-dim" />
+                  <c.icon size={14} strokeWidth={1.75} className="text-fg-dim group-data-[selected=true]:text-select-fg" />
                   <span>{c.label}</span>
                   {c.shortcut !== undefined && (
-                    <span className="num ml-auto text-2xs text-fg-faint">{c.shortcut}</span>
+                    <span className="num ml-auto text-2xs text-fg-faint group-data-[selected=true]:text-select-fg">{c.shortcut}</span>
                   )}
                 </Command.Item>
               ))}
