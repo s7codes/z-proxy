@@ -56,3 +56,7 @@ Checks run by CI on Linux and Windows:
 npm run build
 cd src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
