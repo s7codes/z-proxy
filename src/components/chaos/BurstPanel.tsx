@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
-import { Zap } from "lucide-react";
+import { GitCompareArrows, Zap } from "lucide-react";
 import type { BurstControl } from "../../hooks/useBurst";
-import { comparableRuns, SYNC_LABEL, type SyncRuns } from "../../lib/burst";
+import { comparableRuns, describeDelta, spreadDelta, SYNC_LABEL, type SyncRuns } from "../../lib/burst";
 import { contractSummary, summarizeViolations } from "../../lib/contract";
 import { formatBytes, formatLatency, formatPercent } from "../../lib/format";
 import type { BurstPreset } from "../../lib/risk";
@@ -12,6 +12,7 @@ import type {
   Anomaly,
   AnomalyKind,
   BurstReport,
+  BurstSpec,
   BurstSyncMode,
   LatencyStats,
   ResponseContract,
@@ -97,20 +98,28 @@ export function BurstPanel({
   const replaying = idempotencyMode && writeMethod;
   const canFire = online && target !== null && parsed.error === null && !burst.running;
 
+  const spec = (): BurstSpec | null =>
+    target === null || parsed.error !== null
+      ? null
+      : {
+          target,
+          method,
+          workers,
+          headers: parsed.headers,
+          body: body === "" ? null : body,
+          timeoutMs,
+          expectedMaxSuccesses: maxSuccesses === 0 ? null : maxSuccesses,
+          idempotencyMode: replaying,
+          syncMode,
+          contract,
+        };
   const fire = () => {
-    if (target === null || parsed.error !== null) return;
-    burst.fire({
-      target,
-      method,
-      workers,
-      headers: parsed.headers,
-      body: body === "" ? null : body,
-      timeoutMs,
-      expectedMaxSuccesses: maxSuccesses === 0 ? null : maxSuccesses,
-      idempotencyMode: replaying,
-      syncMode,
-      contract,
-    });
+    const built = spec();
+    if (built !== null) burst.fire(built);
+  };
+  const compare = () => {
+    const built = spec();
+    if (built !== null) burst.compare(built);
   };
 
   return (
@@ -175,23 +184,35 @@ export function BurstPanel({
       </div>
 
       <div className="flex h-9 shrink-0 items-center gap-2 border-t border-line px-2.5">
-        <span className="text-2xs text-fg-faint">
-          {burst.running
-            ? `Barrier armed: ${workers} workers`
-            : replaying
-              ? "One Idempotency-Key from every worker, single barrier release"
-              : syncMode === "lastByte"
-                ? "Final request byte held until the barrier releases"
-                : "Pre-connected workers, single barrier release"}
+        <span className="num min-w-0 truncate text-2xs text-fg-faint">
+          {burst.comparing !== null
+            ? `Comparing sync ${burst.comparing.step}/${burst.comparing.of}: ${SYNC_LABEL[burst.comparing.mode]}, ${workers} workers`
+            : burst.running
+              ? `Barrier armed: ${workers} workers`
+              : replaying
+                ? "One Idempotency-Key from every worker, single barrier release"
+                : syncMode === "lastByte"
+                  ? "Final request byte held until the barrier releases"
+                  : "Pre-connected workers, single barrier release"}
         </span>
         <button
           type="button"
           disabled={!canFire}
+          onClick={compare}
+          title="Run this burst pre-connected, then last byte, and compare the dispatch spreads. A stateful target answers the second run after the first; reset the lab to compare outcomes too."
+          className="ml-auto flex h-6 shrink-0 items-center gap-1.5 rounded-xs border border-line px-2.5 text-xs text-fg hover:border-fg-faint disabled:cursor-not-allowed disabled:text-fg-faint"
+        >
+          <GitCompareArrows size={11} strokeWidth={1.75} />
+          {burst.comparing !== null ? `${burst.comparing.step}/${burst.comparing.of}` : "Compare sync"}
+        </button>
+        <button
+          type="button"
+          disabled={!canFire}
           onClick={fire}
-          className="ml-auto flex h-6 shrink-0 items-center gap-1.5 rounded-xs border border-line-strong bg-active px-2.5 text-xs font-medium text-fg-bright hover:border-fg-faint disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-fg-faint"
+          className="flex h-6 shrink-0 items-center gap-1.5 rounded-xs border border-line-strong bg-active px-2.5 text-xs font-medium text-fg-bright hover:border-fg-faint disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-fg-faint"
         >
           <Zap size={11} strokeWidth={1.75} />
-          {burst.running ? "Running" : `Fire ${workers}`}
+          {burst.running && burst.comparing === null ? "Running" : `Fire ${workers}`}
         </button>
       </div>
     </>
@@ -295,6 +316,7 @@ function ReportView({ report, runs }: { report: BurstReport; runs: SyncRuns }) {
 function SpreadBySync({ report, runs }: { report: BurstReport; runs: SyncRuns }) {
   const comparable = comparableRuns(report, runs);
   if (comparable.length < 2) return null;
+  const delta = spreadDelta(Object.fromEntries(comparable.map((run) => [run.syncMode, run])));
   return (
     <div className="num mb-2 border border-line text-xs">
       <div className="grid h-5 grid-cols-[1fr_72px_64px] items-center border-b border-line bg-bg px-1.5 text-2xs text-fg-faint">
@@ -314,6 +336,11 @@ function SpreadBySync({ report, runs }: { report: BurstReport; runs: SyncRuns })
           <span className="text-right text-2xs text-fg-faint">{run.id.slice(0, 8)}</span>
         </div>
       ))}
+      {delta !== null && (
+        <div className="flex h-5 items-center border-t border-line px-1.5 text-2xs text-fg-dim">
+          {describeDelta(delta, formatLatency)}
+        </div>
+      )}
     </div>
   );
 }

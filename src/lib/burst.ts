@@ -24,3 +24,31 @@ export function comparableRuns(report: BurstReport, runs: SyncRuns): BurstReport
     (run): run is BurstReport => run !== undefined && sameDispatch(run, report),
   );
 }
+
+/** Last-byte dispatch spread against the pre-connected one for the same request. */
+export interface SpreadDelta {
+  preConnectedUs: number;
+  lastByteUs: number;
+  /** Negative when holding the last byte narrowed the spread. */
+  deltaUs: number;
+  /** `lastByteUs / preConnectedUs`; `null` when the pre-connected spread was 0. */
+  ratio: number | null;
+}
+
+/** `null` unless both modes ran the same request from as many workers and measured a spread. */
+export function spreadDelta(runs: SyncRuns): SpreadDelta | null {
+  const { preConnected, lastByte } = runs;
+  if (preConnected === undefined || lastByte === undefined || !sameDispatch(preConnected, lastByte)) return null;
+  const pre = preConnected.dispatchSpreadUs;
+  const last = lastByte.dispatchSpreadUs;
+  if (pre === null || last === null) return null;
+  return { preConnectedUs: pre, lastByteUs: last, deltaUs: last - pre, ratio: pre === 0 ? null : last / pre };
+}
+
+/** `last byte 87 us narrower (0.71x)`, for the table footer and the report. */
+export function describeDelta(delta: SpreadDelta, format: (us: number) => string): string {
+  const direction = delta.deltaUs < 0 ? "narrower" : delta.deltaUs > 0 ? "wider" : "equal";
+  const amount = delta.deltaUs === 0 ? "" : `${format(Math.abs(delta.deltaUs))} `;
+  const ratio = delta.ratio === null ? "" : ` (${delta.ratio.toFixed(2)}x)`;
+  return `last byte ${amount}${direction}${ratio}`;
+}
