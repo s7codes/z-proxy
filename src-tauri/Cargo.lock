@@ -4691,6 +4691,8 @@ name = "z-proxy"
 version = "1.0.0"
 dependencies = [
  "axum",
+ "brotli",
+ "brotli-decompressor",
  "fastrand",
  "flate2",
  "http-body-util",

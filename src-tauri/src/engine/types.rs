@@ -663,8 +663,9 @@ pub enum TrafficFindingKind {
     HeaderMisconfiguration,
     /// Stack trace or database error in a proxied response.
     PassiveDisclosure,
-    /// One exact request (method, path and query) repeated 10 or more times inside 250 ms:
-    /// an effect that re-runs on every render, or a retry loop without backoff.
+    /// One exact request (method, path and query) repeated 10 or more times inside 250 ms
+    /// (an effect that re-runs on every render), or retried 4 times in a row, each within
+    /// 100 ms of a 429 / 503 answer to it (a retry loop without backoff).
     RetryStorm,
     /// A 2xx upstream latency at least 4x the route template's rolling median and at least
     /// 250 ms.

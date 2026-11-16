@@ -6,14 +6,17 @@
 //! the disclosure scan reads a bounded, borrowed UTF-8 prefix. Findings are allocated only
 //! when one is reported.
 //!
-//! Three checks are stateful: N+1 fan-outs, retry storms and latency regressions. Their
-//! windows are sharded by key behind short `std::sync::Mutex` sections (no await, no
-//! allocation once a key is known; an evicted slot's buffers are reused), so concurrent
-//! exchanges contend only when they hit the same shard.
+//! Four checks are stateful: N+1 fan-outs, retry storms, retries that ignore a 429 / 503,
+//! and latency regressions. Their windows are sharded by key behind short
+//! `std::sync::Mutex` sections (no await, no allocation once a key is known; an evicted
+//! slot's buffers are reused), so concurrent exchanges contend only when they hit the same
+//! shard.
 //!
-//! Encoded bodies are inflated before the checks (gzip, deflate) into a buffer capped at
-//! 1 MiB, so a compressed decompression bomb costs at most that much memory and the time
-//! to produce it.
+//! Encoded bodies are inflated before the checks (gzip, deflate, br) into a buffer capped
+//! at 1 MiB, so a compressed decompression bomb costs at most that much output and the time
+//! to produce it. The brotli decoder's ring buffer is bounded by the stream's window, at
+//! most 16 MiB under RFC 7932; large-window streams are refused as corrupt, as browsers
+//! refuse them.
 
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hasher};
@@ -22,6 +25,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::http::header::{self, HeaderMap, HeaderName};
+use brotli_decompressor::Decompressor;
 use flate2::read::{DeflateDecoder, MultiGzDecoder, ZlibDecoder};
 
 use super::disclosure;
@@ -34,6 +38,13 @@ pub const N_PLUS_ONE_THRESHOLD: usize = 8;
 /// retry storm: an effect re-running on every render, or a retry loop without backoff.
 pub const RETRY_STORM_WINDOW: Duration = Duration::from_millis(250);
 pub const RETRY_STORM_THRESHOLD: usize = 10;
+/// A retry of the same request this soon after a 429 or 503 answer to it ignored the
+/// answer; this many such retries in a row are a storm. Any real backoff, even the first
+/// step of an exponential one, waits longer.
+pub const THROTTLE_RETRY_WINDOW: Duration = Duration::from_millis(100);
+pub const THROTTLE_RETRY_THRESHOLD: usize = 4;
+/// Read buffer the brotli decoder pulls compressed input through.
+const BROTLI_BUFFER_BYTES: usize = 4 * 1024;
 /// Upstream latencies kept per route template for the rolling median.
 pub const LATENCY_WINDOW: usize = 32;
 /// Responses a template needs before a regression can be judged against its median.
@@ -109,6 +120,7 @@ const SENSITIVE_SEGMENTS: [&str; 16] = [
 pub struct TrafficLinter {
     shards: [Mutex<Shard>; SHARDS],
     repeats: [Mutex<RepeatShard>; SHARDS],
+    throttles: [Mutex<ThrottleShard>; SHARDS],
     latencies: [Mutex<LatencyShard>; SHARDS],
 }
 
@@ -117,6 +129,7 @@ impl Default for TrafficLinter {
         Self {
             shards: std::array::from_fn(|_| Mutex::new(Shard::default())),
             repeats: std::array::from_fn(|_| Mutex::new(RepeatShard::default())),
+            throttles: std::array::from_fn(|_| Mutex::new(ThrottleShard::default())),
             latencies: std::array::from_fn(|_| Mutex::new(LatencyShard::default())),
         }
     }
@@ -124,6 +137,15 @@ impl Default for TrafficLinter {
 
 fn shard_of(key: u64) -> usize {
     usize::try_from(key % SHARDS as u64).unwrap_or(0)
+}
+
+/// One exact request line: method, path and query.
+fn request_key(method: &str, path_and_query: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(method.as_bytes());
+    hasher.write_u8(b' ');
+    hasher.write(path_and_query.as_bytes());
+    hasher.finish()
 }
 
 /// `METHOD /path?query`, cut to `EVIDENCE_CHARS` characters.
@@ -146,11 +168,7 @@ impl TrafficLinter {
         method: &str,
         path_and_query: &str,
     ) -> Option<TrafficFinding> {
-        let mut hasher = DefaultHasher::new();
-        hasher.write(method.as_bytes());
-        hasher.write_u8(b' ');
-        hasher.write(path_and_query.as_bytes());
-        let key = hasher.finish();
+        let key = request_key(method, path_and_query);
         let (count, span) = {
             let mut shard = self
                 .repeats
@@ -165,6 +183,41 @@ impl TrafficLinter {
             detail: format!(
                 "{count} identical {method} requests within {} ms; an effect re-running on every render or a retry loop without backoff",
                 span.as_millis()
+            ),
+            evidence: Some(request_evidence(method, path_and_query)),
+        })
+    }
+
+    /// Follows one exact request through 429 / 503 answers. A retry that arrives within
+    /// `THROTTLE_RETRY_WINDOW` of the previous throttled answer ignored it; the
+    /// `THROTTLE_RETRY_THRESHOLD`th such retry in a row is reported, once per storm. A retry
+    /// after a longer pause, or any other answer, ends the storm. A request that arrived
+    /// before the throttled answer went out ran concurrently and is not a retry. `status` is
+    /// what the client received, so an injected 429 / 503 exposes the client's retry policy
+    /// as well as an upstream one.
+    pub fn throttled_retry(
+        &self,
+        arrived: Instant,
+        answered: Instant,
+        method: &str,
+        path_and_query: &str,
+        status: Option<u16>,
+    ) -> Option<TrafficFinding> {
+        let key = request_key(method, path_and_query);
+        let (retries, throttled) = {
+            let mut shard = self
+                .throttles
+                .get(shard_of(key))?
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            shard.observe(key, arrived, answered, status)?
+        };
+        Some(TrafficFinding {
+            kind: TrafficFindingKind::RetryStorm,
+            severity: Severity::Warn,
+            detail: format!(
+                "immediate retry storm after 429/503 without backoff: {retries} retries in a row, each sent within {} ms of a {throttled} answer; honour Retry-After or back off exponentially",
+                THROTTLE_RETRY_WINDOW.as_millis()
             ),
             evidence: Some(request_evidence(method, path_and_query)),
         })
@@ -493,6 +546,105 @@ impl Repeats {
     }
 }
 
+// ---- retries after 429 / 503 ----------------------------------------------------------
+
+#[derive(Default)]
+struct ThrottleShard {
+    requests: Vec<Throttle>,
+}
+
+struct Throttle {
+    key: u64,
+    /// When the latest 429 / 503 to this request was answered; `None` after any other answer.
+    throttled_at: Option<Instant>,
+    /// Status of that answer, for the finding.
+    status: u16,
+    /// Consecutive retries that arrived within the window of the previous throttled answer.
+    retries: usize,
+    reported: bool,
+    last_seen: Instant,
+}
+
+impl ThrottleShard {
+    /// Retry count and throttled status when this exchange completes a storm.
+    fn observe(
+        &mut self,
+        key: u64,
+        arrived: Instant,
+        answered: Instant,
+        status: Option<u16>,
+    ) -> Option<(usize, u16)> {
+        let throttled = status.filter(|status| matches!(status, 429 | 503));
+        let Some(index) = self.requests.iter().position(|r| r.key == key) else {
+            // Only a throttled answer opens a slot: an unthrottled request costs one scan.
+            let status = throttled?;
+            let fresh = Throttle {
+                key,
+                throttled_at: Some(answered),
+                status,
+                retries: 0,
+                reported: false,
+                last_seen: answered,
+            };
+            if self.requests.len() < REQUESTS_PER_SHARD {
+                self.requests.push(fresh);
+            } else {
+                let stale = self
+                    .requests
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, r)| r.last_seen)
+                    .map(|(index, _)| index)?;
+                *self.requests.get_mut(stale)? = fresh;
+            }
+            return None;
+        };
+        self.requests
+            .get_mut(index)?
+            .observe(arrived, answered, throttled)
+    }
+}
+
+impl Throttle {
+    fn observe(
+        &mut self,
+        arrived: Instant,
+        answered: Instant,
+        throttled: Option<u16>,
+    ) -> Option<(usize, u16)> {
+        self.last_seen = self.last_seen.max(answered);
+        let mut storm = None;
+        if let Some(previous) = self.throttled_at {
+            match arrived.checked_duration_since(previous) {
+                Some(gap) if gap <= THROTTLE_RETRY_WINDOW => {
+                    self.retries += 1;
+                    if self.retries >= THROTTLE_RETRY_THRESHOLD && !self.reported {
+                        self.reported = true;
+                        storm = Some((self.retries, self.status));
+                    }
+                }
+                Some(_) => {
+                    self.retries = 0;
+                    self.reported = false;
+                }
+                None => {}
+            }
+        }
+        match throttled {
+            Some(status) => {
+                self.throttled_at = Some(self.throttled_at.map_or(answered, |t| t.max(answered)));
+                self.status = status;
+            }
+            None => {
+                self.throttled_at = None;
+                self.retries = 0;
+                self.reported = false;
+            }
+        }
+        storm
+    }
+}
+
 // ---- latency regressions --------------------------------------------------------------
 
 /// Method plus the path with identifier segments folded, so `/orders/7` and `/orders/8`
@@ -607,11 +759,11 @@ impl LatencyWindow {
 pub enum Decoded<'a> {
     /// No coding, or only `identity`.
     Identity(&'a [u8]),
-    /// Inflated gzip or deflate, at most `MAX_DECODED_BYTES`.
+    /// Inflated gzip, deflate or brotli, at most `MAX_DECODED_BYTES`.
     Inflated(Vec<u8>),
-    /// A coding this build does not inflate (`br`, `zstd`): headers only.
+    /// A coding this build does not inflate (`zstd`, `compress`): headers only.
     Unsupported,
-    /// Declared gzip or deflate, but the bytes are not a valid stream of it.
+    /// Declared gzip, deflate or br, but the bytes are not a valid stream of it.
     Corrupt(&'static str),
     /// The inflated output passed `MAX_DECODED_BYTES`.
     OverLimit,
@@ -631,6 +783,7 @@ impl Decoded<'_> {
 enum Coding {
     Gzip,
     Deflate,
+    Brotli,
 }
 
 /// Undoes `Content-Encoding`, last applied coding first. An empty body is never inflated:
@@ -649,6 +802,8 @@ pub fn decode<'a>(headers: &HeaderMap, body: &'a [u8]) -> Decoded<'a> {
                 codings.push(Coding::Gzip);
             } else if token.eq_ignore_ascii_case("deflate") {
                 codings.push(Coding::Deflate);
+            } else if token.eq_ignore_ascii_case("br") {
+                codings.push(Coding::Brotli);
             } else {
                 return Decoded::Unsupported;
             }
@@ -685,6 +840,19 @@ fn inflate(coding: Coding, input: &[u8]) -> Result<Vec<u8>, Decoded<'static>> {
         Coding::Deflate => DeflateDecoder::new(input)
             .take(limit)
             .read_to_end(&mut output),
+        // The decoder reports truncation, trailing bytes and large-window streams as
+        // errors, so a stream it accepts is one a browser decodes too. Bytes after the end
+        // of the stream surface only on the read after the one that returned 0, which
+        // `read_to_end` never makes.
+        Coding::Brotli => {
+            let mut decoder = Decompressor::new(input, BROTLI_BUFFER_BYTES);
+            match decoder.by_ref().take(limit).read_to_end(&mut output) {
+                Ok(read) if output.len() <= MAX_DECODED_BYTES => {
+                    decoder.read(&mut [0u8; 1]).map(|_| read)
+                }
+                other => other,
+            }
+        }
     };
     match read {
         Ok(_) if output.len() > MAX_DECODED_BYTES => Err(Decoded::OverLimit),
@@ -692,6 +860,7 @@ fn inflate(coding: Coding, input: &[u8]) -> Result<Vec<u8>, Decoded<'static>> {
         Err(_) => Err(Decoded::Corrupt(match coding {
             Coding::Gzip => "gzip",
             Coding::Deflate => "deflate",
+            Coding::Brotli => "br",
         })),
     }
 }
@@ -1611,15 +1780,15 @@ mod tests {
             ("access-control-allow-origin", "*"),
             ("access-control-allow-credentials", "true"),
         ];
-        let brotli = inspect_with(
+        let zstd = inspect_with(
             "GET",
             "/api/items",
             200,
-            &[cors[0], cors[1], ("content-encoding", "br")],
-            b"\x1b\x00 at x (/a.js:1:2)",
+            &[cors[0], cors[1], ("content-encoding", "zstd")],
+            b"\x28\xb5\x2f\xfd at x (/a.js:1:2)",
         );
         assert_eq!(
-            kinds(&brotli),
+            kinds(&zstd),
             [(TrafficFindingKind::HeaderMisconfiguration, Severity::Warn)]
         );
         let corrupt = inspect_with(
@@ -1660,6 +1829,149 @@ mod tests {
             kinds(&found),
             [(TrafficFindingKind::UnboundedCollection, Severity::Warn)]
         );
+    }
+
+    fn br(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut writer = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
+        writer.write_all(bytes).unwrap();
+        writer.into_inner()
+    }
+
+    #[test]
+    fn brotli_bodies_are_inflated_under_the_same_cap() {
+        let trace = b"TypeError: Cannot read properties of null (reading 'trim')\n    at normalizeSku (/srv/app/checkout.js:42:17)";
+        let found = inspect_with(
+            "POST",
+            "/checkout",
+            500,
+            &[("content-type", "text/plain"), ("content-encoding", "br")],
+            &br(trace),
+        );
+        assert_eq!(
+            kinds(&found),
+            [(TrafficFindingKind::PassiveDisclosure, Severity::Fault)]
+        );
+        // `br, gzip`: brotli applied first, so gzip is undone first.
+        let stacked = gzip(&br(b"{\"items\":[]}"));
+        let headers = headers(&[("content-encoding", "BR, gzip")]);
+        assert_eq!(
+            decode(&headers, &stacked).bytes(),
+            Some(&b"{\"items\":[]}"[..])
+        );
+
+        let br_only = headers_br();
+        let bomb = br(&vec![b' '; 2 * MAX_DECODED_BYTES]);
+        assert!(bomb.len() < 64 * 1024, "{} compressed bytes", bomb.len());
+        assert!(matches!(decode(&br_only, &bomb), Decoded::OverLimit));
+        let exact = br(&vec![b' '; MAX_DECODED_BYTES]);
+        assert_eq!(
+            decode(&br_only, &exact).bytes().map(<[u8]>::len),
+            Some(MAX_DECODED_BYTES)
+        );
+
+        // A stream cut short, or followed by stray bytes, is not something a client decodes.
+        let whole = br(trace);
+        let truncated = &whole[..whole.len() / 2];
+        let mut trailing = whole.clone();
+        trailing.extend_from_slice(b"tail");
+        for body in [truncated, trailing.as_slice()] {
+            let found = inspect_with(
+                "GET",
+                "/api/items",
+                200,
+                &[("content-encoding", "br")],
+                body,
+            );
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(
+                found[0].detail,
+                "Content-Encoding: br on a body that is not a valid br stream; clients fail to decode it"
+            );
+        }
+    }
+
+    fn headers_br() -> HeaderMap {
+        headers(&[("content-encoding", "br")])
+    }
+
+    #[test]
+    fn retries_that_ignore_a_throttled_answer() {
+        let linter = TrafficLinter::default();
+        let base = Instant::now();
+        // Answered 5 ms after arrival, retried 25 ms after the answer, six times.
+        let quick = |linter: &TrafficLinter, start: u64, path: &str, status: u16| {
+            (0..6u64)
+                .filter_map(|n| {
+                    let arrived = at(base, start + n * 30);
+                    linter
+                        .throttled_retry(
+                            arrived,
+                            arrived + Duration::from_millis(5),
+                            "POST",
+                            path,
+                            Some(status),
+                        )
+                        .map(|f| (n, f))
+                })
+                .collect::<Vec<_>>()
+        };
+        let found = quick(&linter, 0, "/api/v1/orders", 429);
+        assert_eq!(found.len(), 1, "one finding per storm");
+        let (n, finding) = &found[0];
+        assert_eq!(
+            *n, THROTTLE_RETRY_THRESHOLD as u64,
+            "the original plus four retries"
+        );
+        assert_eq!(finding.kind, TrafficFindingKind::RetryStorm);
+        assert_eq!(finding.severity, Severity::Warn);
+        assert_eq!(finding.evidence.as_deref(), Some("POST /api/v1/orders"));
+        assert_eq!(
+            finding.detail,
+            "immediate retry storm after 429/503 without backoff: 4 retries in a row, each sent within 100 ms of a 429 answer; honour Retry-After or back off exponentially"
+        );
+        assert_eq!(quick(&linter, 1_000, "/api/v1/quote", 503).len(), 1);
+        // Other statuses never start tracking.
+        assert!(quick(&linter, 2_000, "/api/v1/stock", 500).is_empty());
+
+        // Exponential backoff: every retry waits longer than the window.
+        let mut arrived = at(base, 5_000);
+        for pause in [120u64, 240, 480, 960, 1_920] {
+            let answered = arrived + Duration::from_millis(5);
+            assert!(linter
+                .throttled_retry(arrived, answered, "GET", "/api/v1/cart", Some(429))
+                .is_none());
+            arrived = answered + Duration::from_millis(pause);
+        }
+
+        // A success ends the storm: three quick retries (the third answered 200), then a
+        // fresh 503 and three more quick retries; neither run reaches four.
+        let slow = TrafficLinter::default();
+        let statuses = [429u16, 429, 429, 200, 503, 503, 503, 503];
+        let found: Vec<TrafficFinding> = statuses
+            .iter()
+            .enumerate()
+            .filter_map(|(n, status)| {
+                let arrived = at(base, n as u64 * 20);
+                slow.throttled_retry(
+                    arrived,
+                    arrived + Duration::from_millis(2),
+                    "PUT",
+                    "/api/v1/profile",
+                    Some(*status),
+                )
+            })
+            .collect();
+        assert!(found.is_empty(), "{found:?}");
+
+        // Requests that arrived before the throttled answer went out ran concurrently.
+        let burst = TrafficLinter::default();
+        let concurrent = (0..8u64)
+            .filter_map(|n| {
+                burst.throttled_retry(base, at(base, 50 + n), "POST", "/api/v1/redeem", Some(429))
+            })
+            .count();
+        assert_eq!(concurrent, 0);
     }
 
     #[test]

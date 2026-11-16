@@ -49,9 +49,14 @@ tauri-plugin-dialog = "2.8"
 # Inflates gzip / deflate response bodies for the passive audit, into a capped buffer.
 # miniz_oxide backend: pure Rust, no zlib or C toolchain on Windows.
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+# Inflates `Content-Encoding: br` bodies for the same audit. Pure Rust; the major already
+# locked through tauri-codegen, so no second copy of the decoder is built.
+brotli-decompressor = "6.3"
 
 [dev-dependencies]
 tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "net", "macros"] }
+# Encoder for brotli test fixtures (bombs, stacked codings); already in the lockfile.
+brotli = "9.1"
 
 [lints.rust]
 unsafe_code = "forbid"

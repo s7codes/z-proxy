@@ -437,6 +437,17 @@ impl ProxyContext {
         {
             record.findings.push(storm);
         }
+        // Published right before the response is handed to hyper: the client cannot see the
+        // answer earlier than this instant, so a retry is measured from it.
+        if let Some(storm) = self.linter.throttled_retry(
+            record.started,
+            Instant::now(),
+            &record.method,
+            &record.path,
+            record.status,
+        ) {
+            record.findings.push(storm);
+        }
         // Upstream time excludes injected delay, so armed latency faults never read as a
         // service regression.
         if let (Some(status), Some(upstream_us)) = (record.status, record.upstream_latency_us) {
@@ -1384,6 +1395,63 @@ mod tests {
         assert_eq!(storms.len(), 1, "{storms:?}");
         assert_eq!(storms[0].evidence.as_deref(), Some("GET /cart?user=7"));
         manager.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn injected_throttling_exposes_retries_without_backoff() {
+        use crate::engine::types::TrafficFindingKind;
+
+        let mut h = Harness::new().await;
+        let proxy = h.start().await;
+        h.arm(FaultProfile {
+            status_mutation: StatusMutation::ServiceUnavailable,
+            mutation_rate: 100,
+            ..FaultProfile::default()
+        })
+        .await;
+        let throttle_storms = |event: TelemetryEvent| match event {
+            TelemetryEvent::ProxyExchange { findings, .. } => findings
+                .iter()
+                .filter(|f| {
+                    f.kind == TrafficFindingKind::RetryStorm
+                        && f.detail
+                            .starts_with("immediate retry storm after 429/503 without backoff")
+                })
+                .count(),
+            other => panic!("unexpected event {other:?}"),
+        };
+
+        // A client that resends the moment the 503 arrives: the original and four retries.
+        for _ in 0..5 {
+            let response = h
+                .client
+                .post(format!("http://{proxy}/api/v1/orders"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let mut storms = Vec::new();
+        for _ in 0..5 {
+            storms.push(throttle_storms(h.next_exchange().await));
+        }
+        assert_eq!(storms, [0, 0, 0, 0, 1]);
+
+        // The same five requests with a pause longer than the window between them.
+        for _ in 0..5 {
+            let response = h
+                .client
+                .post(format!("http://{proxy}/api/v1/quotes"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        for _ in 0..5 {
+            assert_eq!(throttle_storms(h.next_exchange().await), 0);
+        }
+        h.manager.stop().await;
     }
 
     #[tokio::test]

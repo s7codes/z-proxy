@@ -467,7 +467,10 @@ export type TrafficFindingKind =
   | "unboundedCollection"
   | "headerMisconfiguration"
   | "passiveDisclosure"
-  /** One exact request repeated 10+ times inside 250 ms: a render loop or a retry without backoff. */
+  /**
+   * One exact request repeated 10+ times inside 250 ms (a render loop), or retried 4 times in
+   * a row within 100 ms of a 429 / 503 answer (a retry loop without backoff).
+   */
   | "retryStorm"
   /** A 2xx upstream latency at least 4x the template's rolling median and at least 250 ms. */
   | "latencyRegression";
