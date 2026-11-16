@@ -1,6 +1,6 @@
 import type { GuardState } from "../hooks/useGuardValidator";
 import type { AuditRecord, TrafficAudit } from "../hooks/useTelemetry";
-import { sameDispatch, SYNC_LABEL, SYNC_MODES, type SyncRuns } from "./burst";
+import { describeDelta, sameDispatch, spreadDelta, SYNC_LABEL, SYNC_MODES, type SpreadDelta, type SyncRuns } from "./burst";
 import { describeViolation } from "./contract";
 import { formatBytes, formatLatency, formatPercent } from "./format";
 import { RISK_KINDS, RISK_LABEL } from "./risk";
@@ -37,8 +37,11 @@ import type {
  * value-constraint violations, retry storms, latency regressions, mid-body drops in the
  * fault profile, and route risks found in imported handlers (`routeFile` next to `file`).
  * Version 4 added `burstSync` (the latest burst of each barrier sync mode with its dispatch
- * spread) and the `delimiterEscaping` fuzz class. */
-export const AUDIT_SCHEMA = "z-proxy.audit/4";
+ * spread) and the `delimiterEscaping` fuzz class. Version 5 added the `queryAndHeaderBounds`
+ * fuzz class, `massAssignment` on fuzz cases with `fuzz.massAssignments`, the
+ * `sensitiveFieldLeak` disclosure, the `blockingInAsync` route risk and `burstComparison`
+ * (last-byte spread against pre-connected for one request). */
+export const AUDIT_SCHEMA = "z-proxy.audit/5";
 /** Findings listed in Markdown; the JSON rendering carries all of them. */
 const MARKDOWN_FINDINGS = 200;
 
@@ -83,6 +86,8 @@ export interface AuditFuzz {
   faults: number;
   warnings: number;
   disclosures: number;
+  /** Cases whose undeclared field came back in a 2xx response. */
+  massAssignments: number;
   aborted: string | null;
   notes: string[];
   classes: MutationClass[];
@@ -212,6 +217,8 @@ export interface AuditReport {
   burst: BurstReport | null;
   /** Latest burst of each sync mode run in this session, in `SYNC_MODES` order. */
   burstSync: AuditBurstSync[];
+  /** Last-byte against pre-connected spread when both modes sent the same request. */
+  burstComparison: SpreadDelta | null;
   idempotency: AuditIdempotency | null;
   fuzz: AuditFuzz | null;
   traffic: AuditTraffic;
@@ -381,6 +388,9 @@ export function buildAuditReport(inputs: AuditInputs): AuditReport {
           },
     burst: inputs.burst,
     burstSync: buildBurstSync(inputs.burst, inputs.burstRuns),
+    burstComparison: spreadDelta(
+      inputs.burst === null ? inputs.burstRuns : { ...inputs.burstRuns, [inputs.burst.syncMode]: inputs.burst },
+    ),
     idempotency: buildIdempotency(inputs.burst),
     traffic: buildTraffic(inputs.traffic),
     contracts: buildContracts(inputs),
@@ -405,6 +415,7 @@ export function buildAuditReport(inputs: AuditInputs): AuditReport {
             faults: fuzz.faults,
             warnings: fuzz.warnings,
             disclosures: fuzz.disclosures,
+            massAssignments: fuzz.massAssignments,
             aborted: fuzz.aborted,
             notes: fuzz.notes,
             classes: fuzz.classes,
@@ -511,7 +522,7 @@ function overview(report: AuditReport): string[][] {
     rows.push([
       "Payload fuzzer",
       cell(
-        `${count(fuzz.faults, "fault")}, ${count(fuzz.warnings, "warning")}, ${count(fuzz.disclosures, "disclosure")} across ${count(fuzz.executed, "case")}${
+        `${count(fuzz.faults, "fault")}, ${count(fuzz.warnings, "warning")}, ${count(fuzz.disclosures, "disclosure")}, ${count(fuzz.massAssignments, "mass assignment")} across ${count(fuzz.executed, "case")}${
           fuzz.aborted === null ? "" : `; aborted: ${fuzz.aborted}`
         }`,
       ),
@@ -730,6 +741,9 @@ function renderMarkdown(report: AuditReport): string {
           ]),
         ),
       );
+      if (report.burstComparison !== null) {
+        push(`Spread comparison: ${describeDelta(report.burstComparison, formatLatency)} than pre-connected.`);
+      }
     }
     if (burst.latency !== null) {
       push(
@@ -775,6 +789,7 @@ function renderMarkdown(report: AuditReport): string {
         ["Faults", String(fuzz.faults)],
         ["Warnings", String(fuzz.warnings)],
         ["Disclosures", String(fuzz.disclosures)],
+        ["Mass assignments", String(fuzz.massAssignments)],
         ["Wall time", formatLatency(fuzz.wallUs)],
         ["Aborted", cell(fuzz.aborted)],
       ]),
@@ -798,9 +813,9 @@ function renderMarkdown(report: AuditReport): string {
     push(
       "### Findings",
       fuzz.findings.length === 0
-        ? `None: no 5xx, transport failures, leaked traces or contract drift across ${fuzz.executed} cases.`
+        ? `None: no 5xx, transport failures, leaked traces or fields, mass assignments or contract drift across ${fuzz.executed} cases.`
         : table(
-            ["#", "Class", "Case", "Status", "Severity", "Latency", "Disclosure"],
+            ["#", "Class", "Case", "Status", "Severity", "Latency", "Evidence"],
             listed.map((f) => [
               String(f.index),
               f.class === null ? "baseline" : code(f.class),
@@ -808,11 +823,13 @@ function renderMarkdown(report: AuditReport): string {
               f.status === null ? cell(f.verdict) : String(f.status),
               f.severity ?? "-",
               f.latencyUs === 0 ? "-" : formatLatency(f.latencyUs),
-              f.disclosure !== null
-                ? cell(`${f.disclosure.kind}: ${f.disclosure.evidence}`)
-                : f.violations[0] !== undefined
-                  ? cell(`drift ${describeViolation(f.violations[0])}`)
-                  : cell(f.error),
+              f.massAssignment !== null
+                ? cell(`${f.massAssignment.detail}: ${f.massAssignment.echoedAt} = ${f.massAssignment.value}`)
+                : f.disclosure !== null
+                  ? cell(`${f.disclosure.kind}: ${f.disclosure.evidence}`)
+                  : f.violations[0] !== undefined
+                    ? cell(`drift ${describeViolation(f.violations[0])}`)
+                    : cell(f.error),
             ]),
           ),
     );
@@ -951,7 +968,7 @@ function renderRoutes(routes: AuditRoutes | null, push: Push): void {
   );
   if (routes.risks.length === 0) {
     push(
-      "No unvalidated mutations, unbounded queries, floating async calls, non-atomic writes or interpolated SQL found.",
+      "No unvalidated mutations, unbounded queries, floating async calls, non-atomic writes, interpolated SQL or blocking calls found.",
     );
     return;
   }
