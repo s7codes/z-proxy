@@ -12,20 +12,20 @@ is created.
 status mutation, mid-body truncation), barrier-synchronized concurrency burst runner
 (pre-connected or last-byte sync) with TTFB/total latency split, success quota, anomaly
 detection and contract drift under load, filesystem route scanner with in-file mount prefix
-resolution and OpenAPI request body synthesis, deterministic payload fuzzer (nine vectors
-including schema contract bounds and path parameter boundaries) with stack trace and
-database error detection and fuzz-to-burst replay, embedded target lab service with
-switchable defects that can be chained behind the proxy, passive audit of proxied traffic
-with gzip/deflate inflation (N+1 fan-outs, retry storms, latency regressions, unpaginated
-collections, header misconfiguration, disclosures), OpenAPI response contract checks
-(types, required fields, value constraints) in the proxy, the fuzzer and the burst runner,
-static audit of route handlers across relative imports (unvalidated mutations, unbounded
-queries, floating async calls, non-atomic multi-writes, interpolated SQL) with one-click
-targeting into Burst or Fuzzer, Idempotency-Key replay bursts, Markdown/JSON audit report
-export, CI on Linux and Windows.
+resolution and OpenAPI request body synthesis, deterministic payload fuzzer (ten vectors
+including schema contract bounds, path parameter boundaries and delimiter escaping) with
+stack trace and database error detection and fuzz-to-burst replay, embedded target lab
+service with switchable defects that can be chained behind the proxy, passive audit of
+proxied traffic with gzip/deflate/brotli inflation (N+1 fan-outs, retry storms including
+retries that ignore a 429/503, latency regressions, unpaginated collections, header
+misconfiguration, disclosures), OpenAPI response contract checks (types, required fields,
+value constraints) in the proxy, the fuzzer and the burst runner, static audit of route
+handlers across relative imports, `tsconfig` path aliases, Next.js re-exports and class
+controllers (unvalidated mutations, unbounded queries, floating async calls, non-atomic and
+looped writes, interpolated SQL) with one-click targeting into Burst or Fuzzer,
+Idempotency-Key replay bursts, Markdown/JSON audit report export, CI on Linux and Windows.
 Not implemented yet: WebSocket proxying, TLS upstreams, query-string and header fuzzing,
-mount prefixes across files, TypeScript path aliases in the handler audit, brotli and zstd
-inflation.
+mount prefixes across files, `package.json` `imports` subpath aliases, zstd inflation.
 
 ## Layout
 
@@ -50,8 +50,9 @@ src-tauri/
   src/engine/concurrency.rs  Burst runner and report analysis
   src/engine/fuzzer.rs     Mutation case generation, sequential runner, verdicts
   src/engine/disclosure.rs Stack trace and database error signatures in response bodies
-  src/engine/linter.rs     Passive audit of proxied exchanges: N+1, retry storm and latency
-                           windows, capped gzip/deflate inflation, JSON skimmer
+  src/engine/linter.rs     Passive audit of proxied exchanges: N+1, retry storm, throttled
+                           retry and latency windows, capped gzip/deflate/br inflation,
+                           JSON skimmer
   src/engine/contract.rs   Response contract checks, contract set matched by route template
   src/engine/lab.rs        Embedded target lab service (unprotected / hardened)
   src/engine/error.rs      EngineError, serialized as { code, message, ... }
@@ -61,7 +62,9 @@ src-tauri/
   src/scanner/{next,node,axum,go,openapi}.rs  Per-framework extractors, mount prefixes
   src/scanner/schema.rs    OpenAPI request body samples and response contracts
   src/scanner/audit.rs     Static handler audit: validation, query bounds, dropped async calls,
-                           unguarded multi-writes, interpolated SQL; relative import resolution
+                           unguarded and looped writes, interpolated SQL; import, re-export and
+                           class member resolution
+  src/scanner/tsconfig.rs  compilerOptions.paths / baseUrl through relative extends chains
 ```
 
 ## Loopback guard
@@ -144,9 +147,9 @@ results as `findings: TrafficFinding[]` (`kind`, `severity`, `detail`, `evidence
 | Kind                     | Severity   | Condition                                                         |
 |--------------------------|------------|-------------------------------------------------------------------|
 | `nPlusOneBurst`          | warn       | 8 distinct GET paths of one route template within 250 ms of arrival |
-| `retryStorm`             | warn       | One exact request line (method, path and query) 10 times within 250 ms of arrival, any method |
+| `retryStorm`             | warn       | One exact request line (method, path and query) 10 times within 250 ms of arrival, any method; or retried 4 times in a row, each retry arriving within 100 ms of a 429 or 503 answer to it ("immediate retry storm after 429/503 without backoff") |
 | `unboundedCollection`    | warn       | 2xx JSON with a top-level array, or a `data`/`items`/`results` array, above 250 items and no pagination key (`total`, `page`, `nextCursor`, `hasMore`, `meta`, `links`, ...) or header (`Link: rel="next"`, `X-Total-Count`, `Content-Range`, ...); JSON above 1 MiB, compressed or not |
-| `headerMisconfiguration` | warn/fault | JSON body without a JSON `Content-Type`, markup served as JSON; `Content-Encoding: gzip`/`deflate` on a body that is not a valid stream of it; `Access-Control-Allow-Credentials: true` with origin `*` (warn) or `null` (fault); GET 2xx to a credentialed request, a cookie-setting response or an account/session route without `Cache-Control` or marked `public` |
+| `headerMisconfiguration` | warn/fault | JSON body without a JSON `Content-Type`, markup served as JSON; `Content-Encoding: gzip`/`deflate`/`br` on a body that is not a valid stream of it; `Access-Control-Allow-Credentials: true` with origin `*` (warn) or `null` (fault); GET 2xx to a credentialed request, a cookie-setting response or an account/session route without `Cache-Control` or marked `public` |
 | `passiveDisclosure`      | warn/fault | Disclosure signature (see the fuzzer) in the first 8 KiB of a textual body; fault on 5xx |
 | `latencyRegression`      | warn       | 2xx upstream latency at least 4x the median of the route template's previous responses (8 to 32 kept) and at least 250 ms |
 
@@ -160,6 +163,14 @@ most 64 templates per shard.
 
 Retry storms use the same shape keyed by the exact request line, so `/cart?user=7` and
 `/cart?user=8` are different requests; a polling client below 10 per 250 ms is not reported.
+The throttled-retry trigger follows the same key through 429 and 503 answers: a retry that
+arrives within 100 ms of the previous throttled answer ignored it (any real backoff, even the
+first step of an exponential one, waits longer), and the fourth such retry in a row is
+reported once. A longer pause or any other answer ends the storm; a request that arrived
+before the throttled answer went out ran concurrently and is not a retry. The status is the
+one the client received, so arming a 429/503 status mutation exposes a client's retry policy
+as well as an upstream's. Only a throttled answer opens a slot, so unthrottled traffic costs
+one shard scan.
 Latency regressions keep a fixed ring of the last 32 upstream latencies per method and route
 template (identifier segments folded as above) and judge a response against the median of the
 ones before it, once at least 8 exist. Upstream time excludes injected delay, so an armed
@@ -168,10 +179,13 @@ on millisecond loopback medians out. Both detectors shard like the N+1 windows a
 evicted slot's buffer, so a known key costs no allocation.
 
 Response checks run on forwarded responses only, never on injected faults. A `gzip`,
-`x-gzip` or `deflate` (zlib-wrapped or raw) `Content-Encoding` is undone first, last-applied
-coding first, into a buffer capped at 1 MiB: the inflater (`flate2`, pure-Rust `miniz_oxide`
-backend) is read through `take(cap + 1)`, so a decompression bomb stops at the cap. The
-client still receives the encoded bytes. `br` and `zstd` bodies get the header checks only.
+`x-gzip`, `deflate` (zlib-wrapped or raw) or `br` `Content-Encoding` is undone first,
+last-applied coding first, into a buffer capped at 1 MiB: the inflaters (`flate2` on the
+pure-Rust `miniz_oxide` backend, `brotli-decompressor`) are read through `take(cap + 1)`, so
+a decompression bomb stops at the cap. A truncated brotli stream, bytes after its end and a
+large-window stream are reported as an invalid encoding; the decoder's ring buffer stays
+within the RFC 7932 window (16 MiB). The client still receives the encoded bytes. `zstd`
+bodies get the header checks only.
 The checks borrow the decoded body and the header map; JSON is walked by a byte-level skimmer
 that counts items and reads top-level keys without building values or recursing.
 
@@ -212,7 +226,12 @@ one single-byte write per worker. The request is encoded once per worker
 non-empty body) and queued with hyper before the barrier; hyper parses the response from the
 read half while its own serialization of the request goes to a sink whose reads stay parked
 until hyper flushed it. A server that answers before the last byte (431, 413) keeps its
-response even when the final write fails. `burstStarted` and the report echo `syncMode`.
+response even when the final write fails. `burstStarted`, `burstCompleted` and the report
+echo `syncMode`, so a dispatch spread is never read without the mode it was measured under.
+The UI keeps the latest burst of each mode; once both modes have sent the same request from
+as many workers, the Burst result lists their spreads side by side, and the audit report's
+`burstSync` carries the same comparison. Neither mode is asserted to be tighter: both spreads
+depend on the host scheduler, so they are measured and reported, not compared in tests.
 
 Each worker records two monotonic intervals from the instant it writes its request: `ttfbUs`
 to the parsed response head (hyper resolves `send_request` once the status line and headers
@@ -341,28 +360,43 @@ Each route extracted from source (`scanner/audit.rs`; OpenAPI routes have no han
 the region of its handler: the declaration up to the next route or top-level declaration (at
 most 160 lines), plus the bodies of up to three handlers it names that are defined in the same
 file (`post(create_item)`, `app.post("/x", validate(schema), create)`,
-`router.post("/x", asyncHandler(create))`, `mux.HandleFunc("POST /x", createItem)`).
+`router.post("/x", asyncHandler(create))`, `mux.HandleFunc("POST /x", createItem)`). A
+dotted reference lands on the member it names: `router.post("/x", controller.create)` with
+`const controller = new OrdersController()` is the `create` method or arrow property of that
+class, and `handlers.remove` the `remove` property of `const handlers = { .. }`; a member's
+region runs from its line to the end of its function body. A Next.js App Router method export
+that does not hold the handler in place is followed to it: `export { POST } from "m"`,
+`export { create as POST }` and `export const POST = withAuth(create)`.
 
-A JavaScript or TypeScript handler that the file imports from a relative module is audited
-in that module. Bindings come from `import x from`, `import { a, b as c } from`,
+A JavaScript or TypeScript handler that the file imports or re-exports from another module is
+audited in that module. Bindings come from `import x from`, `import { a, b as c } from`,
 `import * as ns from`, `const x = require(..)`, `const { a, b: c } = require(..)` and
-`require(..).a`; type-only imports are ignored. `create` resolves to the binding's export,
-`ns.create` to the named export `create`. The specifier is tried as written, with each JS/TS
-extension, as a directory `index`, and a `.js` specifier also as the `.ts` source beside it.
-The canonical path must stay inside the scan root, at most 16 modules are read per file
-(each once, 1 MiB cap), and the export is located as a named declaration, `exports.x =`,
-`module.exports.x =`, `export default` or `module.exports =`. Evidence found there carries
-the module's path in `file`.
+`require(..).a`; type-only imports are ignored. `create` resolves to the binding's export and
+`ns.create` to the named export `create`; `orders.create` on a default or named import is the
+`create` member of the class instance or object literal exported there
+(`export default new OrdersController()`, `module.exports = { create: .. }`), and
+`controller.create` on an instance of an imported class is the member of that class in its
+module. A relative specifier is joined to the file's directory; any other goes through the
+nearest `tsconfig.json` / `jsconfig.json` inside the scan root (`scanner/tsconfig.rs`):
+`compilerOptions.paths` (an exact pattern first, else the wildcard with the longest prefix,
+each substitution in order) and then `baseUrl`, both read through relative `extends` chains in
+TypeScript's JSON-with-comments dialect. A package name no alias covers resolves to nothing.
+Each candidate is tried as written, with each JS/TS extension, as a directory `index`, and a
+`.js` path also as the `.ts` source beside it. The canonical path must stay inside the scan
+root, at most 16 modules are read per file (each once, 1 MiB cap), and the export is located
+as a named declaration, `exports.x =`, `module.exports.x =`, `export default`,
+`module.exports =`, or a member of the exported container. Evidence found there carries the
+module's path in `file`.
 
 Checks run on the comment-masked text of every region and need positive evidence, so a
 handler the pass cannot resolve reports nothing:
 
 | Risk                   | Evidence                                                              |
 |------------------------|-----------------------------------------------------------------------|
-| `unvalidatedMutation`  | POST/PUT/PATCH/DELETE reads the body (`req.body`, `request.json()`, `Json<..>`, `r.Body`) and the region has no validator: zod, valibot, joi, yup, ajv, superstruct, TypeBox, Fastify `schema:`, `validate*`/`*Validator`, `X.parse(` / `safeParse(` on anything but `JSON`, `Date`, `URL`, `qs`; typed axum `Json<T>`/`Form<T>` or `from_slice::<T>` (`Value`/`HashMap` do not count); gin `Bind*`, typed `Decode(&..)`, `json.Unmarshal` |
+| `unvalidatedMutation`  | POST/PUT/PATCH/DELETE reads the body (`req.body`, `request.json()`, Hono `c.req.parseBody()` / `text()` / `arrayBuffer()`, `Json<..>`, `r.Body`), in code or inside a `${..}` template expression, and the region has no validator (Hono `c.req.valid(..)` returns already validated input and counts as one): zod, valibot, joi, yup, ajv, superstruct, TypeBox, Fastify `schema:`, `validate*`/`*Validator`, `X.parse(` / `safeParse(` on anything but `JSON`, `Date`, `URL`, `qs`; typed axum `Json<T>`/`Form<T>` or `from_slice::<T>` (`Value`/`HashMap` do not count); gin `Bind*`, typed `Decode(&..)`, `json.Unmarshal` |
 | `unboundedQuery`       | `findMany(` / `findAll(` / `find({..})` / GORM `Find(&..)` without `take`/`limit`/`first`/`last` in the arguments or the chain; a `SELECT .. FROM` string literal without `LIMIT`, `TOP`, `FETCH FIRST`, an aggregate or an `id =` lookup |
 | `floatingAsync`        | JS: a persistence call (`save`, `create`, `update`, `delete`, `insert*`, `execute`, `query`, `publish`, `sendMail`, `commit`, ... on a model chain or a db/queue receiver) or `fetch(` as a statement, neither awaited, returned nor chained to `.then`/`.catch`; an async Express handler that awaits without `try`, `next(err)` or `.catch(next)`, unless wrapped (`asyncHandler`, `catchAsync`), `express-async-errors` is loaded, or the nearest `package.json` declares Express 5 (`^5`, `~5`, `>=5`, `npm:express@5`), which forwards rejections natively. Go: `Exec`/`Commit`/`Create`/`Save`/`Delete`/`Update` as a statement, error dropped. Rust is skipped: unused futures and `Result`s are compiler warnings |
-| `nonAtomicMultiWrite`  | Two or more writes across the handler's regions, one per statement: ORM `create`/`update`/`upsert`/`delete`/`insert*`/`save`/`destroy` on a client root (`db`, `prisma`, `knex`, `repo`, `tx`, ...), a model chain or a capitalized model, `await x.save()`; `execute`/`Exec`/`ExecContext` unless the statement selects; `INSERT INTO`, `UPDATE .. SET`, `DELETE FROM` literals (a literal inside a write call, or in the same statement, is that call's write). No transaction marker in any region: `$transaction`, `.transaction(`, `withTransaction(`, `startTransaction(`, GORM `Transaction(`, `Begin()`/`BeginTx(`, sqlx `begin()`, a `tx.`/`trx.` handle, `@Transactional`, or `BEGIN`/`START TRANSACTION` literals. Receivers through request, response or in-memory state (`searchParams`, `session`, `cache`, `headers`, ...) and Go file packages (`os.Create`) never count |
+| `nonAtomicMultiWrite`  | Writes, one per statement: ORM `create`/`update`/`upsert`/`delete`/`insert*`/`save`/`destroy` on a client root (`db`, `prisma`, `knex`, `repo`, `tx`, ...), a model chain or a capitalized model, `await x.save()`, also with the chain broken across lines (`prisma.order` / `.create(`); `execute`/`Exec`/`ExecContext` unless the statement selects (labelled by its SQL); `INSERT INTO`, `UPDATE .. SET`, `DELETE FROM` literals (a literal inside a write call, or in the same statement, is that call's write). Reported when one write runs inside a loop (`for`, `for await`, `while`, `do`, `forEach`/`map`/`flatMap` callbacks; Rust `for`/`while`/`loop`/`for_each`; Go `for`), or when two or more writes include one outside every transaction. A transaction covers only what it encloses: the arguments of `$transaction(..)`, `.transaction(..)`, `withTransaction(..)`, GORM `Transaction(..)`, Diesel/SeaORM `transaction::<..>(..)`; writes after a handle-style begin (`begin()`, `Begin()`/`BeginTx(`, `beginTransaction(`, `startTransaction(`, an argument-less `.transaction()`, a `BEGIN`/`START TRANSACTION` literal); writes on a `tx`/`trx`/`txn` receiver or passed one (`&mut *tx`, `{ transaction: t }`); everything under `@Transactional` / `#[transactional]`. A model named `transaction` is not a handle. Receivers through request, response or in-memory state (`searchParams`, `session`, `cache`, `headers`, ...) and Go file packages (`os.Create`) never count |
 | `unsafeSqlInterpolation` | A literal shaped like SQL (`SELECT .. FROM`, `INSERT INTO`, `UPDATE .. SET`, `DELETE FROM`, `WHERE col =`/`LIKE`/`IN`) built from values: an untagged template literal with `${..}` (tagged templates such as `` sql`..` `` and `` Prisma.sql`..` `` pass values as parameters and stay clean), a quoted literal followed by `+ expr`, the format string of `format!` with a placeholder, or of `fmt.Sprintf` with a verb |
 
 Risks carry `kind`, `line`, the trimmed evidence line, a `detail`, and `file` when the
@@ -376,7 +410,7 @@ contract, and opens the tab that exercises the failure mode with a fresh setup:
 | Risk                     | Opens  | Preset                                                        |
 |--------------------------|--------|---------------------------------------------------------------|
 | `unvalidatedMutation`    | Fuzzer | `nullInjection`, `boundaryNumbers`, `typeConfusion`, `missingFields`, `schemaContractBounds` |
-| `unsafeSqlInterpolation` | Fuzzer | `emptyStrings`, `typeConfusion`, `oversizedField`, `pathParamValidation` |
+| `unsafeSqlInterpolation` | Fuzzer | `emptyStrings`, `typeConfusion`, `oversizedField`, `pathParamValidation`, `delimiterEscaping` |
 | `floatingAsync`          | Fuzzer | `nullInjection`, `typeConfusion`, `malformedJson`             |
 | `nonAtomicMultiWrite`    | Burst  | 32 workers, `lastByte` sync                                   |
 | `unboundedQuery`         | Burst  | 32 workers, `lastByte` sync                                   |
@@ -414,6 +448,7 @@ addressed by RFC 6901 pointer, nested objects to depth 3, at most 48 fields.
 | `missingFields`   | Each field removed; empty object                                             |
 | `schemaContractBounds` | Valid JSON syntax that a strict schema refuses: each top-level key (at most 8) repeated with a conflicting value of the same type; an extra field nested 64 and 1 024 objects deep; undeclared fields (`zproxyExtra`, `isAdmin`, and one inside the first object field); each numeric field set to the literal `1e309` |
 | `pathParamValidation` | Each `{param}` slot of the target path (at most 8) set to `0`, `-1`, `9223372036854775807`, `9223372036854775808`, `invalid-uuid`, the empty segment, and 4 096 digits; other slots stay `1`, the body is the base |
+| `delimiterEscaping` | Each string field set to five ordinary catalogue values carrying the delimiters a string-built query, path or pattern must escape: `O'Reilly & Sons`, `15" display \ rev-2`, `item; category(1)`, `100%_discount_*`, and `cafe` followed by U+0301 (combining acute) and U+200B (zero-width space) and `test`, sent as raw UTF-8 (13 bytes, 10 characters) |
 
 Classes run in the order above; new classes are appended, so case indices of earlier classes
 never shift. Duplicate keys test parser differentials: a validator that keeps the first
@@ -421,7 +456,11 @@ occurrence and a handler that keeps the last disagree about the same body. The t
 depths sit inside common parser limits (serde_json 128, Python 1 000) and past them, where a
 recursive parser or sanitizer runs out of stack.
 
-The default template yields 100 cases (no path cases without a placeholder). An unmutated
+Delimiter values are harmless text: storing one verbatim or refusing it with a 4xx is correct,
+so acceptance raises no warning; a 5xx or a leaked driver error is the finding. The vectors
+never carry exploit payloads.
+
+The default template yields 115 cases (no path cases without a placeholder). An unmutated
 baseline request runs first. Cases run sequentially, one connection each, with
 `Connection: close` and `x-zproxy-fuzz-case: <index>`; `Content-Type: application/json` is
 added unless the operator sets one.
@@ -530,7 +569,7 @@ Unprotected checkout failures, by input:
 |-----------------------------------------------------------|--------------------------------------------------|
 | Malformed JSON                                            | 400 with a body-parser `SyntaxError` stack trace |
 | Missing or `null` field, `null` note, non-object root     | 500 Node.js `TypeError` stack trace              |
-| Non-string `sku`, `sku` containing `'`                    | 500 MySQL driver error object with the query     |
+| Non-string `sku`, `sku` containing `'` (`O'Reilly & Sons`) | 500 MySQL driver error object with the query     |
 | String `quantity` (`"NaN"`, `"1"`)                        | 500 PostgreSQL `invalid input syntax` error      |
 | Negative `quantity`                                       | 500 Go panic with goroutine dump                 |
 | `quantity` above 10 000                                   | 500 Rust panic (index out of bounds)             |
@@ -545,7 +584,17 @@ optional string up to 256, `giftWrap` optional boolean, unknown fields rejected
 (`additionalProperties: false`), body at most 32 KiB. Before field validation it refuses
 nesting deeper than 8 levels and any key repeated within one object (the violation names the
 duplicate's pointer); numbers outside `f64` range and nesting past the parser limit are
-422 `malformed_json`.
+422 `malformed_json`. Delimiters are data there: the `delimiterEscaping` vector gets a clean
+422 on the patterned `sku` and `customer.email`, and 201 with the value stored in
+`customer.name` and `note`, where unprotected mode answers the apostrophe in `sku` with the
+MySQL syntax error.
+
+A checkout burst in idempotency mode with last-byte sync shows the replay contract at the
+tightest overlap a client can produce: unprotected mode creates one order per worker under the
+same key (`idempotencyViolation`, plus `contractDrift` for the string `totalCents` when the
+route contract is attached); hardened mode claims the key, creates and records under one lock
+and answers every worker with the stored response, under last-byte and pre-connected release
+alike.
 
 Order lookup serves the seeded history (orders 1-3) and every order confirmed by checkout
 since the last reset or mode switch (at most 1 024). Unprotected responses, by `orderId`:
@@ -592,9 +641,12 @@ listener runs armed, and the rule is marked inactive otherwise.
 The header's Report group and the command palette export the session state as one report:
 guard verdict and probe, request origin (direct or via proxy), target lab mode and counters,
 proxy listener, global profile (mid-body drop included) and route rules, the latest burst
-report (barrier sync mode, status histogram, TTFB and total latency percentiles, success
-quota, idempotency key, contract drift count, anomalies) and the latest fuzz report (vector
-summary, notes, findings with disclosures and contract drift). Four further sections
+report (barrier sync mode with the dispatch spread measured under it, status histogram, TTFB
+and total latency percentiles, success quota, idempotency key, contract drift count,
+anomalies), the latest burst of each sync mode side by side (`burstSync`: run, request,
+workers, dispatch spread, TTFB p50, wall time, anomalies, and whether it sent the same request
+as the reported burst) and the latest fuzz report (vector summary, notes, findings with
+disclosures and contract drift). Four further sections
 summarize the passive traffic audit (all seven counters and retained findings, faults
 first), contract drift (proxied violations, drifting fuzz requests and drifting burst
 workers), the static route audit of the route list in view (evidence location, with the
@@ -604,7 +656,7 @@ is built in the UI (`src/lib/export.ts`) from state it already holds; nothing is
 | Action | Output                                                                                   |
 |--------|------------------------------------------------------------------------------------------|
 | `.md`  | Tabular Markdown; the first 200 findings, faults first                                    |
-| `.json`| `AuditReport` with `schema: "z-proxy.audit/3"`; burst samples and every finding included  |
+| `.json`| `AuditReport` with `schema: "z-proxy.audit/4"`; burst samples and every finding included  |
 | Copy   | The Markdown rendering to the clipboard                                                   |
 
 `save_audit_report` opens the native save dialog from Rust (the webview has no `fs` or
