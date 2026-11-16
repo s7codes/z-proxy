@@ -1,4 +1,5 @@
-//! `compilerOptions.paths` and `baseUrl` of the nearest `tsconfig.json` / `jsconfig.json`.
+//! `compilerOptions.paths` and `baseUrl` of the nearest `tsconfig.json` / `jsconfig.json`,
+//! and the subpath `imports` (`#name` specifiers) of the nearest `package.json`.
 //!
 //! Only what module resolution needs is read: the two options, through relative `extends`
 //! chains, in the JSON-with-comments dialect TypeScript accepts. Packages named in `extends`
@@ -72,6 +73,121 @@ impl PathAliases {
             out.push(base.join(spec));
         }
         out
+    }
+}
+
+/// `imports` of a `package.json`: Node's subpath imports, the `#name` specifiers a package
+/// maps to its own files.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SubpathImports {
+    /// Directory of the `package.json`; every local target starts with `./` from here.
+    base: PathBuf,
+    patterns: Vec<Pattern>,
+}
+
+/// Conditions a server-side handler resolves under, in the order they are tried when a
+/// target is a condition object; `types` names declarations, never a handler.
+const CONDITIONS: [&str; 4] = ["node", "import", "require", "default"];
+/// Nesting of condition objects and fallback arrays followed in one target.
+const MAX_CONDITION_DEPTH: usize = 4;
+
+impl SubpathImports {
+    /// Paths a `#` specifier names, before extension probing: the exact key, else the
+    /// wildcard key with the longest prefix, with every `*` of its targets replaced by the
+    /// matched text (Node's rule; TypeScript `paths` replace one).
+    pub fn candidates(&self, spec: &str) -> Vec<PathBuf> {
+        let exact = self
+            .patterns
+            .iter()
+            .find(|pattern| pattern.suffix.is_none() && pattern.prefix == spec)
+            .map(|pattern| (pattern, ""));
+        let matched = exact.or_else(|| {
+            self.patterns
+                .iter()
+                .filter_map(|pattern| {
+                    let suffix = pattern.suffix.as_deref()?;
+                    let star = spec
+                        .strip_prefix(pattern.prefix.as_str())?
+                        .strip_suffix(suffix)?;
+                    Some((pattern, star))
+                })
+                .max_by_key(|(pattern, _)| pattern.prefix.len())
+        });
+        matched.map_or_else(Vec::new, |(pattern, star)| {
+            pattern
+                .targets
+                .iter()
+                .map(|target| self.base.join(target.replace('*', star)))
+                .collect()
+        })
+    }
+}
+
+/// The nearest `package.json` at or above `dir`, not above `root`: Node's package scope.
+pub fn nearest_manifest(root: &Path, dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .take_while(|ancestor| ancestor.starts_with(root))
+        .map(|ancestor| ancestor.join("package.json"))
+        .find(|path| path.is_file())
+}
+
+/// Subpath imports `manifest` declares; `None` without an `imports` object or when the file
+/// cannot be read. Targets outside the package (bare package names, `../`) are dropped.
+pub fn load_imports(root: &Path, manifest: &Path) -> Option<SubpathImports> {
+    let canonical = std::fs::canonicalize(manifest).ok()?;
+    if !canonical.starts_with(root) {
+        return None;
+    }
+    let value = read_jsonc(&canonical)?;
+    let imports = value.get("imports")?.as_object()?;
+    let patterns = imports
+        .iter()
+        .filter(|(key, _)| key.starts_with('#') && key.len() > 1)
+        .take(MAX_PATTERNS)
+        .filter_map(|(key, target)| {
+            let mut targets = Vec::new();
+            local_targets(target, 0, &mut targets);
+            let (prefix, suffix) = match key.split_once('*') {
+                Some((_, suffix)) if suffix.contains('*') => return None,
+                Some((prefix, suffix)) => (prefix.to_owned(), Some(suffix.to_owned())),
+                None => (key.clone(), None),
+            };
+            (!targets.is_empty()).then_some(Pattern {
+                prefix,
+                suffix,
+                targets,
+            })
+        })
+        .collect();
+    Some(SubpathImports {
+        base: canonical.parent()?.to_path_buf(),
+        patterns,
+    })
+}
+
+/// Local file targets of one `imports` entry: a `./` string, the first matching condition of
+/// a condition object, or every entry of a fallback array, in order.
+fn local_targets(target: &Value, depth: usize, out: &mut Vec<String>) {
+    if depth > MAX_CONDITION_DEPTH || out.len() >= MAX_TARGETS {
+        return;
+    }
+    match target {
+        Value::String(path) if path.starts_with("./") => out.push(path.clone()),
+        Value::Array(fallbacks) => {
+            for fallback in fallbacks {
+                local_targets(fallback, depth + 1, out);
+            }
+        }
+        // Node takes the first key in object order that names an active condition.
+        Value::Object(conditions) => {
+            if let Some((_, chosen)) = conditions
+                .iter()
+                .find(|(condition, _)| CONDITIONS.contains(&condition.as_str()))
+            {
+                local_targets(chosen, depth + 1, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -345,5 +461,47 @@ mod tests {
         let no_base = aliases(None, &[("~/*", &["./*"])]);
         assert_eq!(no_base.candidates("~/a/b"), [PathBuf::from("/p/./a/b")]);
         assert!(no_base.candidates("express").is_empty());
+    }
+
+    #[test]
+    fn subpath_imports_follow_conditions_and_replace_every_wildcard() {
+        let root = std::env::temp_dir().join(format!("zproxy-imports-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let manifest = root.join("package.json");
+        std::fs::write(
+            &manifest,
+            r##"{
+  "name": "orders-api",
+  "imports": {
+    "#db": { "types": "./types/db.d.ts", "node": "./src/db/index.js", "default": "./src/db/browser.js" },
+    "#handlers/*": "./src/handlers/*.js",
+    "#handlers/legacy/*": ["./src/legacy/*/*.js", "express-legacy/*"],
+    "#vendor": "left-pad",
+    "#two/*/*": "./never.js",
+    "plain": "./ignored.js"
+  }
+}"##,
+        )
+        .unwrap();
+        let imports = load_imports(&root, &manifest).unwrap();
+        assert_eq!(imports.candidates("#db"), [root.join("./src/db/index.js")]);
+        assert_eq!(
+            imports.candidates("#handlers/orders"),
+            [root.join("./src/handlers/orders.js")]
+        );
+        // The longest prefix wins; a bare package fallback is not a local file.
+        assert_eq!(
+            imports.candidates("#handlers/legacy/carts"),
+            [root.join("./src/legacy/carts/carts.js")]
+        );
+        assert!(imports.candidates("#vendor").is_empty());
+        assert!(imports.candidates("#two/a/b").is_empty());
+        assert!(imports.candidates("plain").is_empty());
+        assert_eq!(
+            nearest_manifest(&root, &root.join("src/handlers")),
+            Some(manifest)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

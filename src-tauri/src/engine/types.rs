@@ -535,12 +535,17 @@ pub enum RouteRiskKind {
     /// A side-effecting async call whose promise or error is dropped, or an async Express
     /// handler with no error path.
     FloatingAsync,
-    /// Two or more database writes in one handler with no transaction in sight: a failure
-    /// or a concurrent request between them leaves partial state.
+    /// Two or more database writes in one handler with no transaction in sight, a write
+    /// repeated by a loop, or a write that bypasses a transaction handle begun in the same
+    /// handler: a failure or a concurrent request between them leaves partial state.
     NonAtomicMultiWrite,
     /// SQL text built by interpolating values (`${...}`, concatenation, `format!`,
     /// `fmt.Sprintf`) instead of binding parameters.
     UnsafeSqlInterpolation,
+    /// A synchronous file, process, sleep or key-derivation call inside a handler that runs
+    /// on an event loop (any JavaScript handler) or an `async fn` Rust handler: every request
+    /// sharing the thread waits behind it.
+    BlockingInAsync,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

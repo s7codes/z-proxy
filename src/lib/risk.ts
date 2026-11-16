@@ -6,6 +6,7 @@ export const RISK_KINDS: readonly RouteRiskKind[] = [
   "floatingAsync",
   "nonAtomicMultiWrite",
   "unsafeSqlInterpolation",
+  "blockingInAsync",
 ];
 
 export const RISK_LABEL: Record<RouteRiskKind, string> = {
@@ -14,6 +15,7 @@ export const RISK_LABEL: Record<RouteRiskKind, string> = {
   floatingAsync: "Floating async",
   nonAtomicMultiWrite: "Non-atomic multi-write",
   unsafeSqlInterpolation: "Unsafe SQL interpolation",
+  blockingInAsync: "Blocking I/O",
 };
 
 export const RISK_SHORT: Record<RouteRiskKind, string> = {
@@ -22,6 +24,7 @@ export const RISK_SHORT: Record<RouteRiskKind, string> = {
   floatingAsync: "floating",
   nonAtomicMultiWrite: "non-atomic",
   unsafeSqlInterpolation: "sql-interp",
+  blockingInAsync: "blocking",
 };
 
 /** Burst setup an auto-targeted risk opens with. */
@@ -80,5 +83,10 @@ export const AUTO_TARGET: Record<RouteRiskKind, AutoTarget> = {
     tab: "burst",
     burst: CONTENDED_BURST,
     reason: "32 workers, last byte held, to stack the unbounded reads",
+  },
+  blockingInAsync: {
+    tab: "burst",
+    burst: CONTENDED_BURST,
+    reason: "32 workers released together; a blocked loop serves them in turn, so TTFB p95 climbs with queue position",
   },
 };

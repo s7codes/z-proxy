@@ -390,10 +390,12 @@ export type RouteRiskKind =
   | "unvalidatedMutation"
   | "unboundedQuery"
   | "floatingAsync"
-  /** Two or more database writes in one handler with no transaction in sight. */
+  /** Two or more unguarded writes in one handler, a write in a loop, or a write that bypasses a bound transaction handle. */
   | "nonAtomicMultiWrite"
   /** SQL text built by interpolation (`${...}`, concatenation, `format!`, `fmt.Sprintf`). */
-  | "unsafeSqlInterpolation";
+  | "unsafeSqlInterpolation"
+  /** A synchronous file, process, sleep or key-derivation call in an event-loop or async Rust handler. */
+  | "blockingInAsync";
 
 export interface RouteRisk {
   kind: RouteRiskKind;

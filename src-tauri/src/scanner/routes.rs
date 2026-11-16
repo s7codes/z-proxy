@@ -17,7 +17,7 @@ use walkdir::{DirEntry, WalkDir};
 
 use super::audit::{self, Project};
 use super::lex::{Lang, Source};
-use super::tsconfig::{self, PathAliases};
+use super::tsconfig::{self, PathAliases, SubpathImports};
 use super::{axum, go, next, node, openapi};
 use crate::engine::error::{EngineError, EngineResult};
 use crate::engine::types::{
@@ -201,6 +201,10 @@ struct Scan {
     aliases: HashMap<PathBuf, Option<Arc<PathAliases>>>,
     /// Each config parsed once, however many directories it governs.
     configs: HashMap<PathBuf, Option<Arc<PathAliases>>>,
+    /// `package.json` subpath imports by source directory, from the nearest manifest.
+    imports: HashMap<PathBuf, Option<Arc<SubpathImports>>>,
+    /// Each manifest parsed once.
+    manifests: HashMap<PathBuf, Option<Arc<SubpathImports>>>,
 }
 
 impl Scan {
@@ -260,11 +264,16 @@ impl Scan {
             FileKind::Js => self.aliases(root, dir),
             _ => None,
         };
+        let imports = match kind {
+            FileKind::Js => self.imports(root, dir),
+            _ => None,
+        };
         let project = Project {
             root,
             dir,
             express_native_async,
             aliases: aliases.as_deref(),
+            imports: imports.as_deref(),
         };
 
         match extract(kind, &components, src, Some(&project)) {
@@ -314,6 +323,22 @@ impl Scan {
                 .clone()
         });
         self.aliases.insert(dir.to_path_buf(), found.clone());
+        found
+    }
+
+    /// Subpath `imports` of the nearest `package.json` at or above `dir`, inside the scan
+    /// root: the package scope Node resolves `#name` specifiers in.
+    fn imports(&mut self, root: &Path, dir: &Path) -> Option<Arc<SubpathImports>> {
+        if let Some(known) = self.imports.get(dir) {
+            return known.clone();
+        }
+        let found = tsconfig::nearest_manifest(root, dir).and_then(|manifest| {
+            self.manifests
+                .entry(manifest)
+                .or_insert_with_key(|manifest| tsconfig::load_imports(root, manifest).map(Arc::new))
+                .clone()
+        });
+        self.imports.insert(dir.to_path_buf(), found.clone());
         found
     }
 }
@@ -806,6 +831,58 @@ mod tests {
                 .all(|risk| !risk.contains("@src/handlers/orders.ts")),
             "{unresolved:?}"
         );
+    }
+
+    #[test]
+    fn subpath_imports_barrels_and_imported_instances_resolve() {
+        let fx = Fixture::new();
+        fx.write(
+            "package.json",
+            r##"{"type":"module","imports":{"#controllers/*":"./src/controllers/*.js","#handlers":{"types":"./types/handlers.d.ts","node":"./src/handlers/index.js"}},"dependencies":{"express":"^4.21.2"}}"##,
+        )
+        .write(
+            "src/routes/orders.js",
+            "import express from \"express\";\nimport { ordersController } from \"#controllers/index\";\nimport { updateUser, refundOrder } from \"#handlers\";\n\nconst router = express.Router();\nrouter.post(\"/orders\", ordersController.create);\nrouter.put(\"/users/:id\", updateUser);\nrouter.post(\"/refunds\", refundOrder);\n\nexport default router;\n",
+        )
+        // The route's module holds only an instance; its class lives one module further.
+        .write(
+            "src/controllers/index.js",
+            "import { OrdersController } from \"./orders.controller.js\";\n\nexport const ordersController = new OrdersController();\n",
+        )
+        .write(
+            "src/controllers/orders.controller.ts",
+            "export class OrdersController {\n  create = async (req, res, next) => {\n    try {\n      await db.order.create({ data: req.body });\n      await db.ledger.create({ data: { order: req.body.id } });\n      res.sendStatus(201);\n    } catch (err) {\n      next(err);\n    }\n  };\n}\n",
+        )
+        .write(
+            "src/handlers/index.js",
+            "export * from \"./users.js\";\nexport { refund as refundOrder } from \"./payments.js\";\n",
+        )
+        .write(
+            "src/handlers/users.js",
+            "export async function updateUser(req, res, next) {\n  try {\n    const { name } = req.body;\n    await pool.query(`UPDATE users SET name = '${name}' WHERE id = ${req.params.id}`);\n    res.sendStatus(204);\n  } catch (err) {\n    next(err);\n  }\n}\n",
+        )
+        .write(
+            "src/handlers/payments.js",
+            "export async function refund(req, res, next) {\n  try {\n    const tx = await db.begin();\n    await tx.query(\"UPDATE orders SET refunded = true WHERE id = $1\", [req.body.id]);\n    await db.query(\"INSERT INTO ledger (order_id) VALUES ($1)\", [req.body.id]);\n    await tx.commit();\n    res.sendStatus(204);\n  } catch (err) {\n    next(err);\n  }\n}\n",
+        );
+        assert_eq!(
+            risks(&fx.scan()),
+            [
+                "POST /orders: UnvalidatedMutation@src/controllers/orders.controller.ts:4",
+                "POST /orders: NonAtomicMultiWrite@src/controllers/orders.controller.ts:4",
+                "POST /refunds: UnvalidatedMutation@src/handlers/payments.js:4",
+                "POST /refunds: NonAtomicMultiWrite@src/handlers/payments.js:5",
+                "PUT /users/{id}: UnvalidatedMutation@src/handlers/users.js:3",
+                "PUT /users/{id}: UnsafeSqlInterpolation@src/handlers/users.js:4",
+            ]
+        );
+
+        // Without the manifest's `imports` the `#` specifiers resolve to nothing.
+        fx.write(
+            "package.json",
+            r#"{"type":"module","dependencies":{"express":"^4.21.2"}}"#,
+        );
+        assert!(risks(&fx.scan()).is_empty());
     }
 
     /// `../../...` from `root` to the absolute `target` (forward slashes).

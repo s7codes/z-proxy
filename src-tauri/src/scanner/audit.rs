@@ -3,24 +3,29 @@
 //! Lexical, like the extractors. Each route gets the source regions of its handler: the
 //! declaration up to the next route or top-level declaration, the bodies of handlers it
 //! names that are defined in the same file (functions, and methods or arrow properties of
-//! classes, `new` instances and object literals) and, for JavaScript, the bodies of handlers
-//! it imports from modules inside the scan root: relative specifiers, `tsconfig.json` /
-//! `jsconfig.json` `paths` aliases and `baseUrl` specifiers, Next.js re-exports
-//! (`export { POST } from "@/handlers/orders"`) and assigned exports
-//! (`export const POST = withAuth(create)`). Five checks then run over the comment-masked
-//! text of those regions. Every check needs positive evidence (a body read, a collection
-//! query, a dropped call, an unguarded write, an interpolated query), so a handler the pass
-//! cannot resolve yields no risk rather than a guess.
+//! classes, `new` instances and object literals, whatever their parameter lists hold:
+//! defaults that call functions, NestJS parameter decorators) and, for JavaScript, the
+//! bodies of handlers it imports from modules inside the scan root: relative specifiers,
+//! `tsconfig.json` / `jsconfig.json` `paths` aliases and `baseUrl` specifiers, `package.json`
+//! subpath imports (`#handlers/orders`), Next.js re-exports (`export { POST } from
+//! "@/handlers/orders"`) and assigned exports (`export const POST = withAuth(create)`). An
+//! import that lands on a module without the handler is followed up to two modules further:
+//! through `export ... from` and `export *` barrels, re-exported imports, and exported
+//! instances of classes defined elsewhere. Six checks then run over the comment-masked text
+//! of those regions. Every check needs positive evidence (a body read, a collection query, a
+//! dropped call, an unguarded write, an interpolated query, a blocking call), so a handler
+//! the pass cannot resolve yields no risk rather than a guess.
 
+use std::cell::{OnceCell, RefCell};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use regex::Regex;
+use regex::{Captures, Regex};
 
 use super::lex::{self, Lang, Source};
 use super::routes::{compile, relative, RawRoute, MAX_SOURCE_BYTES};
-use super::tsconfig::PathAliases;
+use super::tsconfig::{PathAliases, SubpathImports};
 use crate::engine::types::{RouteMethod, RouteRisk, RouteRiskKind, RouteSource};
 
 /// A handler region never extends past this many lines, so a route at the end of a long
@@ -30,8 +35,13 @@ const MAX_NAMED_HANDLERS: usize = 3;
 const EVIDENCE_CHARS: usize = 120;
 /// Bytes after a query call searched for a chained `.limit(` / `.then(`.
 const CHAIN_WINDOW: usize = 400;
-/// Relative modules read per audited file; each is read once however many routes use it.
+/// Modules read per audited file, imported or reached through re-exports; each is read once
+/// however many routes use it.
 const MAX_IMPORTED_MODULES: usize = 16;
+/// Modules followed past the one an import names when that one does not define the handler.
+const MAX_HOPS: usize = 2;
+/// `export * from` modules tried for one name.
+const MAX_STAR_EXPORTS: usize = 4;
 /// Extensions tried, in order, for an import specifier written without one.
 const JS_EXTENSIONS: [&str; 8] = ["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts"];
 /// Writes named in a risk's detail before the rest is summarized.
@@ -41,7 +51,8 @@ static JS_DECLARATIONS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
         r"(?m)^(?:export[ \t]+)?(?:default[ \t]+)?(?:async[ \t]+)?function[ \t]*\*?[ \t]*([A-Za-z_$][\w$]*)?",
         r"(?m)^(?:export[ \t]+)?(?:const|let|var)[ \t]+([A-Za-z_$][\w$]*)[ \t]*(?::[^=\n]+)?=[ \t]*(?:async(?-u:\b)|function(?-u:\b)|\(|[A-Za-z_$][\w$]*[ \t]*=>)",
-        r"(?m)^[ \t]+(?:(?:public|private|protected|static|override)[ \t]+)*(?:async[ \t]+)?([A-Za-z_$][\w$]*)[ \t]*\([^)\n]*\)[ \t]*(?::[^{\n]+)?\{",
+        // One level of nested parentheses: `create(@Body() dto)`, `list(limit = cap())`.
+        r"(?m)^[ \t]+(?:(?:public|private|protected|static|override)[ \t]+)*(?:async[ \t]+)?([A-Za-z_$][\w$]*)[ \t]*\((?:[^()\n]|\([^()\n]*\))*\)[ \t]*(?::[^{\n]+)?\{",
         r"(?m)^(?:export[ \t]+)?(?:default[ \t]+)?class(?-u:\b)",
         // CommonJS exports: `exports.create = ...`, `module.exports.create = ...` name a
         // handler; a bare `module.exports = ...` only ends the previous region.
@@ -97,6 +108,9 @@ static EXPORT_FROM: LazyLock<Option<Regex>> = LazyLock::new(|| {
 });
 static EXPORT_LIST: LazyLock<Option<Regex>> =
     LazyLock::new(|| compile(r"(?-u:\b)export[ \t]*\{([^}]*)\}"));
+/// `export * from "m"`; a namespace re-export (`export * as ns from`) does not match.
+static EXPORT_STAR: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile(r#"(?m)^[ \t]*export[ \t]*\*[ \t]*from[ \t]*['"]([^'"\n]+)['"]"#));
 /// `[export] const NAME = <expression>` up to the end of the line.
 static ASSIGNMENT: LazyLock<Option<Regex>> = LazyLock::new(|| {
     compile(
@@ -136,15 +150,18 @@ static DEFAULT_CONTAINER: LazyLock<Option<Regex>> = LazyLock::new(|| {
         r"(?:(?:abstract[ \t]+)?class(?-u:\b)[^{\n]*\{|new[ \t]+([A-Za-z_$][\w$]*)|\{|([A-Za-z_$][\w$]*)[ \t]*;?[ \t]*\r?$)",
     ))
 });
-/// A method (ends at its body's `{`), or a property holding a function or arrow (ends at
-/// `{` or `=>`), at the start of a line inside a class body or object literal. Parameter
-/// lists may span lines.
-static MEMBER_DECL: LazyLock<Option<Regex>> = LazyLock::new(|| {
+/// The head of a member at the start of a line inside a class body or object literal, up to
+/// the `(` of its parameter list: a method (group 2), a property holding a function (group
+/// 3) or a parenthesized arrow (group 4); or a one-parameter arrow through its `=>` (group
+/// 5). The parameter list itself is matched by bracket, so defaults that call functions and
+/// parameter decorators (`@Body() dto`, `@Param('id') id`) do not hide the member. Decorators
+/// on the same line (`@Post(':id') async create(`) are allowed.
+static MEMBER_HEAD: LazyLock<Option<Regex>> = LazyLock::new(|| {
     compile(concat!(
-        r"(?m)^[ \t]*(?:(?:public|private|protected|static|readonly|override|async)[ \t]+)*\*?[ \t]*",
+        r"(?m)^[ \t]*(?:@[A-Za-z_$][\w$.]*(?:\((?:[^()\n]|\([^()\n]*\))*\))?[ \t]+)*",
+        r"(?:(?:public|private|protected|static|readonly|override|async)[ \t]+)*\*?[ \t]*",
         r"([A-Za-z_$][\w$]*)[ \t]*(?:<[^>\n]*>)?[ \t]*",
-        r"(?:\([^)]*\)[ \t]*(?::[^{\n]+)?\{",
-        r"|[:=][ \t]*(?:async[ \t]+)?(?:function(?-u:\b)[^{\n]*\{|\([^)]*\)[ \t]*(?::[^=\n]+)?=>|[A-Za-z_$][\w$]*[ \t]*=>))",
+        r"(?:(\()|[:=][ \t]*(?:async[ \t]+)?(?:function(?-u:\b)[ \t]*\*?[ \t]*(?:[A-Za-z_$][\w$]*)?[ \t]*(\()|(\()|[A-Za-z_$][\w$]*[ \t]*(=>)))",
     ))
 });
 /// A default export defined in place, or naming a declaration (group 1).
@@ -322,6 +339,42 @@ static TX_DECORATOR: LazyLock<Option<Regex>> =
     LazyLock::new(|| compile(r"@Transactional|#\[\s*transactional"));
 static SQL_TX: LazyLock<Option<Regex>> =
     LazyLock::new(|| compile(r"(?-u:\b)(?:BEGIN|START TRANSACTION)(?-u:\b)"));
+/// A transaction begun into a binding: `const tx = await db.begin()`, `const t = await
+/// sequelize.transaction()`, `let mut tx = pool.begin().await?`. Group 1 is the handle,
+/// group 2 the connection it was begun on, group 3 the begin call.
+static TX_BOUND: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(concat!(
+        r"(?-u:\b)(?:const|let|var)[ \t]+(?:mut[ \t]+)?([A-Za-z_$][\w$]*)[ \t]*(?::[^=\n]+)?=[ \t]*(?:await[ \t]+)?",
+        r"((?:this\.|self\.)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*?)[ \t]*\.[ \t]*",
+        r"(begin|beginTransaction|startTransaction|transaction|start_transaction)[ \t]*\(",
+    ))
+});
+/// Go: `tx, err := db.Begin()`, `tx := db.BeginTx(ctx, nil)`.
+static GO_TX_BOUND: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(concat!(
+        r"(?-u:\b)([A-Za-z_]\w*)(?:[ \t]*,[ \t]*[A-Za-z_]\w*)?[ \t]*:?=[ \t]*",
+        r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*?)[ \t]*\.[ \t]*(Begin|BeginTx)[ \t]*\(",
+    ))
+});
+
+// ---- blocking calls in async handlers ---------------------------------------------------
+
+/// Node calls that block the event loop: synchronous file system and child process calls,
+/// and the synchronous key derivation of `crypto` and bcrypt.
+static JS_BLOCKING: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(concat!(
+        r"(?-u:\b)(readFileSync|writeFileSync|appendFileSync|existsSync|statSync|readdirSync",
+        r"|execSync|execFileSync|spawnSync|pbkdf2Sync|scryptSync|hashSync|compareSync|genSaltSync)[ \t]*\(",
+    ))
+});
+/// Calls that block a Tokio worker thread: a thread sleep, `std::fs`, and bcrypt's CPU-bound
+/// hash.
+static RUST_BLOCKING: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(r"(?-u:\b)((?:std::)?thread::sleep|std::fs::[a-z_]+|bcrypt::(?:hash|verify))[ \t]*\(")
+});
+/// A blocking call inside these runs on a thread meant for it.
+static OFFLOADED: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile(r"(?-u:\b)(?:spawn_blocking|block_in_place)[ \t]*\("));
 /// Loop headers; the match ends at the `(` of the condition or callback, or at the body's
 /// `{`. The first group that took part names the loop.
 static JS_LOOP: LazyLock<Option<Regex>> = LazyLock::new(|| {
@@ -410,19 +463,43 @@ pub struct Project<'p> {
     pub express_native_async: bool,
     /// `paths` / `baseUrl` of the nearest `tsconfig.json` or `jsconfig.json`.
     pub aliases: Option<&'p PathAliases>,
+    /// Subpath `imports` of the nearest `package.json`.
+    pub imports: Option<&'p SubpathImports>,
 }
 
-impl Project<'_> {
-    /// The file a specifier names: relative to the audited file, else through the config's
-    /// `paths` and `baseUrl`. A package name that no alias covers resolves to nothing.
+impl<'p> Project<'p> {
+    /// The file a specifier names: relative to the audited file, a `#` subpath import of the
+    /// package, else through the config's `paths` and `baseUrl`. A package name that no
+    /// alias covers resolves to nothing.
     fn resolve(&self, spec: &str) -> Option<PathBuf> {
         if spec.starts_with('.') {
             return self.probe(&self.dir.join(spec));
+        }
+        if spec.starts_with('#') {
+            return self
+                .imports?
+                .candidates(spec)
+                .iter()
+                .find_map(|base| self.probe(base));
         }
         self.aliases?
             .candidates(spec)
             .iter()
             .find_map(|base| self.probe(base))
+    }
+
+    /// The same project seen from another directory, for a module's own imports.
+    fn at<'d>(&self, dir: &'d Path) -> Project<'d>
+    where
+        'p: 'd,
+    {
+        Project {
+            root: self.root,
+            dir,
+            express_native_async: self.express_native_async,
+            aliases: self.aliases,
+            imports: self.imports,
+        }
     }
 
     /// `base` as written, with each JavaScript extension, or as a directory index. A `.js`
@@ -737,50 +814,30 @@ pub fn annotate(
         Lang::Rust | Lang::Go => Vec::new(),
     };
 
-    // Every route's imported handlers are resolved first, so a module shared by several
-    // routes is read once.
+    // Every route's imported handlers are located first, so a module shared by several
+    // routes (or reached through the same barrel) is read once.
+    let modules = ModuleSet::default();
+    let contexts = Contexts::new(&modules, native_async);
     let mut wanted: Vec<Vec<(usize, Target)>> = vec![Vec::new(); routes.len()];
-    let mut paths: Vec<PathBuf> = Vec::new();
     if let (Some(project), Lang::Js) = (project, lang) {
         for (index, route) in routes.iter().enumerate() {
             let line = usize::try_from(route.line).unwrap_or(0);
             for (spec, target) in home.imported_targets(route, line, &bindings) {
-                let Some(path) = project.resolve(&spec) else {
-                    continue;
-                };
-                let module = match paths.iter().position(|known| *known == path) {
-                    Some(module) => module,
-                    None if paths.len() < MAX_IMPORTED_MODULES => {
-                        paths.push(path);
-                        paths.len() - 1
-                    }
-                    None => continue,
-                };
-                if let Some(slot) = wanted.get_mut(index) {
-                    slot.push((module, target));
+                let found = contexts.locate(project, &spec, target, 0);
+                if let (Some(found), Some(slot)) = (found, wanted.get_mut(index)) {
+                    slot.push(found);
                 }
             }
         }
     }
-    let modules: Vec<Option<(String, Source)>> = paths
-        .iter()
-        .map(|path| project.and_then(|project| project.load(path)))
-        .collect();
-    let contexts: Vec<Option<FileContext<'_>>> = modules
-        .iter()
-        .map(|module| {
-            module.as_ref().map(|(rel, source)| {
-                FileContext::new(source, Lang::Js, &[], Some(rel.clone()), native_async)
-            })
-        })
-        .collect();
 
     for (index, route) in routes.iter_mut().enumerate() {
         let mut regions = home.handler_regions(route, &bindings);
-        for (module, target) in wanted.get(index).into_iter().flatten() {
-            let Some(Some(ctx)) = contexts.get(*module) else {
+        for (slot, target) in wanted.get(index).into_iter().flatten() {
+            let Some(module) = contexts.get(*slot) else {
                 continue;
             };
+            let ctx = &module.ctx;
             if let Some(range) = ctx.export_region(target) {
                 let known = regions
                     .iter()
@@ -791,6 +848,123 @@ pub fn annotate(
             }
         }
         route.risks = audit(&home, route, &regions);
+    }
+}
+
+/// One imported module as the audit reads it.
+struct Module {
+    rel: String,
+    source: Source,
+    /// Where the module's own relative imports resolve.
+    dir: PathBuf,
+}
+
+/// Modules read for one audited file. Each slot is filled on first use and never moved, so
+/// the contexts borrowing a module stay valid while later modules are read.
+#[derive(Default)]
+struct ModuleSet {
+    paths: RefCell<Vec<PathBuf>>,
+    loaded: [OnceCell<Option<Module>>; MAX_IMPORTED_MODULES],
+}
+
+impl ModuleSet {
+    /// Slot of `path`, registering it while slots remain.
+    fn slot(&self, path: PathBuf) -> Option<usize> {
+        let mut paths = self.paths.borrow_mut();
+        if let Some(known) = paths.iter().position(|known| *known == path) {
+            return Some(known);
+        }
+        (paths.len() < MAX_IMPORTED_MODULES).then(|| {
+            paths.push(path);
+            paths.len() - 1
+        })
+    }
+
+    fn module(&self, slot: usize, project: &Project<'_>) -> Option<&Module> {
+        self.loaded
+            .get(slot)?
+            .get_or_init(|| {
+                let path = self.paths.borrow().get(slot)?.clone();
+                let (rel, source) = project.load(&path)?;
+                Some(Module {
+                    rel,
+                    source,
+                    dir: path.parent()?.to_path_buf(),
+                })
+            })
+            .as_ref()
+    }
+}
+
+struct ModuleContext<'s> {
+    ctx: FileContext<'s>,
+    bindings: Vec<Binding>,
+}
+
+/// File contexts over a `ModuleSet`, built when a module is first located.
+struct Contexts<'s> {
+    modules: &'s ModuleSet,
+    native_async: bool,
+    built: [OnceCell<Option<ModuleContext<'s>>>; MAX_IMPORTED_MODULES],
+}
+
+impl<'s> Contexts<'s> {
+    fn new(modules: &'s ModuleSet, native_async: bool) -> Self {
+        Self {
+            modules,
+            native_async,
+            built: Default::default(),
+        }
+    }
+
+    /// The context of a module `locate` already read.
+    fn get(&self, slot: usize) -> Option<&ModuleContext<'s>> {
+        self.built.get(slot)?.get()?.as_ref()
+    }
+
+    fn build(&self, slot: usize, project: &Project<'_>) -> Option<&ModuleContext<'s>> {
+        let modules = self.modules;
+        self.built
+            .get(slot)?
+            .get_or_init(|| {
+                let module = modules.module(slot, project)?;
+                Some(ModuleContext {
+                    ctx: FileContext::new(
+                        &module.source,
+                        Lang::Js,
+                        &[],
+                        Some(module.rel.clone()),
+                        self.native_async,
+                    ),
+                    bindings: import_bindings(&module.source),
+                })
+            })
+            .as_ref()
+    }
+
+    /// Slot and export of the module that defines what `project`'s file imports as `target`
+    /// from `spec`, following re-exports and imported classes up to `MAX_HOPS` modules on.
+    fn locate(
+        &self,
+        project: &Project<'_>,
+        spec: &str,
+        target: Target,
+        hops: usize,
+    ) -> Option<(usize, Target)> {
+        let slot = self.modules.slot(project.resolve(spec)?)?;
+        let module = self.build(slot, project)?;
+        if module.ctx.export_region(&target).is_some() {
+            return Some((slot, target));
+        }
+        if hops >= MAX_HOPS {
+            return None;
+        }
+        let from = project.at(&self.modules.module(slot, project)?.dir);
+        module
+            .ctx
+            .forward(&target, &module.bindings)
+            .into_iter()
+            .find_map(|(next, forwarded)| self.locate(&from, &next, forwarded, hops + 1))
     }
 }
 
@@ -807,14 +981,25 @@ struct TxScope {
     whole: bool,
     /// Argument spans of transaction calls (`$transaction(...)`, `db.transaction(cb)`).
     calls: Vec<Range<usize>>,
-    /// Earliest handle-style begin; writes after it are taken to run on the handle.
+    /// Earliest begin whose handle is not bound to a name (`client.query("BEGIN")`,
+    /// `session.startTransaction()`); writes after it are taken to run inside it.
     begun: Option<usize>,
+    /// Transactions begun into a binding; only writes through the binding run inside them.
+    handles: Vec<TxHandle>,
 }
 
 impl TxScope {
     fn begin(&mut self, at: usize) {
         self.begun = Some(self.begun.map_or(at, |begun| begun.min(at)));
     }
+}
+
+/// `const tx = await db.begin()`: handle `tx`, begun on `db`.
+struct TxHandle {
+    name: String,
+    /// Receiver chain of the begin, compacted (`db`, `this.pool`, `state.db`).
+    conn: String,
+    at: usize,
 }
 
 /// A database write, labelled for the risk detail.
@@ -824,6 +1009,22 @@ struct WriteSite {
     /// Runs on a transaction handle: its receiver, or the call it is passed to, is one, or
     /// one is among its arguments.
     handle: bool,
+    /// Receiver chain of the write call, or of the call a SQL string is passed to; compacted.
+    receiver: String,
+    /// The call's arguments, or the rest of the statement after a SQL string.
+    args: Range<usize>,
+}
+
+/// How a write stands against the transactions of its region.
+enum Coverage {
+    Covered,
+    /// A write on the connection a bound transaction was begun on, not on its handle: it
+    /// commits on its own and survives the rollback.
+    Bypass {
+        conn: String,
+        handle: String,
+    },
+    Uncovered,
 }
 
 struct Loop {
@@ -1161,11 +1362,11 @@ impl<'a> FileContext<'a> {
     /// From the start of the member's line to the end of its function body, or of its
     /// expression for an arrow without braces. Only direct members of `body` count.
     fn member_range(&self, body: Range<usize>, member: &str) -> Option<Range<usize>> {
-        let re = MEMBER_DECL.as_ref()?;
+        let re = MEMBER_HEAD.as_ref()?;
         let text = self.text();
         let slice = text.get(body.clone())?;
         for caps in re.captures_iter(slice) {
-            let (Some(whole), Some(name)) = (caps.get(0), caps.get(1)) else {
+            let Some(name) = caps.get(1) else {
                 continue;
             };
             let at = body.start + name.start();
@@ -1175,20 +1376,167 @@ impl<'a> FileContext<'a> {
             {
                 continue;
             }
-            let end = body.start + whole.end();
-            let open = if text.as_bytes().get(end - 1) == Some(&b'{') {
-                Some(end - 1)
-            } else {
-                let next = lex::skip_ws(text, end);
-                (text.as_bytes().get(next) == Some(&b'{')).then_some(next)
-            };
-            let close = match open {
-                Some(open) => lex::matching_bracket(text, open, self.lang)? + 1,
-                None => statement_end(text, end, CHAIN_WINDOW),
-            };
-            return Some(self.line_start(at)..close.min(text.len()));
+            if let Some(end) = self.member_end(&caps, body.start) {
+                return Some(self.line_start(at)..end.min(text.len()));
+            }
         }
         None
+    }
+
+    /// End of the member whose head `caps` matched in a slice starting at `offset`: past the
+    /// closing brace of its body, or the end of an arrow's expression. `None` for a head that
+    /// is no function after all (`value: (a + b)`, an overload signature).
+    fn member_end(&self, caps: &Captures<'_>, offset: usize) -> Option<usize> {
+        let text = self.text();
+        if let Some(arrow) = caps.get(5) {
+            return Some(self.arrow_end(offset + arrow.end()));
+        }
+        let arrow = caps.get(4).is_some();
+        let open = caps
+            .get(2)
+            .or_else(|| caps.get(3))
+            .or_else(|| caps.get(4))?;
+        let close = lex::matching_paren(text, offset + open.start(), self.lang)?;
+        let mut at = lex::skip_ws(text, close + 1);
+        if text.as_bytes().get(at) == Some(&b':') {
+            at = annotation_end(text, at + 1, arrow)?;
+        }
+        if arrow {
+            return text
+                .get(at..)?
+                .starts_with("=>")
+                .then(|| self.arrow_end(at + 2));
+        }
+        if text.as_bytes().get(at) != Some(&b'{') {
+            return None;
+        }
+        Some(lex::matching_bracket(text, at, self.lang)? + 1)
+    }
+
+    /// End of an arrow function whose `=>` ends right before `from`.
+    fn arrow_end(&self, from: usize) -> usize {
+        let text = self.text();
+        let next = lex::skip_ws(text, from);
+        if text.as_bytes().get(next) == Some(&b'{') {
+            if let Some(close) = lex::matching_bracket(text, next, self.lang) {
+                return close + 1;
+            }
+        }
+        statement_end(text, from, CHAIN_WINDOW)
+    }
+
+    /// Where an export this module does not define comes from, most specific first: a
+    /// re-export (`export { create } from "./orders"`), an import it passes on (`import {
+    /// create } from "./orders"; export { create }`), the class of an exported instance
+    /// defined in another module (`export const orders = new OrdersController()`), or the
+    /// `export *` modules that may hold it.
+    fn forward(&self, target: &Target, bindings: &[Binding]) -> Vec<(String, Target)> {
+        let mut out = Vec::new();
+        match target {
+            Target::Named(name) => {
+                out.extend(self.reexported(name));
+                if let Some((module, found)) = import_target(bindings, name) {
+                    out.push((module.to_owned(), found));
+                }
+                out.extend(
+                    self.star_exports()
+                        .into_iter()
+                        .map(|spec| (spec, Target::Named(name.clone()))),
+                );
+            }
+            Target::Default => {
+                out.extend(self.reexported("default"));
+                if let Some(found) = self
+                    .default_name()
+                    .and_then(|name| import_target(bindings, &name))
+                {
+                    out.push((found.0.to_owned(), found.1));
+                }
+            }
+            Target::Member { container, member } => {
+                let name = match (container, self.default_container.as_ref()) {
+                    (Some(name), _) => Some(name.as_str()),
+                    (None, Some(Container::Name(name))) => Some(name.as_str()),
+                    (None, _) => None,
+                };
+                if let Some(name) = name {
+                    let class = self.instance_class(name).unwrap_or(name);
+                    if let Some((module, class_container)) = class_import(bindings, class) {
+                        out.push((
+                            module.to_owned(),
+                            Target::Member {
+                                container: class_container,
+                                member: member.clone(),
+                            },
+                        ));
+                    }
+                    if container.is_some() {
+                        out.extend(self.reexported(name).into_iter().map(|(spec, inner)| {
+                            let container = match inner {
+                                Target::Named(original) => Some(original),
+                                _ => None,
+                            };
+                            (
+                                spec,
+                                Target::Member {
+                                    container,
+                                    member: member.clone(),
+                                },
+                            )
+                        }));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `export { x as exported } from "m"` entries for `exported`: the module and what it
+    /// exports there.
+    fn reexported(&self, exported: &str) -> Vec<(String, Target)> {
+        let Some(re) = EXPORT_FROM.as_ref() else {
+            return Vec::new();
+        };
+        re.captures_iter(self.text())
+            .filter_map(|caps| {
+                let (whole, list, spec) = (caps.get(0)?, caps.get(1)?, caps.get(2)?);
+                if self.source.in_string(whole.start()) {
+                    return None;
+                }
+                let target = match exported_as(list.as_str(), exported)? {
+                    "default" => Target::Default,
+                    original => Target::Named(original.to_owned()),
+                };
+                Some((spec.as_str().to_owned(), target))
+            })
+            .collect()
+    }
+
+    fn star_exports(&self) -> Vec<String> {
+        let Some(re) = EXPORT_STAR.as_ref() else {
+            return Vec::new();
+        };
+        re.captures_iter(self.text())
+            .filter(|caps| {
+                caps.get(0)
+                    .is_some_and(|m| !self.source.in_string(m.start()))
+            })
+            .filter_map(|caps| caps.get(1).map(|spec| spec.as_str().to_owned()))
+            .take(MAX_STAR_EXPORTS)
+            .collect()
+    }
+
+    /// The binding `export default name` names, whether or not this module declares it.
+    fn default_name(&self) -> Option<String> {
+        DEFAULT_EXPORT
+            .as_ref()?
+            .captures_iter(self.text())
+            .find(|caps| {
+                caps.get(0)
+                    .is_some_and(|m| !self.source.in_string(m.start()))
+            })
+            .and_then(|caps| caps.get(1))
+            .map(|name| name.as_str().to_owned())
     }
 
     /// Bracket nesting at `to`, counted from `from`, with string literals skipped.
@@ -1452,7 +1800,13 @@ impl<'a> FileContext<'a> {
                     || TX_HANDLE.as_ref().is_some_and(|re| {
                         re.is_match(text.get(open + 1..close).unwrap_or_default())
                     });
-                sites.push(WriteSite { at, label, handle });
+                sites.push(WriteSite {
+                    at,
+                    label,
+                    handle,
+                    receiver,
+                    args: open + 1..close,
+                });
             }
         }
         if let Some(sql) = SQL_WRITE.as_ref() {
@@ -1473,6 +1827,8 @@ impl<'a> FileContext<'a> {
                         at: start,
                         label: sql_keywords(found.as_str()),
                         handle,
+                        receiver: called_receiver(before),
+                        args: end..statement.max(end),
                     });
                 }
             }
@@ -1515,10 +1871,43 @@ impl<'a> FileContext<'a> {
         let Some(slice) = text.get(range.clone()) else {
             return scope;
         };
+        let bound = match self.lang {
+            Lang::Go => GO_TX_BOUND.as_ref(),
+            Lang::Js | Lang::Rust => TX_BOUND.as_ref(),
+        };
+        // Begin calls that produced a named handle; the generic passes below skip them.
+        let mut bound_calls: Vec<usize> = Vec::new();
+        for caps in bound.into_iter().flat_map(|re| re.captures_iter(slice)) {
+            let (Some(whole), Some(name), Some(conn), Some(call)) =
+                (caps.get(0), caps.get(1), caps.get(2), caps.get(3))
+            else {
+                continue;
+            };
+            if self.source.in_string(range.start + whole.start()) {
+                continue;
+            }
+            // `transaction(cb)` scopes its callback; only an argument-less call returns one.
+            if call.as_str() == "transaction" {
+                let open = range.start + whole.end() - 1;
+                let empty = lex::matching_paren(text, open, self.lang)
+                    .and_then(|close| text.get(open + 1..close))
+                    .is_some_and(|args| args.trim().is_empty());
+                if !empty {
+                    continue;
+                }
+            }
+            let at = range.start + call.start();
+            bound_calls.push(at);
+            scope.handles.push(TxHandle {
+                name: name.as_str().to_owned(),
+                conn: compact(conn.as_str()),
+                at,
+            });
+        }
         if let Some(re) = TX_CALL.as_ref() {
             for found in re.find_iter(slice) {
                 let at = range.start + found.start();
-                if self.source.in_string(at) {
+                if self.source.in_string(at) || bound_calls.contains(&at) {
                     continue;
                 }
                 let open = range.start + found.end() - 1;
@@ -1539,7 +1928,7 @@ impl<'a> FileContext<'a> {
         if let Some(re) = TX_BEGIN.as_ref() {
             for found in re.find_iter(slice) {
                 let at = range.start + found.start();
-                if !self.source.in_string(at) {
+                if !self.source.in_string(at) && !bound_calls.contains(&at) {
                     scope.begin(at);
                 }
             }
@@ -1554,13 +1943,49 @@ impl<'a> FileContext<'a> {
         scope
     }
 
-    /// The write runs inside a transaction call, after a handle-style begin, on a
-    /// transaction handle, or under a transactional decorator.
-    fn covered(scope: &TxScope, site: &WriteSite) -> bool {
-        scope.whole
-            || site.handle
-            || scope.calls.iter().any(|call| call.contains(&site.at))
-            || scope.begun.is_some_and(|begun| begun < site.at)
+    /// The write runs under a transactional decorator, inside a transaction call, on a
+    /// transaction handle, or after an unbound begin. After a bound begin only writes
+    /// through its handle count; one still on the connection it was begun on bypasses it.
+    fn coverage(&self, scope: &TxScope, site: &WriteSite) -> Coverage {
+        if scope.whole || site.handle || scope.calls.iter().any(|call| call.contains(&site.at)) {
+            return Coverage::Covered;
+        }
+        let innermost = scope
+            .handles
+            .iter()
+            .filter(|handle| handle.at < site.at)
+            .max_by_key(|handle| handle.at);
+        if let Some(handle) = innermost {
+            return if self.writes_through(site, &handle.name) {
+                Coverage::Covered
+            } else if self.writes_through(site, &handle.conn) {
+                Coverage::Bypass {
+                    conn: handle.conn.clone(),
+                    handle: handle.name.clone(),
+                }
+            } else {
+                Coverage::Uncovered
+            };
+        }
+        if scope.begun.is_some_and(|begun| begun < site.at) {
+            Coverage::Covered
+        } else {
+            Coverage::Uncovered
+        }
+    }
+
+    /// The write's receiver chain is, or starts with, `chain`, or its arguments name it
+    /// (`.execute(&db)`, `{ transaction: t }`).
+    fn writes_through(&self, site: &WriteSite, chain: &str) -> bool {
+        let receiver = site.receiver.as_str();
+        receiver == chain
+            || receiver
+                .strip_prefix(chain)
+                .is_some_and(|rest| rest.starts_with('.'))
+            || mentions(
+                self.text().get(site.args.clone()).unwrap_or_default(),
+                chain,
+            )
     }
 
     /// Loop bodies in `range`: `for` / `while` / `do` blocks (or single statements) and the
@@ -1617,6 +2042,20 @@ impl<'a> FileContext<'a> {
             }
         }
         loops
+    }
+
+    /// Argument spans of `spawn_blocking(...)` / `block_in_place(...)` calls in `range`.
+    fn offloaded(&self, range: Range<usize>) -> Vec<Range<usize>> {
+        let (Some(re), Some(slice)) = (OFFLOADED.as_ref(), self.text().get(range.clone())) else {
+            return Vec::new();
+        };
+        re.find_iter(slice)
+            .filter_map(|found| {
+                let open = range.start + found.end() - 1;
+                let close = lex::matching_paren(self.text(), open, self.lang)?;
+                Some(open..close)
+            })
+            .collect()
     }
 
     /// First string literal in `range` that holds a SQL statement built from values.
@@ -1727,6 +2166,7 @@ fn audit(home: &FileContext<'_>, route: &RawRoute, regions: &[Region<'_>]) -> Ve
     risks.extend(floating_async(home, route, regions));
     risks.extend(non_atomic_writes(regions));
     risks.extend(unsafe_sql(regions));
+    risks.extend(blocking_in_async(regions));
     risks
 }
 
@@ -1961,13 +2401,14 @@ fn unguarded_express(
 struct Write<'r> {
     region: &'r Region<'r>,
     site: WriteSite,
-    covered: bool,
+    coverage: Coverage,
     in_loop: Option<&'static str>,
 }
 
-/// Writes that a failure or a concurrent request can leave half-applied: one write repeated
-/// by a loop, or two or more writes of which at least one runs outside every transaction.
-/// A transaction counts only for the writes it covers, not for the whole handler.
+/// Writes that a failure or a concurrent request can leave half-applied: a write that
+/// bypasses a transaction handle begun in the same handler, one write repeated by a loop,
+/// or two or more writes of which at least one runs outside every transaction. A
+/// transaction counts only for the writes it covers, not for the whole handler.
 fn non_atomic_writes(regions: &[Region<'_>]) -> Option<RouteRisk> {
     let mut writes: Vec<Write<'_>> = Vec::new();
     for region in regions {
@@ -1983,7 +2424,7 @@ fn non_atomic_writes(regions: &[Region<'_>]) -> Option<RouteRisk> {
             }
             writes.push(Write {
                 region,
-                covered: FileContext::covered(&scope, &site),
+                coverage: ctx.coverage(&scope, &site),
                 in_loop: loops
                     .iter()
                     .find(|l| l.body.contains(&site.at))
@@ -1992,7 +2433,23 @@ fn non_atomic_writes(regions: &[Region<'_>]) -> Option<RouteRisk> {
             });
         }
     }
-    let uncovered: Vec<&Write<'_>> = writes.iter().filter(|w| !w.covered).collect();
+    let uncovered: Vec<&Write<'_>> = writes
+        .iter()
+        .filter(|w| !matches!(w.coverage, Coverage::Covered))
+        .collect();
+    // A bypass is a defect even as the only write: the transaction around it is a no-op.
+    for write in &uncovered {
+        if let Coverage::Bypass { conn, handle } = &write.coverage {
+            return Some(write.region.ctx.risk(
+                RouteRiskKind::NonAtomicMultiWrite,
+                write.site.at,
+                format!(
+                    "write on '{conn}' bypasses active transaction handle '{handle}': `{}` commits on its own and survives a rollback",
+                    write.site.label
+                ),
+            ));
+        }
+    }
     if let Some(write) = uncovered.iter().find(|w| w.in_loop.is_some()) {
         return Some(write.region.ctx.risk(
             RouteRiskKind::NonAtomicMultiWrite,
@@ -2053,6 +2510,93 @@ fn unsafe_sql(regions: &[Region<'_>]) -> Option<RouteRisk> {
     })
 }
 
+/// A blocking call inside a handler body: any JavaScript handler, which runs on the event
+/// loop whether or not it is declared `async`, or an `async fn` Rust handler, which runs on
+/// a runtime worker. Calls in module scope after a route (startup reads) and calls handed to
+/// `spawn_blocking` / `block_in_place` are not findings.
+fn blocking_in_async(regions: &[Region<'_>]) -> Option<RouteRisk> {
+    regions.iter().find_map(|region| {
+        let ctx = region.ctx;
+        let re = match ctx.lang {
+            Lang::Js => JS_BLOCKING.as_ref()?,
+            Lang::Rust if region.text().lines().next()?.contains("async") => {
+                RUST_BLOCKING.as_ref()?
+            }
+            Lang::Rust | Lang::Go => return None,
+        };
+        let offloaded = ctx.offloaded(region.range.clone());
+        re.captures_iter(region.text()).find_map(|caps| {
+            let call = caps.get(1)?;
+            let at = region.range.start + call.start();
+            if ctx.source.in_string(at)
+                || ctx.depth_between(region.range.start, at) == 0
+                || offloaded.iter().any(|span| span.contains(&at))
+            {
+                return None;
+            }
+            let call = call.as_str();
+            let detail = match ctx.lang {
+                Lang::Js => format!(
+                    "`{call}` blocks the event loop inside a request handler, so every concurrent request waits behind it; {}",
+                    js_blocking_advice(call)
+                ),
+                Lang::Rust | Lang::Go => format!(
+                    "`{call}` blocks a runtime worker thread inside an async handler, stalling every task scheduled on it; {}",
+                    rust_blocking_advice(call)
+                ),
+            };
+            Some(ctx.risk(RouteRiskKind::BlockingInAsync, at, detail))
+        })
+    })
+}
+
+fn js_blocking_advice(call: &str) -> &'static str {
+    match call {
+        "execSync" | "execFileSync" | "spawnSync" => {
+            "run the child process through the callback or promise API"
+        }
+        "pbkdf2Sync" | "scryptSync" => "use crypto.pbkdf2 / crypto.scrypt with a callback",
+        "hashSync" | "compareSync" | "genSaltSync" => "use the async bcrypt hash / compare",
+        _ => "use fs/promises",
+    }
+}
+
+fn rust_blocking_advice(call: &str) -> &'static str {
+    if call.ends_with("sleep") {
+        "use tokio::time::sleep"
+    } else if call.starts_with("bcrypt") {
+        "hash inside tokio::task::spawn_blocking"
+    } else {
+        "use tokio::fs or tokio::task::spawn_blocking"
+    }
+}
+
+/// `chain` occurs in `text` as a whole identifier path: not inside a longer name, not as a
+/// property of another value (`req.body.db`).
+fn mentions(text: &str, chain: &str) -> bool {
+    !chain.is_empty()
+        && text.match_indices(chain).any(|(at, _)| {
+            let before = text.get(..at).and_then(|head| head.bytes().next_back());
+            let after = text.as_bytes().get(at + chain.len()).copied();
+            !before.is_some_and(|b| lex::is_ident_byte(b) || b == b'.')
+                && !after.is_some_and(lex::is_ident_byte)
+        })
+}
+
+/// Receiver chain of the call a literal is the first argument of: `await db.query(` gives
+/// `db.query`. Empty when the literal is not a call argument.
+fn called_receiver(before: &str) -> String {
+    let Some(call) = before.trim_end().strip_suffix('(') else {
+        return String::new();
+    };
+    let call = call.trim_end();
+    let start = call
+        .bytes()
+        .rposition(|b| !(lex::is_ident_byte(b) || matches!(b, b'.' | b'$')))
+        .map_or(0, |at| at + 1);
+    compact(call.get(start..).unwrap_or_default())
+}
+
 /// `receiver` can hold a database handle: a known client name, a model chain
 /// (`prisma.order`), a capitalized model (`Order`), or anything awaited. Chains through
 /// request, response or in-memory state never qualify.
@@ -2110,6 +2654,32 @@ fn root_segment(receiver: &str) -> &str {
         .split('.')
         .next()
         .unwrap_or_default()
+}
+
+/// Where a TypeScript return type annotation starting at `from` ends: at the body's `{` of a
+/// method, or at the `=>` of an arrow. Brackets inside the type (`Promise<{ id: string }>`,
+/// `(x: number) => void`) are skipped; a `;` first means a signature without a body.
+fn annotation_end(text: &str, from: usize, arrow: bool) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut at = from;
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
+            b'(' | b'<' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'>' if at > 0 && bytes.get(at - 1) != Some(&b'=') => depth = depth.saturating_sub(1),
+            b'=' if arrow && depth == 0 && bytes.get(at + 1) == Some(&b'>') => return Some(at),
+            b'{' if depth == 0 && !arrow => return Some(at),
+            b'{' => {
+                at = lex::matching_bracket(text, at, Lang::Js)? + 1;
+                continue;
+            }
+            b';' if depth == 0 => return None,
+            _ => {}
+        }
+        at += 1;
+    }
+    None
 }
 
 /// A `format!` string with at least one `{}` / `{name}` placeholder.
@@ -2197,7 +2767,13 @@ mod tests {
             &OBJECT_DECL,
             &INSTANCE_DECL,
             &DEFAULT_CONTAINER,
-            &MEMBER_DECL,
+            &MEMBER_HEAD,
+            &EXPORT_STAR,
+            &TX_BOUND,
+            &GO_TX_BOUND,
+            &JS_BLOCKING,
+            &RUST_BLOCKING,
+            &OFFLOADED,
         ]
         .iter()
         .all(|re| re.is_some())
@@ -2683,6 +3259,237 @@ async fn archive(State(db): State<Db>, Json(body): Json<Archive>) -> StatusCode 
             audited(Lang::Go, go, &[]),
             ["POST /sync: NonAtomicMultiWrite@13"]
         );
+    }
+
+    #[test]
+    fn writes_that_bypass_a_bound_transaction_handle() {
+        let src = r#"app.post("/transfer", validate(Transfer), async (req, res, next) => {
+  try {
+    const { from, to, amount } = req.body;
+    const tx = await db.begin();
+    await tx.query("UPDATE accounts SET balance = balance - $1 WHERE id = $2", [amount, from]);
+    await db.query("UPDATE accounts SET balance = balance + $1 WHERE id = $2", [amount, to]);
+    await tx.commit();
+    res.sendStatus(204);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/archive", validate(Archive), async (req, res, next) => {
+  try {
+    const trx = await knex.transaction();
+    await trx("orders").update({ archived: true }).where({ id: req.body.id });
+    await knex("audit").insert({ action: "archive", order: req.body.id });
+    await trx.commit();
+    res.sendStatus(204);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/ledger", validate(Entry), async (req, res, next) => {
+  try {
+    const t = await sequelize.transaction();
+    await Entry.create(req.body, { transaction: t });
+    await Balance.update({ cents: req.body.cents }, { where: { id: req.body.account }, transaction: t });
+    await t.commit();
+    res.sendStatus(201);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/close", validate(Close), async (req, res, next) => {
+  try {
+    const tx = await db.begin();
+    await db.account.update({ where: { id: req.body.id }, data: { closed: true } });
+    await tx.commit();
+    res.sendStatus(204);
+  } catch (err) {
+    next(err);
+  }
+});
+"#;
+        assert_eq!(
+            audited(Lang::Js, src, &["server.js"]),
+            [
+                "POST /transfer: NonAtomicMultiWrite@6",
+                "POST /archive: NonAtomicMultiWrite@18",
+                "POST /close: NonAtomicMultiWrite@41",
+            ]
+        );
+        let bypass = |conn: &str, handle: &str, write: &str| {
+            format!("write on '{conn}' bypasses active transaction handle '{handle}': `{write}` commits on its own and survives a rollback")
+        };
+        assert_eq!(
+            details(Lang::Js, src, &["server.js"]),
+            [
+                (
+                    "/transfer".to_owned(),
+                    bypass("db", "tx", "UPDATE ACCOUNTS SET")
+                ),
+                ("/archive".to_owned(), bypass("knex", "trx", "knex.insert")),
+                ("/close".to_owned(), bypass("db", "tx", "db.account.update")),
+            ]
+        );
+
+        let rust = r#"pub fn router() -> Router<Db> {
+    Router::new()
+        .route("/refund", post(refund))
+        .route("/settle", post(settle))
+}
+
+async fn refund(State(db): State<Db>, Json(body): Json<Refund>) -> StatusCode {
+    let mut tx = db.begin().await.unwrap();
+    sqlx::query("UPDATE orders SET refunded = true WHERE id = $1").bind(body.id).execute(&mut *tx).await.ok();
+    sqlx::query("INSERT INTO ledger (order_id) VALUES ($1)").bind(body.id).execute(&db).await.ok();
+    tx.commit().await.ok();
+    StatusCode::OK
+}
+
+async fn settle(State(db): State<Db>, Json(body): Json<Settle>) -> StatusCode {
+    let mut tx = db.begin().await.unwrap();
+    sqlx::query("UPDATE invoices SET paid = true WHERE id = $1").bind(body.id).execute(&mut *tx).await.ok();
+    sqlx::query("INSERT INTO payments (invoice_id) VALUES ($1)").bind(body.id).execute(&mut *tx).await.ok();
+    tx.commit().await.ok();
+    StatusCode::OK
+}
+"#;
+        assert_eq!(
+            details(Lang::Rust, rust, &[]),
+            [("/refund".to_owned(), bypass("db", "tx", "INSERT INTO"))]
+        );
+        assert_eq!(
+            audited(Lang::Rust, rust, &[]),
+            ["POST /refund: NonAtomicMultiWrite@10"]
+        );
+
+        let go = "package main\n\nfunc routes(mux *http.ServeMux) {\n\tmux.HandleFunc(\"POST /refund\", refund)\n}\n\nfunc refund(w http.ResponseWriter, r *http.Request) {\n\ttx, err := db.Begin()\n\tif err != nil {\n\t\treturn\n\t}\n\tif _, err := tx.Exec(\"UPDATE orders SET refunded = true WHERE id = $1\", 7); err != nil {\n\t\treturn\n\t}\n\tif _, err := db.Exec(\"INSERT INTO ledger (order_id) VALUES ($1)\", 7); err != nil {\n\t\treturn\n\t}\n\tif err := tx.Commit(); err != nil {\n\t\treturn\n\t}\n}\n";
+        assert_eq!(
+            audited(Lang::Go, go, &[]),
+            ["POST /refund: NonAtomicMultiWrite@15"]
+        );
+        assert!(mentions("execute(&mut *tx)", "tx"));
+        assert!(mentions("{ where: { id }, transaction: t }", "t"));
+        assert!(!mentions("{ txn: 1, req.body.tx }", "tx"));
+        assert_eq!(
+            called_receiver("    await this.pool.query("),
+            "this.pool.query"
+        );
+        assert_eq!(called_receiver("    sqlx::query("), "query");
+        assert_eq!(called_receiver("    const sql = "), "");
+    }
+
+    #[test]
+    fn blocking_calls_inside_handlers() {
+        let src = r#"app.get("/avatar/:id", async (req, res, next) => {
+  try {
+    const template = fs.readFileSync("./templates/avatar.html", "utf8");
+    res.send(template.replace("{id}", req.params.id));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/login", validate(Login), async (req, res, next) => {
+  try {
+    const user = await db.user.findUnique({ where: { email: req.body.email } });
+    if (!bcrypt.compareSync(req.body.password, user.passwordHash)) return res.sendStatus(401);
+    res.json({ id: user.id });
+  } catch (err) {
+    next(err);
+  }
+});
+const banner = fs.readFileSync("./banner.txt", "utf8");
+
+app.get("/banner", (req, res) => res.send(banner));
+app.get("/docs", (req, res) => res.send("the readFileSync() call is synchronous"));
+"#;
+        assert_eq!(
+            audited(Lang::Js, src, &["server.js"]),
+            [
+                "GET /avatar/:id: BlockingInAsync@3",
+                "POST /login: BlockingInAsync@13",
+            ]
+        );
+        let source = Source::new(src, Lang::Js);
+        let mut routes = extracted(Lang::Js, &source, &["server.js"]);
+        annotate(&source, Lang::Js, &mut routes, None);
+        assert_eq!(
+            routes[0].risks[0].detail,
+            "`readFileSync` blocks the event loop inside a request handler, so every concurrent request waits behind it; use fs/promises"
+        );
+
+        let rust = r#"pub fn router() -> Router<Db> {
+    Router::new()
+        .route("/report", get(report))
+        .route("/export", get(export))
+}
+
+async fn report(State(db): State<Db>) -> String {
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::fs::read_to_string("report.txt").unwrap_or_default()
+}
+
+async fn export(State(db): State<Db>) -> String {
+    tokio::task::spawn_blocking(|| std::fs::read_to_string("export.csv").unwrap_or_default())
+        .await
+        .unwrap_or_default()
+}
+
+fn render(path: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+"#;
+        assert_eq!(
+            audited(Lang::Rust, rust, &[]),
+            ["GET /report: BlockingInAsync@8"]
+        );
+    }
+
+    #[test]
+    fn members_with_decorated_and_defaulted_parameters() {
+        let src = r#"class OrdersController {
+  @Post()
+  async create(@Body() dto: CreateOrderDto, @Req() req: Request, @Param('id') id = parseInt("1")) {
+    await this.db.order.create({ data: req.body });
+    await this.db.audit.create({ data: { action: "create", id } });
+  }
+
+  @Get(':id') async show(@Param('id') id: string, @Query() query = defaults()): Promise<{ id: string }> {
+    return this.db.order.findMany({ where: { id } });
+  }
+
+  list = async (req: Request, res: Response, limit = Number(process.env.LIMIT ?? "20")): Promise<void> => {
+    res.json(await this.db.order.findMany());
+  };
+}
+
+const controller = new OrdersController();
+router.post("/orders", controller.create);
+router.get("/orders/:id", controller.show);
+router.get("/orders", controller.list);
+"#;
+        assert_eq!(
+            audited(Lang::Js, src, &["orders.controller.ts"]),
+            [
+                "POST /orders: UnvalidatedMutation@4",
+                "POST /orders: FloatingAsync@3",
+                "POST /orders: NonAtomicMultiWrite@4",
+                "GET /orders/:id: UnboundedQuery@9",
+                "GET /orders: UnboundedQuery@13",
+                "GET /orders: FloatingAsync@12",
+            ]
+        );
+        // A parenthesized value is not a member function; an overload signature has no body.
+        let text = "{\n  total: (a + b),\n  create(input: Input): void;\n  create(input: Input) {\n    return input;\n  }\n}\n";
+        let source = Source::new(text, Lang::Js);
+        let ctx = FileContext::new(&source, Lang::Js, &[], None, false);
+        let range = ctx.member_range(1..text.len() - 2, "create").unwrap();
+        assert!(text[range.clone()].starts_with("  create(input: Input) {"));
+        assert!(text[range].ends_with('}'));
+        assert!(ctx.member_range(1..text.len() - 2, "total").is_none());
     }
 
     #[test]
