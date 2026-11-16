@@ -12,7 +12,14 @@ import { METHOD_BADGE, type RequestTarget } from "../../lib/routes";
 import type { BurstPreset, FuzzPreset } from "../../lib/risk";
 import { DEFAULT_LISTEN_PORT, summarizeProfile } from "../../lib/rules";
 import { AUDIT_KINDS, AUDIT_LABEL, type AuditKind } from "../../lib/traffic";
-import type { DiscoveredRoute, FaultProfile, FaultRule, RouteMethod, StatusMutation } from "../../lib/types";
+import type {
+  DiscoveredRoute,
+  FaultProfile,
+  FaultRule,
+  HeaderPair,
+  RouteMethod,
+  StatusMutation,
+} from "../../lib/types";
 import { PanelHeader, Section, StatusSquare, ToolButton } from "../shell/PanelHeader";
 import { BurstPanel } from "./BurstPanel";
 import { ErrorLine } from "./ErrorLine";
@@ -53,6 +60,9 @@ interface ChaosControlsProps {
   onTarget: (target: RequestTarget) => void;
   burstBody: string;
   onBurstBody: (body: string) => void;
+  /** Burst header lines; a replayed header case writes its override here. */
+  burstHeaders: string;
+  onBurstHeaders: (text: string) => void;
   fuzzPayload: string;
   onFuzzPayload: (payload: string) => void;
   /** OpenAPI sample of the selected route, offered by both payload fields. */
@@ -60,7 +70,7 @@ interface ChaosControlsProps {
   route: DiscoveredRoute | null;
   /** Where the current burst body came from, when it was not typed: a replayed fuzz case. */
   burstOrigin: string | null;
-  onReplayInBurst: (target: RequestTarget, body: string, origin: string) => void;
+  onReplayInBurst: (target: RequestTarget, body: string, origin: string, headers: HeaderPair[]) => void;
   /** Passive audit counters folded from proxied exchanges. */
   audit: TrafficAudit;
   /** Narrows the telemetry table to one audit category (`null`: every audited exchange). */
@@ -118,6 +128,8 @@ export function ChaosControls(props: ChaosControlsProps) {
           onTarget={onTarget}
           body={props.burstBody}
           onBody={props.onBurstBody}
+          headers={props.burstHeaders}
+          onHeaders={props.onBurstHeaders}
           sampleBody={sampleBody}
           origin={props.burstOrigin}
           contract={contractFor(route, target.method, target.path)}

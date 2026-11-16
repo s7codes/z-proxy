@@ -206,7 +206,9 @@ export type MutationClass =
   | "missingFields"
   | "schemaContractBounds"
   | "pathParamValidation"
-  | "delimiterEscaping";
+  | "delimiterEscaping"
+  /** Paging and filter bounds appended to the target's query, then empty and contradicting Accept / Content-Type headers. */
+  | "queryAndHeaderBounds";
 
 export interface FuzzSpec {
   /** May hold `{param}` placeholders in the path; path vectors vary each slot. */
@@ -326,13 +328,23 @@ export interface FuzzCaseRef {
   pathTemplate: string | null;
   /** `0` is the baseline. */
   index: number;
+  /** The report's `target`; query cases extend it, so they cannot be rebuilt without it. */
+  target?: string | null;
+}
+
+/** A request header a case sets in place of the suite's. */
+export interface CaseHeader {
+  name: string;
+  value: string;
 }
 
 export interface FuzzCasePayload {
   index: number;
   label: string;
-  /** Origin-form request target of a path case; `null` when the case used the suite target. */
+  /** Origin-form request target of a path or query case; `null` when the case used the suite target. */
   path: string | null;
+  /** Headers a header case overrides; empty otherwise. */
+  headers: CaseHeader[];
   body: string;
   /** Size of the body as sent by the fuzzer. */
   bytes: number;

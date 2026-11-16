@@ -970,6 +970,7 @@ mod tests {
                 "POST /api/v1/coupons/redeem",
                 "POST /api/v1/orders/checkout",
                 "GET /api/v1/orders/{orderId}",
+                "GET /api/v1/orders",
                 "GET /api/v1/lab/openapi.json",
             ]
         );

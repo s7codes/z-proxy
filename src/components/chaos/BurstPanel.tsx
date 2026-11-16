@@ -55,6 +55,9 @@ interface BurstPanelProps {
   onTarget: (target: RequestTarget) => void;
   body: string;
   onBody: (body: string) => void;
+  /** Header lines, `Name: value` each; held by the app so a replayed fuzz case can set one. */
+  headers: string;
+  onHeaders: (text: string) => void;
   sampleBody: string | null;
   /** Set while the body is a replayed fuzz case; editing the body clears it. */
   origin: string | null;
@@ -72,6 +75,8 @@ export function BurstPanel({
   onTarget,
   body,
   onBody: setBody,
+  headers: headerText,
+  onHeaders: setHeaderText,
   sampleBody,
   origin: bodyOrigin,
   contract,
@@ -84,7 +89,6 @@ export function BurstPanel({
   const [maxSuccesses, setMaxSuccesses] = useState(0);
   const [idempotencyMode, setIdempotencyMode] = useState(false);
   const [syncMode, setSyncMode] = useState<BurstSyncMode>(preset?.syncMode ?? "preConnected");
-  const [headerText, setHeaderText] = useState("");
 
   const parsed = useMemo(() => parseHeaders(headerText), [headerText]);
   const params = pathParams(path);

@@ -54,8 +54,17 @@ export const AUTO_TARGET: Record<RouteRiskKind, AutoTarget> = {
   },
   unsafeSqlInterpolation: {
     tab: "fuzzer",
-    fuzz: { classes: ["emptyStrings", "typeConfusion", "oversizedField", "pathParamValidation", "delimiterEscaping"] },
-    reason: "delimiter, string, type and path vectors that reach the string-built query",
+    fuzz: {
+      classes: [
+        "emptyStrings",
+        "typeConfusion",
+        "oversizedField",
+        "pathParamValidation",
+        "delimiterEscaping",
+        "queryAndHeaderBounds",
+      ],
+    },
+    reason: "delimiter, query, string, type and path vectors that reach the string-built query",
   },
   floatingAsync: {
     tab: "fuzzer",

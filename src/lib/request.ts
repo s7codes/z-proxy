@@ -19,6 +19,16 @@ export function joinTarget(origin: string, path: string): string {
   return `${origin}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
+/** `text` with each override replacing the lines of the same name (case-insensitive), appended last. */
+export function withHeaders(text: string, overrides: readonly HeaderPair[]): string {
+  const replaced = new Set(overrides.map((header) => header.name.toLowerCase()));
+  const kept = text.split("\n").filter((line) => {
+    const colon = line.indexOf(":");
+    return line.trim() !== "" && (colon <= 0 || !replaced.has(line.slice(0, colon).trim().toLowerCase()));
+  });
+  return [...kept, ...overrides.map((header) => `${header.name}: ${header.value}`)].join("\n");
+}
+
 /** One `Name: value` pair per line; blank lines are ignored. */
 export function parseHeaders(text: string): { headers: HeaderPair[]; error: string | null } {
   const headers: HeaderPair[] = [];

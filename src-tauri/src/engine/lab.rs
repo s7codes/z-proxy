@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -91,6 +91,18 @@ const LAB_PASSWORD_HASH: &str = "$2b$12$ZproxyLabFixtureSalt00NotARealCredential
 /// like a value that fits no column, so the ledger stays bounded.
 const MAX_STORED_EXTRAS: usize = 8;
 const MAX_EXTRA_CHARS: usize = 64;
+/// Columns of the `orders` table the unprotected list splices into its SQL.
+const ORDER_COLUMNS: [&str; 4] = ["id", "sku", "quantity", "total_cents"];
+/// Sort keys the documented list accepts, each optionally prefixed with `-`.
+const LIST_SORTS: [&str; 4] = ["id", "sku", "quantity", "totalCents"];
+const LIST_PARAMS: [&str; 5] = ["limit", "offset", "page", "sort", "q"];
+const LIST_DEFAULT_LIMIT: i64 = 20;
+const LIST_MAX_LIMIT: i64 = 100;
+const LIST_MAX_OFFSET: i64 = 10_000;
+const LIST_MAX_PAGE: i64 = 500;
+const SEARCH_MAX: usize = 64;
+/// 2^63: the first magnitude a PostgreSQL `bigint` cannot hold.
+const BIGINT_LIMIT: f64 = 9_223_372_036_854_775_808.0;
 const CATALOG: [(&str, i64); 3] = [
     ("LAB-KB-01", 4_999),
     ("LAB-MS-02", 2_999),
@@ -246,20 +258,34 @@ impl Shared {
 
     fn find_order(&self, id: u64) -> Option<StoredOrder> {
         if let Some((_, sku, quantity)) = ORDER_HISTORY.iter().find(|(known, ..)| *known == id) {
-            return Some(StoredOrder {
-                id,
-                sku: (*sku).to_owned(),
-                quantity: *quantity,
-                total_cents: price(sku).unwrap_or(0) * quantity,
-                customer: LAB_ACCOUNT.to_owned(),
-                extras: Vec::new(),
-            });
+            return Some(seeded_order(id, sku, *quantity));
         }
         self.ledger()
             .created
             .iter()
             .find(|order| order.id == id)
             .cloned()
+    }
+
+    /// Every order in id order, copied out so the list is filtered without the ledger lock.
+    fn orders(&self) -> Vec<StoredOrder> {
+        let created: Vec<StoredOrder> = self.ledger().created.iter().cloned().collect();
+        ORDER_HISTORY
+            .iter()
+            .map(|(id, sku, quantity)| seeded_order(*id, sku, *quantity))
+            .chain(created)
+            .collect()
+    }
+}
+
+fn seeded_order(id: u64, sku: &str, quantity: i64) -> StoredOrder {
+    StoredOrder {
+        id,
+        sku: sku.to_owned(),
+        quantity,
+        total_cents: price(sku).unwrap_or(0) * quantity,
+        customer: LAB_ACCOUNT.to_owned(),
+        extras: Vec::new(),
     }
 }
 
@@ -429,6 +455,7 @@ fn router(shared: Arc<Shared>, base_url: String) -> Router {
         .route("/", get(index))
         .route("/api/v1/health", get(health))
         .route("/api/v1/coupons/redeem", post(redeem))
+        .route("/api/v1/orders", get(order_list))
         .route("/api/v1/orders/checkout", post(checkout))
         .route("/api/v1/orders/{order_id}", get(order_lookup))
         // An empty identifier leaves a trailing slash; routed explicitly so the handler, not
@@ -518,7 +545,8 @@ async fn index(State(shared): State<Arc<Shared>>) -> Response {
                 "GET /api/v1/health",
                 "POST /api/v1/coupons/redeem",
                 "POST /api/v1/orders/checkout",
-                "GET /api/v1/orders/{orderId}"
+                "GET /api/v1/orders/{orderId}",
+                "GET /api/v1/orders"
             ]
         }),
         "index",
@@ -699,11 +727,24 @@ struct Leak {
     outcome: &'static str,
 }
 
-/// Unprotected ignores `Idempotency-Key`: a retried or duplicated checkout creates another
-/// order every time. Hardened stores the response per key and replays it.
+/// Unprotected ignores `Idempotency-Key` and `Content-Type`: a retried or duplicated checkout
+/// creates another order every time, and a JSON body declared as `text/plain` (which a
+/// browser sends cross-site without a preflight) is parsed like any other. Hardened refuses
+/// a declared type other than JSON with 415, and stores the response per key and replays it.
 async fn checkout(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Bytes) -> Response {
     let mode = shared.mode();
     if mode == LabMode::Hardened {
+        // An absent header is read as JSON, as the documented body is the only one accepted.
+        if headers
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|declared| !json_media_type(declared))
+        {
+            return json_reply(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                &json!({ "error": "unsupported_media_type", "expected": "application/json" }),
+                "rejected: unsupported media type",
+            );
+        }
         if let Some(key) = headers.get(IDEMPOTENCY_HEADER) {
             return idempotent_checkout(&shared, key, &body);
         }
@@ -1096,6 +1137,23 @@ fn hardened_checkout(body: &[u8]) -> Checkout {
     }
 }
 
+/// `application/json` with no charset or `utf-8`: RFC 8259 8.1 makes UTF-8 the only encoding
+/// for JSON exchanged between systems.
+fn json_media_type(declared: &HeaderValue) -> bool {
+    let Ok(text) = declared.to_str() else {
+        return false;
+    };
+    let mut parts = text.split(';').map(str::trim);
+    let essence = parts.next().unwrap_or_default();
+    essence.eq_ignore_ascii_case("application/json")
+        && parts.all(|param| match param.split_once('=') {
+            Some((name, value)) if name.trim().eq_ignore_ascii_case("charset") => {
+                value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
+            }
+            _ => true,
+        })
+}
+
 fn valid_sku(sku: &str) -> bool {
     (1..=32).contains(&sku.len())
         && sku
@@ -1318,6 +1376,381 @@ fn hardened_lookup(raw: &str, find: impl Fn(u64) -> Option<StoredOrder>) -> Look
     match id.filter(|id| (1..=ORDER_ID_MAX).contains(id)) {
         Some(id) => find(id).map_or(Lookup::NotFound, Lookup::Found),
         None => Lookup::Invalid,
+    }
+}
+
+// ---- order list -----------------------------------------------------------------------
+
+#[derive(Debug, PartialEq)]
+enum Listing {
+    Page {
+        items: Vec<StoredOrder>,
+        /// Echoed by hardened only, as the documented `OrderPage` requires.
+        window: Option<(i64, i64)>,
+        total: usize,
+    },
+    /// Hardened: 422 with every parameter violation found.
+    Invalid(Vec<Value>),
+    Leak(Leak),
+}
+
+async fn order_list(State(shared): State<Arc<Shared>>, RawQuery(query): RawQuery) -> Response {
+    let mode = shared.mode();
+    let orders = shared.orders();
+    let params: Vec<(String, String)> =
+        url::form_urlencoded::parse(query.as_deref().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+    match evaluate_list(mode, &params, &orders) {
+        Listing::Page {
+            items,
+            window,
+            total,
+        } => {
+            let mut body = Map::with_capacity(4);
+            body.insert(
+                "items".to_owned(),
+                Value::Array(items.iter().map(|order| order.to_json(mode)).collect()),
+            );
+            if let Some((limit, offset)) = window {
+                body.insert("limit".to_owned(), json!(limit));
+                body.insert("offset".to_owned(), json!(offset));
+            }
+            body.insert("total".to_owned(), json!(total));
+            json_reply(StatusCode::OK, &Value::Object(body), "orders listed")
+        }
+        Listing::Invalid(violations) => json_reply(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &json!({ "error": "invalid_query", "violations": violations }),
+            "rejected: invalid query",
+        ),
+        Listing::Leak(leak) => reply(leak.status, leak.content_type, leak.body, leak.outcome),
+    }
+}
+
+fn evaluate_list(mode: LabMode, params: &[(String, String)], orders: &[StoredOrder]) -> Listing {
+    match mode {
+        LabMode::Unprotected => unprotected_list(params, orders),
+        LabMode::Hardened => hardened_list(params, orders),
+    }
+}
+
+/// The list as an unvalidated Express gateway builds it: `qs` turns a repeated key into an
+/// array, `Number()` converts the paging input, and every value is spliced into one SQL
+/// string. Failures are what PostgreSQL answers to that string, serialized by the driver.
+fn unprotected_list(params: &[(String, String)], orders: &[StoredOrder]) -> Listing {
+    let values = |key: &str| -> Vec<&str> {
+        params
+            .iter()
+            .filter(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+            .collect()
+    };
+    // A template literal renders a `qs` array comma-joined; `Number()` of one is NaN.
+    let spliced = |key: &str| Some(values(key).join(",")).filter(|text| !text.is_empty());
+    let numeric = |key: &str| match values(key).as_slice() {
+        [] => None,
+        [single] => Some(js_number(single)),
+        _ => Some(f64::NAN),
+    };
+    let search = spliced("q").unwrap_or_default();
+    let sort = spliced("sort").unwrap_or_else(|| "id".to_owned());
+    let limit = numeric("limit").unwrap_or(LIST_DEFAULT_LIMIT as f64);
+    let offset =
+        numeric("offset").unwrap_or_else(|| (numeric("page").unwrap_or(1.0) - 1.0) * limit);
+    let ids = spliced("id");
+    let filter = ids
+        .as_deref()
+        .map_or_else(String::new, |ids| format!(" AND id = {ids}"));
+    let sql = format!(
+        "SELECT id, sku, quantity, total_cents FROM orders WHERE sku ILIKE '%{search}%'{filter} ORDER BY {sort} LIMIT {} OFFSET {}",
+        js_render(limit),
+        js_render(offset)
+    );
+
+    // Parse errors, then name resolution, then the executor's checks: PostgreSQL's order. An
+    // odd quote count leaves the last literal open.
+    let quotes: Vec<usize> = sql.match_indices('\'').map(|(at, _)| at).collect();
+    if let Some(&open) = quotes.last().filter(|_| quotes.len() % 2 == 1) {
+        let near: String = sql[open..].chars().take(80).collect();
+        return Listing::Leak(postgres_error(
+            "42601",
+            &format!("unterminated quoted string at or near \"{near}\""),
+            "scanner_yyerror",
+            &sql,
+        ));
+    }
+    if ids.as_deref().is_some_and(|ids| ids.contains(',')) {
+        return Listing::Leak(postgres_error(
+            "42601",
+            "syntax error at or near \",\"",
+            "scanner_yyerror",
+            &sql,
+        ));
+    }
+    let keys: Vec<(String, bool)> = sort
+        .split(',')
+        .map(|key| {
+            let key = key.trim();
+            let descending = key.starts_with('-');
+            (key.trim_start_matches('-').to_ascii_lowercase(), descending)
+        })
+        .collect();
+    let unknown = keys
+        .iter()
+        .map(|(column, _)| column.as_str())
+        .chain([limit, offset].iter().filter(|n| n.is_nan()).map(|_| "nan"))
+        .find(|column| !ORDER_COLUMNS.contains(column));
+    if let Some(column) = unknown {
+        return Listing::Leak(postgres_error(
+            "42703",
+            &format!("column \"{column}\" does not exist"),
+            "errorMissingColumn",
+            &sql,
+        ));
+    }
+    for value in [limit, offset] {
+        if value.abs() >= BIGINT_LIMIT {
+            return Listing::Leak(postgres_error(
+                "22003",
+                &format!(
+                    "value \"{}\" is out of range for type bigint",
+                    js_render(value)
+                ),
+                "pg_strtoint64_safe",
+                &sql,
+            ));
+        }
+    }
+    if limit < 0.0 {
+        return Listing::Leak(postgres_error(
+            "2201W",
+            "LIMIT must not be negative",
+            "recompute_limits",
+            &sql,
+        ));
+    }
+    if offset < 0.0 {
+        return Listing::Leak(postgres_error(
+            "2201X",
+            "OFFSET must not be negative",
+            "recompute_limits",
+            &sql,
+        ));
+    }
+    let id = ids.as_deref().and_then(|id| id.trim().parse::<u64>().ok());
+    let mut matching: Vec<StoredOrder> = orders
+        .iter()
+        .filter(|order| id.is_none_or(|id| order.id == id))
+        .filter(|order| contains_ignore_case(&order.sku, &search))
+        .cloned()
+        .collect();
+    sort_orders(&mut matching, &keys);
+    let total = matching.len();
+    // Both are non-negative and below 2^63 here.
+    let items = matching
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    Listing::Page {
+        items,
+        window: None,
+        total,
+    }
+}
+
+/// The documented list: every parameter validated before any row is read, repeated and
+/// unknown parameters refused, the search term matched as data.
+fn hardened_list(params: &[(String, String)], orders: &[StoredOrder]) -> Listing {
+    let mut violations = Vec::new();
+    let mut seen: Vec<&str> = Vec::with_capacity(params.len());
+    let mut repeated: Vec<&str> = Vec::new();
+    for (name, _) in params {
+        let name = name.as_str();
+        if !seen.contains(&name) {
+            seen.push(name);
+            if !LIST_PARAMS.contains(&name) {
+                violations.push(query_violation(name, "unknown parameter"));
+            }
+        } else if !repeated.contains(&name) {
+            repeated.push(name);
+            violations.push(query_violation(name, "repeated parameter"));
+        }
+    }
+    let value = |key: &str| {
+        params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    };
+    let mut bounded = |key: &'static str, default: Option<i64>, min: i64, max: i64| {
+        let parsed = match value(key) {
+            None => return default,
+            Some(text) => canonical_integer(text).filter(|n| (min..=max).contains(n)),
+        };
+        if parsed.is_none() {
+            violations.push(query_violation(
+                key,
+                &format!("integer between {min} and {max}"),
+            ));
+        }
+        parsed
+    };
+    let limit = bounded("limit", Some(LIST_DEFAULT_LIMIT), 1, LIST_MAX_LIMIT);
+    let offset = bounded("offset", None, 0, LIST_MAX_OFFSET);
+    let page = bounded("page", None, 1, LIST_MAX_PAGE);
+    if value("offset").is_some() && value("page").is_some() {
+        violations.push(query_violation("page", "send offset or page, not both"));
+    }
+    let sort = value("sort").unwrap_or("id");
+    let sort_key = sort.strip_prefix('-').unwrap_or(sort);
+    if !LIST_SORTS.contains(&sort_key) {
+        violations.push(query_violation(
+            "sort",
+            "one of id, sku, quantity, totalCents, optionally prefixed with -",
+        ));
+    }
+    let search = value("q").unwrap_or_default();
+    if search.chars().count() > SEARCH_MAX {
+        violations.push(query_violation(
+            "q",
+            &format!("at most {SEARCH_MAX} characters"),
+        ));
+    }
+    let Some(limit) = limit.filter(|_| violations.is_empty()) else {
+        return Listing::Invalid(violations);
+    };
+    let offset = offset.unwrap_or_else(|| (page.unwrap_or(1) - 1) * limit);
+    let column = if sort_key == "totalCents" {
+        "total_cents".to_owned()
+    } else {
+        sort_key.to_owned()
+    };
+    let mut matching: Vec<StoredOrder> = orders
+        .iter()
+        .filter(|order| contains_ignore_case(&order.sku, search))
+        .cloned()
+        .collect();
+    sort_orders(&mut matching, &[(column, sort.starts_with('-'))]);
+    let total = matching.len();
+    let items = matching
+        .into_iter()
+        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        .take(usize::try_from(limit).unwrap_or(0))
+        .collect();
+    Listing::Page {
+        items,
+        window: Some((limit, offset)),
+        total,
+    }
+}
+
+fn query_violation(parameter: &str, reason: &str) -> Value {
+    json!({ "parameter": parameter, "reason": reason })
+}
+
+/// A decimal integer without sign tricks, leading zeros or whitespace, within `i64`.
+fn canonical_integer(text: &str) -> Option<i64> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    let canonical = !digits.is_empty()
+        && digits.len() <= 19
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'));
+    canonical.then(|| text.parse().ok()).flatten()
+}
+
+fn contains_ignore_case(text: &str, needle: &str) -> bool {
+    needle.is_empty() || text.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// Stable sort by `(column, descending)` keys over the `orders` columns; unknown columns
+/// were refused before this.
+fn sort_orders(orders: &mut [StoredOrder], keys: &[(String, bool)]) {
+    orders.sort_by(|a, b| {
+        keys.iter()
+            .map(|(column, descending)| {
+                let order = match column.as_str() {
+                    "sku" => a.sku.cmp(&b.sku),
+                    "quantity" => a.quantity.cmp(&b.quantity),
+                    "total_cents" => a.total_cents.cmp(&b.total_cents),
+                    _ => a.id.cmp(&b.id),
+                };
+                if *descending {
+                    order.reverse()
+                } else {
+                    order
+                }
+            })
+            .find(|order| order.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+/// `Number(text)` for the decimal input a query string carries: blank is 0, `Infinity` is
+/// infinite, anything else that is not a decimal literal is NaN.
+fn js_number(text: &str) -> f64 {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return 0.0;
+    }
+    match trimmed.trim_start_matches(['+', '-']) {
+        "Infinity" if trimmed.starts_with('-') => f64::NEG_INFINITY,
+        "Infinity" => f64::INFINITY,
+        rest if rest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-')) =>
+        {
+            trimmed.parse::<f64>().unwrap_or(f64::NAN)
+        }
+        _ => f64::NAN,
+    }
+}
+
+/// A number as a JavaScript template literal renders it: an integer below 1e21 in full,
+/// its shortest round-trip digits padded with zeros, so 2^63 reads `9223372036854776000`.
+fn js_render(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_owned();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_owned();
+    }
+    if value.fract() != 0.0 || value.abs() >= 1e21 {
+        return value.to_string();
+    }
+    let scientific = format!("{:e}", value.abs());
+    let Some((mantissa, exponent)) = scientific.split_once('e') else {
+        return value.to_string();
+    };
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let exponent: usize = exponent.parse().unwrap_or(0);
+    let mut out = String::with_capacity(exponent + 2);
+    if value < 0.0 {
+        out.push('-');
+    }
+    out.push_str(&digits);
+    for _ in digits.len()..=exponent {
+        out.push('0');
+    }
+    out
+}
+
+/// A node-postgres error object as an Express error handler serializes it, query included.
+fn postgres_error(code: &str, message: &str, routine: &str, sql: &str) -> Leak {
+    Leak {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        content_type: "application/json",
+        body: json!({
+            "name": "error",
+            "severity": "ERROR",
+            "code": code,
+            "message": message,
+            "routine": routine,
+            "query": sql,
+        })
+        .to_string(),
+        outcome: "crash: sql error",
     }
 }
 
@@ -1594,6 +2027,7 @@ pub fn openapi_document(base_url: Option<&str>) -> String {
                     "requestBody": { "$ref": "#/components/requestBodies/Checkout" },
                     "responses": {
                         "201": body("Order confirmed", "Order"),
+                        "415": body("Body declared as another media type than JSON", "Error"),
                         "422": body("Validation failed", "ValidationError"),
                         "500": response("Unhandled failure")
                     }
@@ -1612,6 +2046,22 @@ pub fn openapi_document(base_url: Option<&str>) -> String {
                         "200": body("Order", "Order"),
                         "404": body("Unknown order", "Error"),
                         "422": body("Identifier outside the documented range", "Error")
+                    }
+                }
+            },
+            "/api/v1/orders": {
+                "get": {
+                    "summary": "Page through confirmed orders",
+                    "parameters": [
+                        { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": LIST_MAX_LIMIT, "default": LIST_DEFAULT_LIMIT } },
+                        { "name": "offset", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "maximum": LIST_MAX_OFFSET } },
+                        { "name": "page", "in": "query", "required": false, "description": "Alternative to offset", "schema": { "type": "integer", "minimum": 1, "maximum": LIST_MAX_PAGE } },
+                        { "name": "sort", "in": "query", "required": false, "schema": { "type": "string", "enum": ["id", "-id", "sku", "-sku", "quantity", "-quantity", "totalCents", "-totalCents"] } },
+                        { "name": "q", "in": "query", "required": false, "description": "Case-insensitive SKU substring", "schema": { "type": "string", "maxLength": SEARCH_MAX } }
+                    ],
+                    "responses": {
+                        "200": body("Page of orders", "OrderPage"),
+                        "422": body("Query outside the documented parameters", "ValidationError")
                     }
                 }
             },
@@ -1670,6 +2120,16 @@ pub fn openapi_document(base_url: Option<&str>) -> String {
                         "sku": { "type": "string" },
                         "quantity": { "type": "integer", "minimum": 1 },
                         "totalCents": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "OrderPage": {
+                    "type": "object",
+                    "required": ["items", "limit", "offset", "total"],
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/Order" } },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": LIST_MAX_LIMIT },
+                        "offset": { "type": "integer", "minimum": 0 },
+                        "total": { "type": "integer", "minimum": 0 }
                     }
                 },
                 "Redemption": {
@@ -2601,6 +3061,22 @@ mod tests {
             case.disclosure.map(|d| d.kind),
             Some(DisclosureKind::SqlError)
         );
+        let outcome = |report: &crate::engine::types::FuzzReport, label: &str| {
+            let case = report.cases.iter().find(|c| c.label == label).unwrap();
+            (case.status, case.severity)
+        };
+        // The JSON body is parsed whatever it is declared as, so a cross-site form post
+        // without a preflight reaches the write.
+        for label in [
+            "Content-Type: text/plain",
+            "Content-Type: application/x-www-form-urlencoded",
+        ] {
+            assert_eq!(
+                outcome(&report, label),
+                (Some(201), Some(Severity::Warn)),
+                "{label}"
+            );
+        }
 
         lab.set_mode(LabMode::Hardened).await;
         let report = fuzzer::run(checkout_fuzz(&base), &hub, &slot)
@@ -2614,10 +3090,215 @@ mod tests {
         assert!(report
             .cases
             .iter()
-            .all(|c| matches!(c.status, Some(201) | Some(422))));
+            .all(|c| matches!(c.status, Some(201) | Some(415) | Some(422))));
         let case = apostrophe(&report);
         assert_eq!((case.status, case.severity), (Some(422), None));
         assert!(case.disclosure.is_none());
+        for label in [
+            "Content-Type: text/plain",
+            "Content-Type: application/x-www-form-urlencoded",
+            "Content-Type: (empty)",
+            "Content-Type: application/json; charset=utf-16",
+        ] {
+            assert_eq!(outcome(&report, label), (Some(415), None), "{label}");
+        }
+        assert_eq!(outcome(&report, "Accept: text/plain"), (Some(201), None));
+        lab.stop().await;
+    }
+
+    #[test]
+    fn order_list_by_mode() {
+        let orders: Vec<StoredOrder> = ORDER_HISTORY
+            .iter()
+            .map(|(id, sku, quantity)| seeded_order(*id, sku, *quantity))
+            .collect();
+        let list = |mode, query: &str| {
+            let params: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect();
+            evaluate_list(mode, &params, &orders)
+        };
+        let leaked = |query: &str| match list(LabMode::Unprotected, query) {
+            Listing::Leak(leak) => {
+                assert_eq!(leak.status, StatusCode::INTERNAL_SERVER_ERROR, "{query}");
+                assert_eq!(
+                    disclosure::detect(&leak.body).map(|d| d.kind),
+                    Some(DisclosureKind::SqlError),
+                    "{query}: {}",
+                    leak.body
+                );
+                let body: Value = serde_json::from_str(&leak.body).unwrap();
+                body["message"].as_str().unwrap().to_owned()
+            }
+            other => panic!("expected a leak for {query}, got {other:?}"),
+        };
+        assert_eq!(leaked("limit=-1"), "LIMIT must not be negative");
+        assert_eq!(leaked("page=0"), "OFFSET must not be negative");
+        assert_eq!(leaked("page=-1"), "OFFSET must not be negative");
+        assert_eq!(leaked("offset=-10"), "OFFSET must not be negative");
+        assert_eq!(
+            leaked("offset=9223372036854775807"),
+            "value \"9223372036854776000\" is out of range for type bigint"
+        );
+        assert_eq!(
+            leaked("sort=nonexistent_column"),
+            "column \"nonexistent_column\" does not exist"
+        );
+        // PostgreSQL folds the unquoted identifier: the documented key fails here too.
+        assert_eq!(
+            leaked("sort=totalCents"),
+            "column \"totalcents\" does not exist"
+        );
+        assert_eq!(leaked("id=1&id=2"), "syntax error at or near \",\"");
+        assert_eq!(
+            leaked("q=O%27Reilly"),
+            "unterminated quoted string at or near \"' ORDER BY id LIMIT 20 OFFSET 0\""
+        );
+        assert_eq!(leaked("limit=ten"), "column \"nan\" does not exist");
+
+        let page = |mode, query: &str| match list(mode, query) {
+            Listing::Page {
+                items,
+                window,
+                total,
+            } => (
+                items.iter().map(|o| o.id).collect::<Vec<_>>(),
+                window,
+                total,
+            ),
+            other => panic!("expected a page for {query}, got {other:?}"),
+        };
+        let unprotected = LabMode::Unprotected;
+        assert_eq!(page(unprotected, ""), (vec![1, 2, 3], None, 3));
+        assert_eq!(page(unprotected, "limit=0"), (vec![], None, 3));
+        assert_eq!(
+            page(unprotected, "limit=1000000&sort=-quantity"),
+            (vec![3, 1, 2], None, 3)
+        );
+        assert_eq!(page(unprotected, "id=2"), (vec![2], None, 1));
+        assert_eq!(page(unprotected, "q=ms"), (vec![2], None, 1));
+
+        // Hardened validates every parameter before reading a row and binds the search term.
+        let hardened = LabMode::Hardened;
+        assert_eq!(page(hardened, ""), (vec![1, 2, 3], Some((20, 0)), 3));
+        assert_eq!(page(hardened, "limit=2&page=2"), (vec![3], Some((2, 2)), 3));
+        assert_eq!(
+            page(hardened, "sort=-totalCents"),
+            (vec![3, 1, 2], Some((20, 0)), 3)
+        );
+        assert_eq!(page(hardened, "q=O%27Reilly"), (vec![], Some((20, 0)), 0));
+        let refused = |query: &str| match list(hardened, query) {
+            Listing::Invalid(violations) => {
+                let text = json!(violations).to_string();
+                assert_eq!(disclosure::detect(&text), None, "{text}");
+                violations
+                    .iter()
+                    .map(|v| v["parameter"].as_str().unwrap_or_default().to_owned())
+                    .collect::<Vec<_>>()
+            }
+            other => panic!("expected 422 for {query}, got {other:?}"),
+        };
+        for (query, parameter) in [
+            ("limit=-1", "limit"),
+            ("limit=0", "limit"),
+            ("limit=1000000", "limit"),
+            ("limit=01", "limit"),
+            ("page=0", "page"),
+            ("page=-1", "page"),
+            ("offset=-10", "offset"),
+            ("offset=9223372036854775807", "offset"),
+            ("sort=nonexistent_column", "sort"),
+            ("offset=0&page=1", "page"),
+        ] {
+            assert_eq!(refused(query), [parameter], "{query}");
+        }
+        // Unknown, then repeated.
+        assert_eq!(refused("id=1&id=2"), ["id", "id"]);
+
+        assert_eq!(
+            js_render(9_223_372_036_854_775_807.0),
+            "9223372036854776000"
+        );
+        assert_eq!(js_render(-20.0), "-20");
+        assert_eq!(js_render(120.0), "120");
+        assert_eq!(js_render(1.5), "1.5");
+        assert_eq!(js_render(f64::NAN), "NaN");
+        assert!(js_number("1,2").is_nan());
+        assert!(js_number("-Infinity").is_infinite());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fuzzing_order_list_query_and_headers() {
+        let (hub, lab, base) = started(LabMode::Unprotected).await;
+        let slot = FuzzerSlot::default();
+        let spec = || FuzzSpec {
+            target: format!("{base}/api/v1/orders"),
+            method: BurstMethod::Get,
+            headers: Vec::new(),
+            base_body: None,
+            classes: vec![MutationClass::QueryAndHeaderBounds],
+            timeout_ms: 5_000,
+            contract: None,
+        };
+
+        let report = fuzzer::run(spec(), &hub, &slot).await.unwrap();
+        assert_eq!(report.baseline.status, Some(200));
+        assert_eq!(report.cases.len(), 16);
+        let outcome = |label: &str| {
+            let case = report.cases.iter().find(|c| c.label == label).unwrap();
+            (
+                case.status,
+                case.severity,
+                case.disclosure.as_ref().map(|d| d.kind),
+            )
+        };
+        for label in [
+            "?limit=-1",
+            "?page=0",
+            "?page=-1",
+            "?offset=-10",
+            "?offset=9223372036854775807",
+            "?sort=nonexistent_column",
+            "?id=1&id=2",
+            "?q=O%27Reilly",
+        ] {
+            assert_eq!(
+                outcome(label),
+                (
+                    Some(500),
+                    Some(Severity::Fault),
+                    Some(DisclosureKind::SqlError)
+                ),
+                "{label}"
+            );
+        }
+        assert_eq!(outcome("?limit=0"), (Some(200), None, None));
+        assert_eq!(outcome("?limit=1000000"), (Some(200), None, None));
+        // A read ignores the body its Content-Type describes.
+        assert!(report.cases[10..]
+            .iter()
+            .all(|c| c.status == Some(200) && c.severity.is_none()));
+        assert_eq!(
+            (report.faults, report.warnings, report.disclosures),
+            (8, 0, 8)
+        );
+
+        lab.set_mode(LabMode::Hardened).await;
+        let report = fuzzer::run(spec(), &hub, &slot).await.unwrap();
+        assert_eq!(report.baseline.status, Some(200));
+        assert_eq!(
+            (report.faults, report.warnings, report.disclosures),
+            (0, 0, 0)
+        );
+        for case in &report.cases[..10] {
+            let expected = if case.label == "?q=O%27Reilly" {
+                200
+            } else {
+                422
+            };
+            assert_eq!(case.status, Some(expected), "{}", case.label);
+        }
+        assert!(report.cases[10..].iter().all(|c| c.status == Some(200)));
         lab.stop().await;
     }
 
@@ -2706,7 +3387,7 @@ mod tests {
         let (hub, lab, base) = started(LabMode::Unprotected).await;
         let proxy = ProxyManager::new(Arc::clone(&hub)).unwrap();
         let status = proxy.set_contracts(lab_contracts(&base)).await.unwrap();
-        assert_eq!(status.contracts, 5);
+        assert_eq!(status.contracts, 6);
         let listener = proxy
             .start(ProxyConfig {
                 upstream: base.clone(),
@@ -3213,7 +3894,7 @@ mod tests {
         let document: Value =
             serde_json::from_str(&openapi_document(Some("http://127.0.0.1:4242"))).unwrap();
         assert_eq!(document["servers"][0]["url"], "http://127.0.0.1:4242");
-        assert_eq!(document["paths"].as_object().unwrap().len(), 5);
+        assert_eq!(document["paths"].as_object().unwrap().len(), 6);
         let fallback: Value = serde_json::from_str(&openapi_document(None)).unwrap();
         assert_eq!(
             fallback["servers"][0]["url"],

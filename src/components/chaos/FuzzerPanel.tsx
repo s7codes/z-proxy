@@ -10,7 +10,14 @@ import type { FuzzPreset } from "../../lib/risk";
 import { joinTarget, parseHeaders, type RequestOrigin } from "../../lib/request";
 import { pathParams, type RequestTarget } from "../../lib/routes";
 import { httpStatusTone, TONE_BG, TONE_TEXT, type Tone } from "../../lib/tone";
-import type { FuzzCaseResult, FuzzReport, FuzzVerdict, MutationClass, ResponseContract } from "../../lib/types";
+import type {
+  FuzzCaseResult,
+  FuzzReport,
+  FuzzVerdict,
+  HeaderPair,
+  MutationClass,
+  ResponseContract,
+} from "../../lib/types";
 import { Section, StatusSquare } from "../shell/PanelHeader";
 import { ErrorLine } from "./ErrorLine";
 import { Field, MethodPicker, Metric, OriginRow, PathField } from "./RequestFields";
@@ -27,6 +34,7 @@ const CLASSES: ReadonlyArray<{ id: MutationClass; label: string; short: string }
   { id: "schemaContractBounds", label: "Schema contract", short: "contract" },
   { id: "pathParamValidation", label: "Path parameters", short: "path" },
   { id: "delimiterEscaping", label: "Delimiter escaping", short: "delimiter" },
+  { id: "queryAndHeaderBounds", label: "Query & headers", short: "query" },
 ];
 
 /** Classes whose case bodies cannot seed a base payload, which must be a plain JSON object. */
@@ -37,6 +45,7 @@ const UNSEEDABLE: ReadonlySet<MutationClass> = new Set<MutationClass>([
   "schemaContractBounds",
   // The body is the unmodified base.
   "pathParamValidation",
+  "queryAndHeaderBounds",
 ]);
 
 const SHORT: Record<MutationClass, string> = Object.fromEntries(CLASSES.map((c) => [c.id, c.short])) as Record<
@@ -81,8 +90,8 @@ interface FuzzerPanelProps {
   sampleBody: string | null;
   /** OpenAPI response contract of the targeted operation; responses are checked against it. */
   contract: ResponseContract | null;
-  /** Replays a case body through the burst runner: same method and path, N workers. */
-  onSendToBurst: (target: RequestTarget, body: string, origin: string) => void;
+  /** Replays a case through the burst runner: same method, path, body and header overrides, N workers. */
+  onSendToBurst: (target: RequestTarget, body: string, origin: string, headers: HeaderPair[]) => void;
   /** Initial mutation classes from an auto-targeted route risk. */
   preset: FuzzPreset | null;
 }
@@ -337,7 +346,7 @@ function FuzzReportView({
 }: {
   report: FuzzReport;
   onLoadPayload: (payload: string) => void;
-  onSendToBurst: (target: RequestTarget, body: string, origin: string) => void;
+  onSendToBurst: (target: RequestTarget, body: string, origin: string, headers: HeaderPair[]) => void;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
   const [pending, setPending] = useState<number | null>(null);
@@ -354,6 +363,7 @@ function FuzzReportView({
       classes: report.classes,
       pathTemplate: report.pathTemplate,
       index: result.index,
+      target: report.target,
     }).then(
       (outcome) => {
         setPending(null);
@@ -371,8 +381,8 @@ function FuzzReportView({
           setNotice({ tone: "muted", text: `#${payload.index} ${payload.label} loaded as base payload` });
           return;
         }
-        // A path case replays its exact path; a body case keeps the template, so the burst
-        // runner substitutes the same default identifier the suite used.
+        // A path or query case replays its exact target; a body case keeps the template, so
+        // the burst runner substitutes the same default identifier the suite used.
         const path = payload.path ?? report.pathTemplate ?? reportPath(report);
         if (path === null) {
           setNotice({ tone: "fault", text: `cannot derive a path from ${report.target}` });
@@ -381,7 +391,7 @@ function FuzzReportView({
         const origin = `fuzz case #${payload.index} ${payload.label}${
           payload.lossy ? "; invalid UTF-8 replaced with U+FFFD" : ""
         }`;
-        onSendToBurst({ method: report.method, path }, payload.body, origin);
+        onSendToBurst({ method: report.method, path }, payload.body, origin, payload.headers);
       },
     );
   };

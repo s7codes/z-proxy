@@ -24,9 +24,9 @@ use super::http1::{self, OpenError, RequestTemplate, CONNECT_TIMEOUT};
 use super::net;
 use super::pathparam::{self, PathTemplate};
 use super::types::{
-    BurstMethod, ClassSummary, ContractViolation, Disclosure, DisclosureKind, FuzzCasePayload,
-    FuzzCaseRef, FuzzCaseResult, FuzzReport, FuzzSpec, FuzzVerdict, MassAssignment, MutationClass,
-    ResponseContract, Severity, TelemetryEvent,
+    BurstMethod, CaseHeader, ClassSummary, ContractViolation, Disclosure, DisclosureKind,
+    FuzzCasePayload, FuzzCaseRef, FuzzCaseResult, FuzzReport, FuzzSpec, FuzzVerdict,
+    MassAssignment, MutationClass, ResponseContract, Severity, TelemetryEvent,
 };
 use crate::telemetry::{now_us, TelemetryHub};
 
@@ -66,7 +66,7 @@ const UTF8_FIELD: &str = "zproxyUtf8";
 /// to emit (a bare `NaN`, invalid UTF-8).
 const MARKER: &str = "__zproxy_marker_7f3a__";
 
-const ALL_CLASSES: [MutationClass; 10] = [
+const ALL_CLASSES: [MutationClass; 11] = [
     MutationClass::NullInjection,
     MutationClass::EmptyStrings,
     MutationClass::BoundaryNumbers,
@@ -77,6 +77,70 @@ const ALL_CLASSES: [MutationClass; 10] = [
     MutationClass::SchemaContractBounds,
     MutationClass::PathParamValidation,
     MutationClass::DelimiterEscaping,
+    MutationClass::QueryAndHeaderBounds,
+];
+
+/// Pagination and filter parameters at the values list endpoints mishandle: negative and
+/// zero limits, a limit no page should allow, pages and offsets before the first row, an
+/// offset at `i64::MAX` (a JavaScript gateway rounds it past `bigint`), a sort column that
+/// does not exist, a repeated key (`qs` and `URLSearchParams.getAll` turn it into a list),
+/// and an apostrophe in a search term, percent-encoded. Each replaces the parameter of the
+/// same name in the target's query; a correct service clamps or refuses them with a 4xx.
+const QUERY_BOUNDS: [(&str, &[(&str, &str)]); 10] = [
+    ("?limit=-1", &[("limit", "-1")]),
+    ("?limit=0", &[("limit", "0")]),
+    ("?limit=1000000", &[("limit", "1000000")]),
+    ("?page=0", &[("page", "0")]),
+    ("?page=-1", &[("page", "-1")]),
+    ("?offset=-10", &[("offset", "-10")]),
+    (
+        "?offset=9223372036854775807",
+        &[("offset", "9223372036854775807")],
+    ),
+    (
+        "?sort=nonexistent_column",
+        &[("sort", "nonexistent_column")],
+    ),
+    ("?id=1&id=2", &[("id", "1"), ("id", "2")]),
+    ("?q=O%27Reilly", &[("q", "O%27Reilly")]),
+];
+
+/// Header values a JSON API meets from real clients: an `Accept` it cannot serve, an empty
+/// one, and a JSON body declared as something else. `text/plain` and form encoding are
+/// CORS-safelisted, so a browser sends them cross-site without a preflight; a write that
+/// accepts its JSON body under them is reachable from any page.
+static HEADER_BOUNDS: [(&str, HeaderName, &str, Acceptance); 6] = [
+    (
+        "Accept: text/plain",
+        header::ACCEPT,
+        "text/plain",
+        Acceptance::Tolerated,
+    ),
+    ("Accept: (empty)", header::ACCEPT, "", Acceptance::Tolerated),
+    (
+        "Content-Type: text/plain",
+        header::CONTENT_TYPE,
+        "text/plain",
+        Acceptance::RefusedOnWrite,
+    ),
+    (
+        "Content-Type: application/x-www-form-urlencoded",
+        header::CONTENT_TYPE,
+        "application/x-www-form-urlencoded",
+        Acceptance::RefusedOnWrite,
+    ),
+    (
+        "Content-Type: (empty)",
+        header::CONTENT_TYPE,
+        "",
+        Acceptance::Tolerated,
+    ),
+    (
+        "Content-Type: application/json; charset=utf-16",
+        header::CONTENT_TYPE,
+        "application/json; charset=utf-16",
+        Acceptance::Tolerated,
+    ),
 ];
 
 /// Values a correct service stores verbatim or refuses with a 4xx: a company name with an
@@ -123,7 +187,7 @@ pub async fn run(
         .map_err(|_| EngineError::FuzzerBusy)?;
     slot.cancel.store(false, Ordering::SeqCst);
     let plan = prepare(&spec)?;
-    Ok(execute(&plan, spec.method, hub, &slot.cancel).await)
+    Ok(execute(&plan, hub, &slot.cancel).await)
 }
 
 // ---- case generation ------------------------------------------------------------------
@@ -134,11 +198,56 @@ pub struct Case {
     pub label: String,
     pub pointer: Option<String>,
     pub body: Bytes,
-    /// Origin-form target of a path case; `None` sends the suite target.
+    /// Origin-form target of a path or query case; `None` sends the suite target.
     pub path: Option<Uri>,
+    /// Headers set in place of the suite's; empty for every class but the header cases.
+    pub headers: Vec<(HeaderName, HeaderValue)>,
     /// Value of the undeclared field this case adds at `pointer`; a 2xx response that
     /// carries it back is a mass assignment.
     pub undeclared: Option<Value>,
+    pub acceptance: Acceptance,
+}
+
+/// What a 1xx-3xx answer to a case says about the service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acceptance {
+    /// Taking the case can be correct: a stored delimiter, a clamped limit.
+    Tolerated,
+    /// A correct service refuses it; taking it is a warning.
+    Refused,
+    /// Refused by a write. A read may ignore the body the case concerns.
+    RefusedOnWrite,
+}
+
+impl Acceptance {
+    /// Structurally invalid bodies, bodies outside the schema contract and identifiers
+    /// outside their documented range are never valid input.
+    fn of(class: MutationClass) -> Self {
+        match class {
+            MutationClass::MalformedJson
+            | MutationClass::SchemaContractBounds
+            | MutationClass::PathParamValidation => Self::Refused,
+            _ => Self::Tolerated,
+        }
+    }
+
+    fn refused(self, method: BurstMethod) -> bool {
+        match self {
+            Self::Tolerated => false,
+            Self::Refused => true,
+            Self::RefusedOnWrite => method != BurstMethod::Get,
+        }
+    }
+}
+
+/// Request-line context case generation needs beyond the body.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RequestLine<'a> {
+    /// Slots `PathParamValidation` varies.
+    pub path: Option<&'a PathTemplate>,
+    /// Origin-form suite target (`/orders?expand=1`) whose query `QueryAndHeaderBounds`
+    /// extends; `/` when absent.
+    pub origin: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,11 +397,13 @@ fn confusions(own: Kind) -> Vec<(&'static str, Value)> {
 }
 
 /// Expands `base` into the ordered case list for `classes` (assumed sorted and unique).
-/// `path` supplies the slots for `PathParamValidation`; without it that class is empty.
+/// `line.path` supplies the slots for `PathParamValidation`, without which that class is
+/// empty; `line.origin` the path and query `QueryAndHeaderBounds` extends. The list's labels
+/// and order never depend on `line.origin`, only the query cases' targets do.
 pub fn generate(
     base: &Map<String, Value>,
     classes: &[MutationClass],
-    path: Option<&PathTemplate>,
+    line: RequestLine<'_>,
 ) -> Vec<Case> {
     let fields = collect_fields(base);
     let mut cases = Vec::new();
@@ -305,7 +416,9 @@ pub fn generate(
         pointer: Some(field.pointer.clone()),
         body: Bytes::from(encode(&mutate(base, &field.path, value))),
         path: None,
+        headers: Vec::new(),
         undeclared: None,
+        acceptance: Acceptance::of(class),
     };
 
     for &class in classes {
@@ -366,7 +479,7 @@ pub fn generate(
             }
             MutationClass::SchemaContractBounds => cases.extend(contract_bounds(base, &fields)),
             MutationClass::PathParamValidation => {
-                if let Some(path) = path {
+                if let Some(path) = line.path {
                     cases.extend(path_cases(base, path));
                 }
             }
@@ -376,6 +489,9 @@ pub fn generate(
                         cases.push(field_case(class, field, label, Some(json!(value))));
                     }
                 }
+            }
+            MutationClass::QueryAndHeaderBounds => {
+                cases.extend(query_and_header_cases(base, line.origin.unwrap_or("/")));
             }
         }
     }
@@ -390,8 +506,63 @@ fn whole(class: MutationClass, label: &str, pointer: Option<String>, body: Vec<u
         pointer,
         body: Bytes::from(body),
         path: None,
+        headers: Vec::new(),
         undeclared: None,
+        acceptance: Acceptance::of(class),
     }
+}
+
+/// The query bounds against `origin`, each parameter replacing any of the same name, then
+/// the header bounds against the suite target. The body is the base throughout, so a
+/// difference from the baseline is the query's or the header's alone.
+fn query_and_header_cases(base: &Map<String, Value>, origin: &str) -> Vec<Case> {
+    let class = MutationClass::QueryAndHeaderBounds;
+    let body = Bytes::from(encode(base));
+    let (path, query) = origin.split_once('?').unwrap_or((origin, ""));
+    let mut cases = Vec::with_capacity(QUERY_BOUNDS.len() + HEADER_BOUNDS.len());
+    for (label, params) in QUERY_BOUNDS {
+        let kept = query.split('&').filter(|pair| {
+            let key = pair.split_once('=').map_or(*pair, |(key, _)| key);
+            !pair.is_empty() && params.iter().all(|(name, _)| *name != key)
+        });
+        let added = params.iter().map(|(name, value)| format!("{name}={value}"));
+        let joined = kept
+            .map(str::to_owned)
+            .chain(added)
+            .collect::<Vec<_>>()
+            .join("&");
+        // Every bound is unreserved ASCII or percent-encoded, and `origin` came from a parsed
+        // URL; a target this cannot hold is left out rather than sent elsewhere.
+        let Ok(uri) = format!("{path}?{joined}").parse::<Uri>() else {
+            continue;
+        };
+        cases.push(Case {
+            class,
+            label: label.to_owned(),
+            pointer: None,
+            body: body.clone(),
+            path: Some(uri),
+            headers: Vec::new(),
+            undeclared: None,
+            acceptance: Acceptance::Tolerated,
+        });
+    }
+    for (label, name, value, acceptance) in &HEADER_BOUNDS {
+        let Ok(value) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        cases.push(Case {
+            class,
+            label: (*label).to_owned(),
+            pointer: None,
+            body: body.clone(),
+            path: None,
+            headers: vec![(name.clone(), value)],
+            undeclared: None,
+            acceptance: *acceptance,
+        });
+    }
+    cases
 }
 
 /// A value of the same JSON type that differs from `value`, so a duplicated key changes
@@ -512,7 +683,9 @@ fn path_cases(base: &Map<String, Value>, path: &PathTemplate) -> Vec<Case> {
                 pointer: None,
                 body: body.clone(),
                 path: Some(uri),
+                headers: Vec::new(),
                 undeclared: None,
+                acceptance: Acceptance::Refused,
             });
         }
     }
@@ -600,6 +773,7 @@ fn malformed(base: &Map<String, Value>) -> Vec<Case> {
 
 struct Plan {
     template: RequestTemplate,
+    method: BurstMethod,
     path_template: Option<PathTemplate>,
     content_type: bool,
     timeout: Duration,
@@ -622,10 +796,10 @@ impl Plan {
         }
     }
 
-    fn request(&self, index: u32, body: Bytes, path: Option<&Uri>) -> Request<Full<Bytes>> {
-        let mut request = match path {
-            Some(uri) => self.template.request_at(uri, body),
-            None => self.template.request(body),
+    fn request(&self, index: u32, wire: &Wire<'_>) -> Request<Full<Bytes>> {
+        let mut request = match wire.path {
+            Some(uri) => self.template.request_at(uri, wire.body.clone()),
+            None => self.template.request(wire.body.clone()),
         };
         let headers = request.headers_mut();
         if self.content_type {
@@ -637,12 +811,34 @@ impl Plan {
         headers
             .entry(header::USER_AGENT)
             .or_insert(HeaderValue::from_static(USER_AGENT));
+        // A header case replaces the default and the operator's value alike; framing headers
+        // are never among them.
+        for (name, value) in wire.headers {
+            headers.insert(name, value.clone());
+        }
         headers.insert(header::CONNECTION, HeaderValue::from_static("close"));
         headers.insert(
             HeaderName::from_static(CASE_HEADER),
             HeaderValue::from(index),
         );
         request
+    }
+}
+
+/// What one request puts on the wire besides the suite's request line and headers.
+struct Wire<'a> {
+    body: Bytes,
+    path: Option<&'a Uri>,
+    headers: &'a [(HeaderName, HeaderValue)],
+}
+
+impl<'a> Wire<'a> {
+    fn of(case: &'a Case) -> Self {
+        Self {
+            body: case.body.clone(),
+            path: case.path.as_ref(),
+            headers: &case.headers,
+        }
     }
 }
 
@@ -657,19 +853,33 @@ fn prepare(spec: &FuzzSpec) -> EngineResult<Plan> {
     let template = RequestTemplate::new(&resolved.target, spec.method, &spec.headers, invalid)?;
     let base = parse_base(spec.base_body.as_deref())?;
     let classes = normalize_classes(&spec.classes);
+    let origin = template.origin_form().to_string();
+    let line = RequestLine {
+        path: resolved.template.as_ref(),
+        origin: Some(&origin),
+    };
 
     Ok(Plan {
         content_type: !template.has_header(&header::CONTENT_TYPE),
+        cases: generate(&base, &classes, line),
         template,
+        method: spec.method,
         timeout: Duration::from_millis(u64::from(spec.timeout_ms)),
         connect_timeout: CONNECT_TIMEOUT,
         base: Bytes::from(encode(&base)),
         fields: count_u32(collect_fields(&base).len()),
-        cases: generate(&base, &classes, resolved.template.as_ref()),
         path_template: resolved.template,
         classes,
         contract: spec.contract.clone(),
     })
+}
+
+/// Origin-form path and query of a report's `target`, through the same guard and
+/// placeholder resolution the suite used.
+fn report_origin(target: &str) -> EngineResult<String> {
+    let resolved = pathparam::resolve(target)?;
+    let template = RequestTemplate::new(&resolved.target, BurstMethod::Get, &[], invalid)?;
+    Ok(template.origin_form().to_string())
 }
 
 fn parse_base(text: Option<&str>) -> EngineResult<Map<String, Value>> {
@@ -708,9 +918,10 @@ fn normalize_classes(requested: &[MutationClass]) -> Vec<MutationClass> {
     classes
 }
 
-/// Rebuilds the exact request body (and path, for path cases) of case `index` (0 is the
-/// baseline) from the base body, classes and path template a report carries. Generation is
-/// deterministic, so this is what was sent, without the report holding every payload.
+/// Rebuilds the exact request body (and path, for path and query cases, and headers, for
+/// header cases) of case `index` (0 is the baseline) from the base body, classes, path
+/// template and target a report carries. Generation is deterministic, so this is what was
+/// sent, without the report holding every payload.
 pub fn materialize(reference: &FuzzCaseRef) -> EngineResult<FuzzCasePayload> {
     let base = parse_base(Some(&reference.base_body))?;
     let classes = normalize_classes(&reference.classes);
@@ -720,11 +931,16 @@ pub fn materialize(reference: &FuzzCaseRef) -> EngineResult<FuzzCasePayload> {
         }
         None => None,
     };
-    let (label, body, path) = match reference.index {
-        0 => ("baseline".to_owned(), encode(&base), None),
+    let origin = reference.target.as_deref().map(report_origin).transpose()?;
+    let line = RequestLine {
+        path: path_template.as_ref(),
+        origin: origin.as_deref(),
+    };
+    let (label, body, path, headers) = match reference.index {
+        0 => ("baseline".to_owned(), encode(&base), None, Vec::new()),
         index => {
             let offset = usize::try_from(index - 1).unwrap_or(usize::MAX);
-            let mut cases = generate(&base, &classes, path_template.as_ref());
+            let mut cases = generate(&base, &classes, line);
             let total = cases.len();
             if offset >= total {
                 return Err(invalid(
@@ -733,10 +949,30 @@ pub fn materialize(reference: &FuzzCaseRef) -> EngineResult<FuzzCasePayload> {
                 ));
             }
             let case = cases.swap_remove(offset);
+            if case.class == MutationClass::QueryAndHeaderBounds
+                && case.path.is_some()
+                && origin.is_none()
+            {
+                return Err(invalid(
+                    "target",
+                    format!(
+                        "case #{index} extends the suite target's query; pass the report's target"
+                    ),
+                ));
+            }
+            let headers = case
+                .headers
+                .iter()
+                .map(|(name, value)| CaseHeader {
+                    name: name.as_str().to_owned(),
+                    value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                })
+                .collect();
             (
                 case.label,
                 case.body.to_vec(),
                 case.path.map(|uri| uri.to_string()),
+                headers,
             )
         }
     };
@@ -749,6 +985,7 @@ pub fn materialize(reference: &FuzzCaseRef) -> EngineResult<FuzzCasePayload> {
         index: reference.index,
         label,
         path,
+        headers,
         body,
         bytes,
         lossy,
@@ -771,7 +1008,7 @@ enum Outcome {
     },
 }
 
-async fn send(plan: &Plan, index: u32, body: Bytes, path: Option<&Uri>, capture: usize) -> Outcome {
+async fn send(plan: &Plan, index: u32, wire: &Wire<'_>, capture: usize) -> Outcome {
     let opened =
         tokio::time::timeout(plan.connect_timeout, http1::open(&plan.template.target)).await;
     let mut sender = match opened {
@@ -799,7 +1036,7 @@ async fn send(plan: &Plan, index: u32, body: Bytes, path: Option<&Uri>, capture:
     };
 
     let started = Instant::now();
-    let request = plan.request(index, body, path);
+    let request = plan.request(index, wire);
     let exchange = http1::exchange(&mut sender, request, capture);
     match tokio::time::timeout(plan.timeout, exchange).await {
         Ok(Ok(received)) => Outcome::Response {
@@ -823,10 +1060,11 @@ async fn send(plan: &Plan, index: u32, body: Bytes, path: Option<&Uri>, capture:
     }
 }
 
-/// `flagged`: the response leaked internals or broke the documented contract.
-/// A mass assignment raises the case to a fault after this (see `to_result`).
+/// `refused`: `None` for the baseline, else whether a correct service refuses the case
+/// (`Acceptance::refused`). `flagged`: the response leaked internals or broke the documented
+/// contract. A mass assignment raises the case to a fault after this (see `to_result`).
 fn classify(
-    class: Option<MutationClass>,
+    refused: Option<bool>,
     outcome: &Outcome,
     flagged: bool,
 ) -> (FuzzVerdict, Option<Severity>) {
@@ -835,21 +1073,14 @@ fn classify(
             (FuzzVerdict::ServerError, Some(Severity::Fault))
         }
         Outcome::Response { status, .. } if *status >= 400 => (FuzzVerdict::Rejected, None),
-        // Accepting these is itself the finding: a structurally invalid body (lenient parser,
-        // or the body is never read), a body outside the schema contract, or a boundary
-        // identifier the route treated as valid. Other accepted mutations may be legitimate;
-        // a delimiter value stored verbatim is the correct outcome.
+        // Accepting a refused case is itself the finding: a structurally invalid body (lenient
+        // parser, or the body is never read), a body outside the schema contract, a boundary
+        // identifier the route treated as valid, or a write that took JSON declared as a
+        // CORS-safelisted type. Other accepted cases may be legitimate; a delimiter value
+        // stored verbatim or a clamped limit is the correct outcome.
         Outcome::Response { .. } => (
             FuzzVerdict::Accepted,
-            matches!(
-                class,
-                Some(
-                    MutationClass::MalformedJson
-                        | MutationClass::SchemaContractBounds
-                        | MutationClass::PathParamValidation
-                )
-            )
-            .then_some(Severity::Warn),
+            (refused == Some(true)).then_some(Severity::Warn),
         ),
         Outcome::Transport { .. } => (FuzzVerdict::TransportFailure, Some(Severity::Fault)),
         Outcome::Unreachable { .. } => (FuzzVerdict::Unreachable, None),
@@ -859,7 +1090,7 @@ fn classify(
     // body is a warning for the same reason: the payload was handled, but not as specified.
     let severity = severity.or(flagged.then_some(Severity::Warn));
     // The baseline is context for the mutations, not a finding of its own.
-    (verdict, if class.is_none() { None } else { severity })
+    (verdict, if refused.is_none() { None } else { severity })
 }
 
 struct CaseMeta<'a> {
@@ -869,6 +1100,8 @@ struct CaseMeta<'a> {
     pointer: Option<String>,
     request_bytes: usize,
     undeclared: Option<&'a Value>,
+    /// A correct service refuses the case under the suite's method.
+    refused: bool,
 }
 
 /// What every response of a suite is judged against.
@@ -889,6 +1122,7 @@ fn to_result(meta: CaseMeta<'_>, outcome: &Outcome, judge: Judge<'_>) -> FuzzCas
         pointer,
         request_bytes,
         undeclared,
+        refused,
     } = meta;
     let success = match outcome {
         Outcome::Response {
@@ -936,7 +1170,7 @@ fn to_result(meta: CaseMeta<'_>, outcome: &Outcome, judge: Judge<'_>) -> FuzzCas
     };
     let disclosure = preview.as_deref().and_then(disclosure::detect).or(leak);
     let flagged = disclosure.is_some() || !violations.is_empty();
-    let (verdict, mut severity) = classify(class, outcome, flagged);
+    let (verdict, mut severity) = classify(class.map(|_| refused), outcome, flagged);
     if mass_assignment.is_some() && class.is_some() {
         severity = Some(Severity::Fault);
     }
@@ -1037,12 +1271,8 @@ fn echo(body: &[u8], pointer: &str, sent: &Value) -> Option<MassAssignment> {
     })
 }
 
-async fn execute(
-    plan: &Plan,
-    method: BurstMethod,
-    hub: &TelemetryHub,
-    cancel: &AtomicBool,
-) -> FuzzReport {
+async fn execute(plan: &Plan, hub: &TelemetryHub, cancel: &AtomicBool) -> FuzzReport {
+    let method = plan.method;
     let id = Uuid::new_v4();
     let started = Instant::now();
     let total = count_u32(plan.cases.len());
@@ -1064,7 +1294,12 @@ async fn execute(
         });
     };
 
-    let outcome = send(plan, 0, plan.base.clone(), None, plan.capture_limit(false)).await;
+    let baseline_wire = Wire {
+        body: plan.base.clone(),
+        path: None,
+        headers: &[],
+    };
+    let outcome = send(plan, 0, &baseline_wire, plan.capture_limit(false)).await;
     let judge = Judge {
         contract: plan.contract.as_ref(),
         route_path: plan.template.origin_form().path(),
@@ -1078,6 +1313,7 @@ async fn execute(
             pointer: None,
             request_bytes: plan.base.len(),
             undeclared: None,
+            refused: false,
         },
         &outcome,
         judge,
@@ -1146,7 +1382,7 @@ async fn execute(
         }
 
         let capture = plan.capture_limit(case.undeclared.is_some());
-        let outcome = send(plan, index, case.body.clone(), case.path.as_ref(), capture).await;
+        let outcome = send(plan, index, &Wire::of(case), capture).await;
         let result = to_result(
             CaseMeta {
                 index,
@@ -1155,6 +1391,7 @@ async fn execute(
                 pointer: case.pointer.clone(),
                 request_bytes: case.body.len(),
                 undeclared: case.undeclared.as_ref(),
+                refused: case.acceptance.refused(plan.method),
             },
             &outcome,
             judge,
@@ -1331,7 +1568,11 @@ mod tests {
     }
 
     fn cases_of(class: MutationClass) -> Vec<Case> {
-        generate(&default_template(), &[class], None)
+        generate(&default_template(), &[class], RequestLine::default())
+    }
+
+    fn slots(path: Option<&PathTemplate>) -> RequestLine<'_> {
+        RequestLine { path, origin: None }
     }
 
     fn body_of<'a>(cases: &'a [Case], label: &str) -> &'a [u8] {
@@ -1361,9 +1602,13 @@ mod tests {
                 (MutationClass::SchemaContractBounds, 14),
                 (MutationClass::PathParamValidation, 0),
                 (MutationClass::DelimiterEscaping, 15),
+                (MutationClass::QueryAndHeaderBounds, 16),
             ]
         );
-        assert_eq!(generate(&default_template(), &ALL_CLASSES, None).len(), 115);
+        assert_eq!(
+            generate(&default_template(), &ALL_CLASSES, RequestLine::default()).len(),
+            131
+        );
     }
 
     #[test]
@@ -1373,24 +1618,32 @@ mod tests {
             .unwrap()
             .template;
         assert_eq!(
-            generate(&base, &ALL_CLASSES, path.as_ref()),
-            generate(&base, &ALL_CLASSES, path.as_ref())
+            generate(&base, &ALL_CLASSES, slots(path.as_ref())),
+            generate(&base, &ALL_CLASSES, slots(path.as_ref()))
         );
         // Appended classes never shift the indices of earlier ones.
-        let all = generate(&base, &ALL_CLASSES, path.as_ref());
+        let all = generate(&base, &ALL_CLASSES, slots(path.as_ref()));
         let original = &ALL_CLASSES[..7];
-        assert_eq!(generate(&base, original, None)[..], all[..86]);
-        let before_delimiters = generate(&base, &ALL_CLASSES[..9], path.as_ref());
+        assert_eq!(
+            generate(&base, original, RequestLine::default())[..],
+            all[..86]
+        );
+        let before_delimiters = generate(&base, &ALL_CLASSES[..9], slots(path.as_ref()));
         assert_eq!(before_delimiters[..], all[..before_delimiters.len()]);
-        assert!(all[before_delimiters.len()..]
+        let before_queries = generate(&base, &ALL_CLASSES[..10], slots(path.as_ref()));
+        assert_eq!(before_queries[..], all[..before_queries.len()]);
+        assert!(all[before_delimiters.len()..before_queries.len()]
             .iter()
             .all(|case| case.class == MutationClass::DelimiterEscaping));
+        assert!(all[before_queries.len()..]
+            .iter()
+            .all(|case| case.class == MutationClass::QueryAndHeaderBounds));
 
         let ordered: Map<String, Value> = serde_json::from_str(r#"{"z":1,"a":{"b":"x"}}"#).unwrap();
         let cases = generate(
             &ordered,
             &[MutationClass::NullInjection, MutationClass::MissingFields],
-            None,
+            RequestLine::default(),
         );
         assert_eq!(body_of(&cases, "/z = null"), br#"{"z":null,"a":{"b":"x"}}"#);
         assert_eq!(body_of(&cases, "/a/b = null"), br#"{"z":1,"a":{"b":null}}"#);
@@ -1497,7 +1750,153 @@ mod tests {
         assert_eq!((text.len(), text.chars().count()), (13, 10));
 
         let numeric: Map<String, Value> = serde_json::from_str(r#"{"qty":2,"ok":true}"#).unwrap();
-        assert!(generate(&numeric, &[MutationClass::DelimiterEscaping], None).is_empty());
+        assert!(generate(
+            &numeric,
+            &[MutationClass::DelimiterEscaping],
+            RequestLine::default()
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn query_and_header_bounds_extend_the_target_and_keep_the_base_body() {
+        let base = default_template();
+        let line = RequestLine {
+            path: None,
+            origin: Some("/api/v1/orders?expand=lines&limit=20"),
+        };
+        let cases = generate(&base, &[MutationClass::QueryAndHeaderBounds], line);
+        let labels: Vec<&str> = cases.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "?limit=-1",
+                "?limit=0",
+                "?limit=1000000",
+                "?page=0",
+                "?page=-1",
+                "?offset=-10",
+                "?offset=9223372036854775807",
+                "?sort=nonexistent_column",
+                "?id=1&id=2",
+                "?q=O%27Reilly",
+                "Accept: text/plain",
+                "Accept: (empty)",
+                "Content-Type: text/plain",
+                "Content-Type: application/x-www-form-urlencoded",
+                "Content-Type: (empty)",
+                "Content-Type: application/json; charset=utf-16",
+            ]
+        );
+        let case = |label: &str| cases.iter().find(|c| c.label == label).unwrap();
+        let target = |label: &str| case(label).path.as_ref().map(ToString::to_string);
+        // A bound replaces the parameter of the same name; the rest of the query stays.
+        assert_eq!(
+            target("?limit=-1").as_deref(),
+            Some("/api/v1/orders?expand=lines&limit=-1")
+        );
+        assert_eq!(
+            target("?id=1&id=2").as_deref(),
+            Some("/api/v1/orders?expand=lines&limit=20&id=1&id=2")
+        );
+        assert_eq!(
+            target("?q=O%27Reilly").as_deref(),
+            Some("/api/v1/orders?expand=lines&limit=20&q=O%27Reilly")
+        );
+        let encoded = encode(&base);
+        assert!(cases
+            .iter()
+            .all(|c| c.body == encoded && c.pointer.is_none() && c.undeclared.is_none()));
+        assert!(cases[..10]
+            .iter()
+            .all(|c| c.headers.is_empty() && c.acceptance == Acceptance::Tolerated));
+
+        let plain = case("Content-Type: text/plain");
+        assert_eq!(plain.path, None);
+        assert_eq!(
+            plain.headers,
+            [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))]
+        );
+        assert!(plain.acceptance.refused(BurstMethod::Post));
+        assert!(!plain.acceptance.refused(BurstMethod::Get));
+        assert_eq!(case("Accept: (empty)").headers[0].1.as_bytes(), b"");
+        assert!(!case("Accept: text/plain")
+            .acceptance
+            .refused(BurstMethod::Post));
+
+        // Without an origin the labels and order hold; the query cases extend `/`.
+        let bare = cases_of(MutationClass::QueryAndHeaderBounds);
+        assert_eq!(
+            bare.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
+            labels
+        );
+        assert_eq!(
+            bare[0].path.as_ref().map(ToString::to_string).as_deref(),
+            Some("/?limit=-1")
+        );
+    }
+
+    #[test]
+    fn header_cases_replace_the_default_and_the_operators_value() {
+        let mut fuzz = spec("http://127.0.0.1:9/api/v1/orders?expand=lines".into());
+        fuzz.classes = vec![MutationClass::QueryAndHeaderBounds];
+        fuzz.headers = vec![crate::engine::types::HeaderPair {
+            name: "Content-Type".into(),
+            value: "application/vnd.api+json".into(),
+        }];
+        let plan = prepare(&fuzz).unwrap();
+        let by_label = |label: &str| plan.cases.iter().find(|c| c.label == label).unwrap();
+        let request = plan.request(13, &Wire::of(by_label("Content-Type: text/plain")));
+        assert_eq!(request.headers()[header::CONTENT_TYPE], "text/plain");
+        assert_eq!(request.uri().to_string(), "/api/v1/orders?expand=lines");
+        let request = plan.request(6, &Wire::of(by_label("?offset=-10")));
+        assert_eq!(
+            request.uri().to_string(),
+            "/api/v1/orders?expand=lines&offset=-10"
+        );
+        assert_eq!(
+            request.headers()[header::CONTENT_TYPE],
+            "application/vnd.api+json"
+        );
+        assert_eq!(request.headers()[header::HOST], "127.0.0.1:9");
+
+        // Replay rebuilds a query case against the report's target and a header case's header.
+        let reference = |index: u32, target: Option<String>| FuzzCaseRef {
+            base_body: String::from_utf8(plan.base.to_vec()).unwrap(),
+            classes: fuzz.classes.clone(),
+            path_template: None,
+            index,
+            target,
+        };
+        let target = Some(plan.template.label.clone());
+        let query = materialize(&reference(6, target.clone())).unwrap();
+        assert_eq!(query.label, "?offset=-10");
+        assert_eq!(
+            query.path.as_deref(),
+            Some("/api/v1/orders?expand=lines&offset=-10")
+        );
+        assert!(query.headers.is_empty());
+        let header_case = materialize(&reference(13, target)).unwrap();
+        assert_eq!(header_case.label, "Content-Type: text/plain");
+        assert_eq!(header_case.path, None);
+        assert_eq!(
+            header_case.headers,
+            [CaseHeader {
+                name: "content-type".into(),
+                value: "text/plain".into()
+            }]
+        );
+        match materialize(&reference(6, None)) {
+            Err(EngineError::InvalidFuzzSpec { field, .. }) => assert_eq!(field, "target"),
+            other => panic!("expected a target rejection, got {other:?}"),
+        }
+        assert!(materialize(&reference(13, None)).is_ok());
+        assert_eq!(
+            materialize(&reference(6, Some("http://10.0.0.1/api/v1/orders".into())))
+                .unwrap_err()
+                .code(),
+            "NON_LOOPBACK_TARGET_REJECTED"
+        );
     }
 
     #[test]
@@ -1570,7 +1969,11 @@ mod tests {
         assert_eq!(nested_extra["meta"]["source"], "z-proxy");
         assert!(cases.iter().all(|c| c.path.is_none()));
 
-        let empty = generate(&Map::new(), &[MutationClass::SchemaContractBounds], None);
+        let empty = generate(
+            &Map::new(),
+            &[MutationClass::SchemaContractBounds],
+            RequestLine::default(),
+        );
         let labels: Vec<&str> = empty.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(
             labels,
@@ -1593,7 +1996,7 @@ mod tests {
         let cases = generate(
             &base,
             &[MutationClass::PathParamValidation],
-            Some(&template),
+            slots(Some(&template)),
         );
         assert_eq!(cases.len(), 14);
         let path_of = |label: &str| {
@@ -1629,7 +2032,12 @@ mod tests {
         assert!(cases
             .iter()
             .all(|c| c.body == base_body && c.pointer.is_none()));
-        assert!(generate(&base, &[MutationClass::PathParamValidation], None).is_empty());
+        assert!(generate(
+            &base,
+            &[MutationClass::PathParamValidation],
+            RequestLine::default()
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1650,6 +2058,7 @@ mod tests {
             classes: fuzz.classes.clone(),
             path_template: path_template.clone(),
             index,
+            target: None,
         };
         // Null injection runs first (8 cases), then the 7 path cases.
         assert_eq!(plan.cases.len(), 15);
@@ -1724,6 +2133,7 @@ mod tests {
             classes: fuzz.classes.clone(),
             path_template: None,
             index,
+            target: None,
         };
 
         let baseline = materialize(&reference(0)).unwrap();
@@ -1839,7 +2249,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.baseline.status, Some(201));
-        assert_eq!(report.cases.len(), 115);
+        assert_eq!(report.cases.len(), 131);
         assert_eq!(report.fields, 8);
         assert_eq!(report.classes, ALL_CLASSES);
         assert_eq!(report.path_template, None);
@@ -1848,6 +2258,7 @@ mod tests {
             classes: report.classes.clone(),
             path_template: None,
             index: 1,
+            target: Some(report.target.clone()),
         })
         .unwrap();
         assert_eq!(replayed.label, report.cases[0].label);
@@ -1865,15 +2276,25 @@ mod tests {
         );
         // Every contract case the service took: six duplicates whose last value it accepts,
         // the 64-level nest, and the three undeclared fields. The duplicate quantity (-1) is
-        // rejected, and 1024 levels and 1e309 fail its parser with a 400.
+        // rejected, and 1024 levels and 1e309 fail its parser with a 400. The service also
+        // reads its JSON body whatever the Content-Type, so the two CORS-safelisted types are
+        // taken by a write.
         let warned: Vec<&str> = report
             .cases
             .iter()
             .filter(|c| c.severity == Some(Severity::Warn))
             .map(|c| c.label.as_str())
             .collect();
-        assert_eq!(warned.len(), 10, "{warned:#?}");
-        assert_eq!(report.warnings, 10);
+        assert_eq!(warned.len(), 12, "{warned:#?}");
+        assert_eq!(report.warnings, 12);
+        assert!(warned.contains(&"Content-Type: text/plain"));
+        assert!(warned.contains(&"Content-Type: application/x-www-form-urlencoded"));
+        let queries = report
+            .summary
+            .iter()
+            .find(|s| s.class == MutationClass::QueryAndHeaderBounds)
+            .unwrap();
+        assert_eq!((queries.cases, queries.accepted), (16, 16));
         let contract = report
             .summary
             .iter()
@@ -1939,7 +2360,7 @@ mod tests {
         while let Ok(event) = events.try_recv() {
             match event {
                 TelemetryEvent::FuzzerStarted { cases, .. } => {
-                    assert_eq!(cases, 115);
+                    assert_eq!(cases, 131);
                     kinds.0 += 1;
                 }
                 TelemetryEvent::FuzzerCaseCompleted { .. } => kinds.1 += 1,
@@ -1950,7 +2371,7 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(kinds, (1, 116, 1));
+        assert_eq!(kinds, (1, 132, 1));
     }
 
     /// Express default error handler in development mode: malformed JSON is rejected with
@@ -2023,17 +2444,18 @@ mod tests {
             preview: Vec::new(),
             latency_us: 1,
         };
-        let class = Some(MutationClass::NullInjection);
+        // A null injection may be taken; only a leak or drift makes it a finding.
+        let tolerated = Some(false);
         assert_eq!(
-            classify(class, &rejected, true),
+            classify(tolerated, &rejected, true),
             (FuzzVerdict::Rejected, Some(Severity::Warn))
         );
         assert_eq!(
-            classify(class, &rejected, false),
+            classify(tolerated, &rejected, false),
             (FuzzVerdict::Rejected, None)
         );
         assert_eq!(
-            classify(class, &crashed, true),
+            classify(tolerated, &crashed, true),
             (FuzzVerdict::ServerError, Some(Severity::Fault))
         );
         assert_eq!(
@@ -2060,7 +2482,7 @@ mod tests {
         let mut plan = prepare(&fuzz).unwrap();
         plan.connect_timeout = Duration::from_millis(300);
 
-        let report = execute(&plan, fuzz.method, &hub, &AtomicBool::new(false)).await;
+        let report = execute(&plan, &hub, &AtomicBool::new(false)).await;
 
         assert_eq!(
             report.aborted.as_deref(),
@@ -2120,7 +2542,7 @@ mod tests {
             .iter()
             .filter(|c| c.verdict == FuzzVerdict::Skipped)
             .count();
-        assert!(skipped > 0 && skipped < 115, "skipped {skipped}");
+        assert!(skipped > 0 && skipped < 131, "skipped {skipped}");
         assert!(
             report.notes[0].contains("rejected with 422"),
             "{:?}",

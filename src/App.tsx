@@ -46,12 +46,12 @@ import { useTelemetry } from "./hooks/useTelemetry";
 import { routeContracts } from "./lib/contract";
 import type { AuditKind } from "./lib/traffic";
 import { ipcAvailable } from "./lib/ipc";
-import { originOf, type RequestOrigin } from "./lib/request";
+import { originOf, withHeaders, type RequestOrigin } from "./lib/request";
 import { AUTO_TARGET } from "./lib/risk";
 import { toBurstMethod, type RequestTarget } from "./lib/routes";
 import { DEFAULT_LISTEN_PORT } from "./lib/rules";
 import { TONE_TEXT } from "./lib/tone";
-import type { DiscoveredRoute, FaultProfile, RouteRiskKind } from "./lib/types";
+import type { DiscoveredRoute, FaultProfile, HeaderPair, RouteRiskKind } from "./lib/types";
 
 // Slider drags emit a value per pixel; one IPC round trip per settled position is enough.
 const PROFILE_PUSH_MS = 150;
@@ -77,6 +77,7 @@ export function App() {
   // later a fuzz finding can write them while the owning tab is not mounted.
   const [burstBody, setBurstBody] = useState("");
   const [burstOrigin, setBurstOrigin] = useState<string | null>(null);
+  const [burstHeaders, setBurstHeaders] = useState("");
   const [fuzzPayload, setFuzzPayload] = useState("");
   const [chaosPreset, setChaosPreset] = useState<ChaosPreset | null>(null);
 
@@ -146,10 +147,13 @@ export function App() {
   // Fuzz-to-burst escalation: the payload that broke one request is fired from N
   // pre-connected workers, which separates a deterministic crash from one that only
   // surfaces under contention.
-  const replayInBurst = useCallback((target: RequestTarget, body: string, origin: string) => {
+  const replayInBurst = useCallback((target: RequestTarget, body: string, origin: string, headers: HeaderPair[]) => {
     setRequestTarget(target);
     setBurstBody(body);
     setBurstOrigin(origin);
+    // A header case's override replaces the line of the same name; the operator's other
+    // headers (credentials, tracing) stay.
+    if (headers.length > 0) setBurstHeaders((current) => withHeaders(current, headers));
     chaosRef.current?.expand();
     setChaosTab("burst");
   }, []);
@@ -489,6 +493,8 @@ export function App() {
             onTarget={setRequestTarget}
             burstBody={burstBody}
             onBurstBody={editBurstBody}
+            burstHeaders={burstHeaders}
+            onBurstHeaders={setBurstHeaders}
             fuzzPayload={fuzzPayload}
             onFuzzPayload={setFuzzPayload}
             sampleBody={selectedRoute?.sampleBody ?? null}

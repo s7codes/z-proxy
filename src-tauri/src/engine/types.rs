@@ -274,6 +274,11 @@ pub enum MutationClass {
     /// its strings stores them or refuses them cleanly; one that splices them into a query,
     /// path or pattern fails.
     DelimiterEscaping,
+    /// Pagination and filter parameters at their bounds appended to the target's query
+    /// (negative and oversized `limit` / `offset` / `page`, an unknown `sort` column, a
+    /// repeated key, an apostrophe in `q`), then empty and contradicting `Accept` /
+    /// `Content-Type` headers. The body stays the base.
+    QueryAndHeaderBounds,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -438,6 +443,16 @@ pub struct FuzzCaseRef {
     pub path_template: Option<String>,
     /// `0` is the baseline.
     pub index: u32,
+    /// The report's `target`; query cases extend its path and query, so they cannot be
+    /// rebuilt without it.
+    pub target: Option<String>,
+}
+
+/// A request header a case sets in place of the suite's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CaseHeader {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -445,8 +460,11 @@ pub struct FuzzCaseRef {
 pub struct FuzzCasePayload {
     pub index: u32,
     pub label: String,
-    /// Origin-form request target of a path case; `None` when the case used the suite target.
+    /// Origin-form request target of a path or query case; `None` when the case used the
+    /// suite target.
     pub path: Option<String>,
+    /// Headers a header case overrides; empty otherwise.
+    pub headers: Vec<CaseHeader>,
     pub body: String,
     /// Size of the body as sent by the fuzzer.
     pub bytes: u64,
