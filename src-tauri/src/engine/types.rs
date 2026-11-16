@@ -665,10 +665,12 @@ pub enum TrafficFindingKind {
     PassiveDisclosure,
     /// One exact request (method, path and query) repeated 10 or more times inside 250 ms
     /// (an effect that re-runs on every render), or retried 4 times in a row, each within
-    /// 100 ms of a 429 / 503 answer to it (a retry loop without backoff).
+    /// 100 ms of a 429 / 503 answer to it or before that answer's `Retry-After` elapsed (a
+    /// retry loop that ignores the throttle).
     RetryStorm,
     /// A 2xx upstream latency at least 4x the route template's rolling median and at least
-    /// 250 ms.
+    /// 250 ms; or, on a template whose median is at least 2 ms, at least 8x the median, at
+    /// least 35 ms and more than twice the window's p95.
     LatencyRegression,
 }
 

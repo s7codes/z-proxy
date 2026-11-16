@@ -52,6 +52,9 @@ flate2 = { version = "1.1", default-features = false, features = ["rust_backend"
 # Inflates `Content-Encoding: br` bodies for the same audit. Pure Rust; the major already
 # locked through tauri-codegen, so no second copy of the decoder is built.
 brotli-decompressor = "6.3"
+# Inflates `Content-Encoding: zstd` bodies for the same audit. Pure Rust, no libzstd or C
+# toolchain; frame windows are checked against the RFC 9659 limit before it allocates.
+ruzstd = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "net", "macros"] }

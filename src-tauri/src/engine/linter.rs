@@ -6,27 +6,30 @@
 //! the disclosure scan reads a bounded, borrowed UTF-8 prefix. Findings are allocated only
 //! when one is reported.
 //!
-//! Four checks are stateful: N+1 fan-outs, retry storms, retries that ignore a 429 / 503,
-//! and latency regressions. Their windows are sharded by key behind short
-//! `std::sync::Mutex` sections (no await, no allocation once a key is known; an evicted
-//! slot's buffers are reused), so concurrent exchanges contend only when they hit the same
-//! shard.
+//! Four checks are stateful: N+1 fan-outs, retry storms, retries that ignore a 429 / 503
+//! (and its `Retry-After`), and latency regressions. Their windows are sharded by key behind
+//! short `std::sync::Mutex` sections (no await, no allocation once a key is known; an
+//! evicted slot's buffers are reused), so concurrent exchanges contend only when they hit
+//! the same shard.
 //!
-//! Encoded bodies are inflated before the checks (gzip, deflate, br) into a buffer capped
-//! at 1 MiB, so a compressed decompression bomb costs at most that much output and the time
-//! to produce it. The brotli decoder's ring buffer is bounded by the stream's window, at
-//! most 16 MiB under RFC 7932; large-window streams are refused as corrupt, as browsers
-//! refuse them.
+//! Encoded bodies are inflated before the checks (gzip, deflate, br, zstd) into a buffer
+//! capped at 1 MiB, so a compressed decompression bomb costs at most that much output and
+//! the time to produce it. The brotli decoder's ring buffer is bounded by the stream's
+//! window, at most 16 MiB under RFC 7932; large-window streams are refused as corrupt, as
+//! browsers refuse them. A zstd frame's window is read from its header before the decoder
+//! allocates anything, and one above the 8 MiB that RFC 9659 allows a `zstd` content coding
+//! is refused the same way.
 
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hasher};
-use std::io::Read;
+use std::io::{self, Read};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::http::header::{self, HeaderMap, HeaderName};
 use brotli_decompressor::Decompressor;
 use flate2::read::{DeflateDecoder, MultiGzDecoder, ZlibDecoder};
+use ruzstd::decoding::StreamingDecoder;
 
 use super::disclosure;
 use super::types::{Severity, TrafficFinding, TrafficFindingKind};
@@ -39,20 +42,37 @@ pub const N_PLUS_ONE_THRESHOLD: usize = 8;
 pub const RETRY_STORM_WINDOW: Duration = Duration::from_millis(250);
 pub const RETRY_STORM_THRESHOLD: usize = 10;
 /// A retry of the same request this soon after a 429 or 503 answer to it ignored the
-/// answer; this many such retries in a row are a storm. Any real backoff, even the first
-/// step of an exponential one, waits longer.
+/// answer, as does one sent before the answer's `Retry-After` elapsed; this many such retries
+/// in a row are a storm. Any real backoff, even the first step of an exponential one, waits
+/// longer than the window.
 pub const THROTTLE_RETRY_WINDOW: Duration = Duration::from_millis(100);
 pub const THROTTLE_RETRY_THRESHOLD: usize = 4;
+/// `Retry-After` delta-seconds above a day are read as a day.
+const MAX_RETRY_AFTER_SECS: u64 = 86_400;
 /// Read buffer the brotli decoder pulls compressed input through.
 const BROTLI_BUFFER_BYTES: usize = 4 * 1024;
+/// RFC 9659 caps the window of a `zstd` content coding at 8 MiB, so no compliant sender
+/// needs more history; a larger one would make the decoder reserve it before the output cap
+/// could stop anything.
+const ZSTD_MAX_WINDOW: u64 = 8 * 1024 * 1024;
+const ZSTD_MAGIC: u32 = 0xFD2F_B528;
+/// Skippable frames (RFC 8878 3.1.2) carry metadata, never content.
+const ZSTD_SKIPPABLE: std::ops::RangeInclusive<u32> = 0x184D_2A50..=0x184D_2A5F;
 /// Upstream latencies kept per route template for the rolling median.
 pub const LATENCY_WINDOW: usize = 32;
 /// Responses a template needs before a regression can be judged against its median.
 pub const LATENCY_MIN_SAMPLES: usize = 8;
 pub const LATENCY_FACTOR: u64 = 4;
-/// A response faster than this is never a regression, whatever its ratio: loopback medians
-/// of a few milliseconds would otherwise turn scheduler jitter into findings.
+/// A response faster than this is never a regression under the general rule, whatever its
+/// ratio: loopback medians of a few milliseconds would otherwise turn scheduler jitter into
+/// findings.
 pub const LATENCY_FLOOR: Duration = Duration::from_millis(250);
+/// The loopback rule applies to templates whose rolling median is at least this: handlers
+/// that do real work (a query, a file read), not in-memory answers whose median is jitter.
+pub const LOOPBACK_MEDIAN: Duration = Duration::from_millis(2);
+pub const LOOPBACK_FACTOR: u64 = 8;
+/// Above two ticks of the 15.6 ms Windows timer, so a descheduled handler is not a finding.
+pub const LOOPBACK_FLOOR: Duration = Duration::from_millis(35);
 /// Decoded body cap for the audit; larger output stops the inflater and skips body checks.
 pub const MAX_DECODED_BYTES: usize = 1024 * 1024;
 /// Request evidence (`METHOD /path?query`) is cut to this many characters.
@@ -189,12 +209,13 @@ impl TrafficLinter {
     }
 
     /// Follows one exact request through 429 / 503 answers. A retry that arrives within
-    /// `THROTTLE_RETRY_WINDOW` of the previous throttled answer ignored it; the
-    /// `THROTTLE_RETRY_THRESHOLD`th such retry in a row is reported, once per storm. A retry
-    /// after a longer pause, or any other answer, ends the storm. A request that arrived
-    /// before the throttled answer went out ran concurrently and is not a retry. `status` is
-    /// what the client received, so an injected 429 / 503 exposes the client's retry policy
-    /// as well as an upstream one.
+    /// `THROTTLE_RETRY_WINDOW` of the previous throttled answer, or before the `Retry-After`
+    /// that answer set, ignored it; the `THROTTLE_RETRY_THRESHOLD`th such retry in a row is
+    /// reported, once per storm, with the advertised interval it broke. A retry after a longer
+    /// pause, or any other answer, ends the storm. A request that arrived before the
+    /// throttled answer went out ran concurrently and is not a retry. `status` and
+    /// `retry_after` are what the client received, so an injected 429 / 503 exposes the
+    /// client's retry policy as well as an upstream one.
     pub fn throttled_retry(
         &self,
         arrived: Instant,
@@ -202,30 +223,50 @@ impl TrafficLinter {
         method: &str,
         path_and_query: &str,
         status: Option<u16>,
+        retry_after: Option<Duration>,
     ) -> Option<TrafficFinding> {
         let key = request_key(method, path_and_query);
-        let (retries, throttled) = {
+        let storm = {
             let mut shard = self
                 .throttles
                 .get(shard_of(key))?
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            shard.observe(key, arrived, answered, status)?
+            shard.observe(key, arrived, answered, status, retry_after)?
+        };
+        let ThrottleStorm {
+            retries,
+            status,
+            retry_after,
+            longest_gap,
+        } = storm;
+        let detail = match retry_after {
+            Some(advertised) => format!(
+                "retry storm after 429/503 ignoring Retry-After: {retries} retries in a row, each sent at most {} ms after a {status} answer that set Retry-After: {} s; wait the advertised interval before retrying",
+                longest_gap.as_millis(),
+                advertised.as_secs()
+            ),
+            None => format!(
+                "immediate retry storm after 429/503 without backoff: {retries} retries in a row, each sent within {} ms of a {status} answer; honour Retry-After or back off exponentially",
+                THROTTLE_RETRY_WINDOW.as_millis()
+            ),
         };
         Some(TrafficFinding {
             kind: TrafficFindingKind::RetryStorm,
             severity: Severity::Warn,
-            detail: format!(
-                "immediate retry storm after 429/503 without backoff: {retries} retries in a row, each sent within {} ms of a {throttled} answer; honour Retry-After or back off exponentially",
-                THROTTLE_RETRY_WINDOW.as_millis()
-            ),
+            detail,
             evidence: Some(request_evidence(method, path_and_query)),
         })
     }
 
     /// Feeds the upstream latency of a 2xx response into its route template's window;
     /// returns a finding when the response took `LATENCY_FACTOR` times the template's
-    /// rolling median and at least `LATENCY_FLOOR`.
+    /// rolling median and at least `LATENCY_FLOOR`, or, on a template whose median is at
+    /// least `LOOPBACK_MEDIAN`, `LOOPBACK_FACTOR` times the median, at least
+    /// `LOOPBACK_FLOOR` and more than twice the window's p95. The second rule is what a fast
+    /// loopback service needs: an N+1 or a blocking call that turns 3 ms into 40 ms never
+    /// reaches 250 ms, and the p95 guard keeps a route whose normal tail is already that slow
+    /// quiet.
     pub fn latency(
         &self,
         method: &str,
@@ -240,7 +281,7 @@ impl TrafficLinter {
             .split_once('?')
             .map_or(path_and_query, |(path, _)| path);
         let key = template_key(method, path);
-        let (median_us, samples) = {
+        let regression = {
             let mut shard = self
                 .latencies
                 .get(shard_of(key))?
@@ -250,15 +291,29 @@ impl TrafficLinter {
         };
         let template = template(path);
         let ms = |us: u64| us as f64 / 1_000.0;
+        let Regression {
+            median_us,
+            p95_us,
+            samples,
+            loopback,
+        } = regression;
+        let mut detail = format!(
+            "{method} {template} answered in {:.1} ms, {:.1}x its rolling median of {:.1} ms over {samples} responses",
+            ms(upstream_us),
+            upstream_us as f64 / median_us.max(1) as f64,
+            ms(median_us),
+        );
+        if loopback {
+            detail.push_str(&format!(
+                " (p95 {:.1} ms); past the loopback threshold of {LOOPBACK_FACTOR}x and {} ms",
+                ms(p95_us),
+                LOOPBACK_FLOOR.as_millis()
+            ));
+        }
         Some(TrafficFinding {
             kind: TrafficFindingKind::LatencyRegression,
             severity: Severity::Warn,
-            detail: format!(
-                "{method} {template} answered in {:.1} ms, {:.1}x its rolling median of {:.1} ms over {samples} responses",
-                ms(upstream_us),
-                upstream_us as f64 / median_us.max(1) as f64,
-                ms(median_us),
-            ),
+            detail,
             evidence: Some(format!("{method} {template}")),
         })
     }
@@ -559,22 +614,37 @@ struct Throttle {
     throttled_at: Option<Instant>,
     /// Status of that answer, for the finding.
     status: u16,
-    /// Consecutive retries that arrived within the window of the previous throttled answer.
+    /// Non-zero `Retry-After` of that answer.
+    retry_after: Option<Duration>,
+    /// Consecutive retries that arrived too soon after the previous throttled answer.
     retries: usize,
+    /// Longest gap among those retries, for the finding.
+    longest_gap: Duration,
     reported: bool,
     last_seen: Instant,
 }
 
+/// A completed storm as the finding reports it.
+struct ThrottleStorm {
+    retries: usize,
+    status: u16,
+    /// The advertised interval the retries broke; `None` when the answer set none.
+    retry_after: Option<Duration>,
+    longest_gap: Duration,
+}
+
 impl ThrottleShard {
-    /// Retry count and throttled status when this exchange completes a storm.
     fn observe(
         &mut self,
         key: u64,
         arrived: Instant,
         answered: Instant,
         status: Option<u16>,
-    ) -> Option<(usize, u16)> {
+        retry_after: Option<Duration>,
+    ) -> Option<ThrottleStorm> {
         let throttled = status.filter(|status| matches!(status, 429 | 503));
+        // `Retry-After: 0` permits an immediate retry; only the window rule applies then.
+        let retry_after = retry_after.filter(|interval| !interval.is_zero());
         let Some(index) = self.requests.iter().position(|r| r.key == key) else {
             // Only a throttled answer opens a slot: an unthrottled request costs one scan.
             let status = throttled?;
@@ -582,7 +652,9 @@ impl ThrottleShard {
                 key,
                 throttled_at: Some(answered),
                 status,
+                retry_after,
                 retries: 0,
+                longest_gap: Duration::ZERO,
                 reported: false,
                 last_seen: answered,
             };
@@ -601,7 +673,7 @@ impl ThrottleShard {
         };
         self.requests
             .get_mut(index)?
-            .observe(arrived, answered, throttled)
+            .observe(arrived, answered, throttled, retry_after)
     }
 }
 
@@ -611,22 +683,30 @@ impl Throttle {
         arrived: Instant,
         answered: Instant,
         throttled: Option<u16>,
-    ) -> Option<(usize, u16)> {
+        retry_after: Option<Duration>,
+    ) -> Option<ThrottleStorm> {
         self.last_seen = self.last_seen.max(answered);
         let mut storm = None;
         if let Some(previous) = self.throttled_at {
+            // Judged against the answer this request retried, not the one it receives.
+            let too_soon = |gap: Duration| {
+                gap <= THROTTLE_RETRY_WINDOW || self.retry_after.is_some_and(|ra| gap < ra)
+            };
             match arrived.checked_duration_since(previous) {
-                Some(gap) if gap <= THROTTLE_RETRY_WINDOW => {
+                Some(gap) if too_soon(gap) => {
                     self.retries += 1;
+                    self.longest_gap = self.longest_gap.max(gap);
                     if self.retries >= THROTTLE_RETRY_THRESHOLD && !self.reported {
                         self.reported = true;
-                        storm = Some((self.retries, self.status));
+                        storm = Some(ThrottleStorm {
+                            retries: self.retries,
+                            status: self.status,
+                            retry_after: self.retry_after,
+                            longest_gap: self.longest_gap,
+                        });
                     }
                 }
-                Some(_) => {
-                    self.retries = 0;
-                    self.reported = false;
-                }
+                Some(_) => self.calm(),
                 None => {}
             }
         }
@@ -634,15 +714,33 @@ impl Throttle {
             Some(status) => {
                 self.throttled_at = Some(self.throttled_at.map_or(answered, |t| t.max(answered)));
                 self.status = status;
+                self.retry_after = retry_after;
             }
             None => {
                 self.throttled_at = None;
-                self.retries = 0;
-                self.reported = false;
+                self.retry_after = None;
+                self.calm();
             }
         }
         storm
     }
+
+    fn calm(&mut self) {
+        self.retries = 0;
+        self.longest_gap = Duration::ZERO;
+        self.reported = false;
+    }
+}
+
+/// `Retry-After` as delta-seconds (RFC 9110 10.2.3). An HTTP-date is not read: it needs a
+/// clock agreement with the server that a loopback audit cannot assume.
+pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = header(headers, &header::RETRY_AFTER)?;
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let secs = value.parse::<u64>().unwrap_or(MAX_RETRY_AFTER_SECS);
+    Some(Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS)))
 }
 
 // ---- latency regressions --------------------------------------------------------------
@@ -680,10 +778,17 @@ struct LatencyWindow {
     used: u64,
 }
 
+/// A sample judged against its template's window as it stood before the sample.
+struct Regression {
+    median_us: u64,
+    p95_us: u64,
+    samples: usize,
+    /// Only the loopback rule fired.
+    loopback: bool,
+}
+
 impl LatencyShard {
-    /// The window's median before this sample and the sample count it rests on, when the
-    /// sample is a regression against it.
-    fn observe(&mut self, key: u64, sample_us: u64) -> Option<(u64, usize)> {
+    fn observe(&mut self, key: u64, sample_us: u64) -> Option<Regression> {
         self.tick += 1;
         let tick = self.tick;
         let index = match self.routes.iter().position(|w| w.key == key) {
@@ -730,27 +835,45 @@ impl LatencyWindow {
         self.len = (self.len + 1).min(LATENCY_WINDOW);
     }
 
-    fn regression(&self, sample_us: u64) -> Option<(u64, usize)> {
-        let floor = u64::try_from(LATENCY_FLOOR.as_micros()).unwrap_or(u64::MAX);
-        if self.len < LATENCY_MIN_SAMPLES || sample_us < floor {
+    fn regression(&self, sample_us: u64) -> Option<Regression> {
+        let micros = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        if self.len < LATENCY_MIN_SAMPLES || sample_us < micros(LOOPBACK_FLOOR) {
             return None;
         }
-        let median = self.median()?;
-        (sample_us > median.saturating_mul(LATENCY_FACTOR)).then_some((median, self.len))
-    }
-
-    fn median(&self) -> Option<u64> {
+        // One sort on a stack copy serves both statistics; the ring itself stays in order.
         let mut sorted = self.samples;
         let window = sorted.get_mut(..self.len)?;
         window.sort_unstable();
-        let mid = window.len() / 2;
-        if window.len() % 2 == 1 {
-            window.get(mid).copied()
-        } else {
-            let (low, high) = (*window.get(mid - 1)?, *window.get(mid)?);
-            Some(low / 2 + high / 2 + (low % 2 + high % 2) / 2)
-        }
+        let median = median(window)?;
+        let p95 = nearest_rank(window, 95)?;
+        let general =
+            sample_us >= micros(LATENCY_FLOOR) && sample_us > median.saturating_mul(LATENCY_FACTOR);
+        let loopback = median >= micros(LOOPBACK_MEDIAN)
+            && sample_us >= median.saturating_mul(LOOPBACK_FACTOR)
+            && sample_us > p95.saturating_mul(2);
+        (general || loopback).then_some(Regression {
+            median_us: median,
+            p95_us: p95,
+            samples: self.len,
+            loopback: !general,
+        })
     }
+}
+
+fn median(sorted: &[u64]) -> Option<u64> {
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted.get(mid).copied()
+    } else {
+        let (low, high) = (*sorted.get(mid.checked_sub(1)?)?, *sorted.get(mid)?);
+        Some(low / 2 + high / 2 + (low % 2 + high % 2) / 2)
+    }
+}
+
+/// Nearest-rank percentile, the definition the burst statistics use.
+fn nearest_rank(sorted: &[u64], percentile: usize) -> Option<u64> {
+    let rank = (sorted.len() * percentile).div_ceil(100).max(1);
+    sorted.get(rank - 1).copied()
 }
 
 // ---- content decoding -----------------------------------------------------------------
@@ -759,11 +882,11 @@ impl LatencyWindow {
 pub enum Decoded<'a> {
     /// No coding, or only `identity`.
     Identity(&'a [u8]),
-    /// Inflated gzip, deflate or brotli, at most `MAX_DECODED_BYTES`.
+    /// Inflated gzip, deflate, brotli or zstd, at most `MAX_DECODED_BYTES`.
     Inflated(Vec<u8>),
-    /// A coding this build does not inflate (`zstd`, `compress`): headers only.
+    /// A coding this build does not inflate (`compress`, dictionary codings): headers only.
     Unsupported,
-    /// Declared gzip, deflate or br, but the bytes are not a valid stream of it.
+    /// Declared gzip, deflate, br or zstd, but the bytes are not a valid stream of it.
     Corrupt(&'static str),
     /// The inflated output passed `MAX_DECODED_BYTES`.
     OverLimit,
@@ -784,6 +907,7 @@ enum Coding {
     Gzip,
     Deflate,
     Brotli,
+    Zstd,
 }
 
 /// Undoes `Content-Encoding`, last applied coding first. An empty body is never inflated:
@@ -804,6 +928,8 @@ pub fn decode<'a>(headers: &HeaderMap, body: &'a [u8]) -> Decoded<'a> {
                 codings.push(Coding::Deflate);
             } else if token.eq_ignore_ascii_case("br") {
                 codings.push(Coding::Brotli);
+            } else if token.eq_ignore_ascii_case("zstd") {
+                codings.push(Coding::Zstd);
             } else {
                 return Decoded::Unsupported;
             }
@@ -853,6 +979,7 @@ fn inflate(coding: Coding, input: &[u8]) -> Result<Vec<u8>, Decoded<'static>> {
                 other => other,
             }
         }
+        Coding::Zstd => inflate_zstd(input, limit, &mut output).map(|()| output.len()),
     };
     match read {
         Ok(_) if output.len() > MAX_DECODED_BYTES => Err(Decoded::OverLimit),
@@ -861,8 +988,78 @@ fn inflate(coding: Coding, input: &[u8]) -> Result<Vec<u8>, Decoded<'static>> {
             Coding::Gzip => "gzip",
             Coding::Deflate => "deflate",
             Coding::Brotli => "br",
+            Coding::Zstd => "zstd",
         })),
     }
+}
+
+/// Every frame of a zstd stream in order (RFC 8878 3.1: a stream may hold several, and
+/// skippable frames between them), into `output` until it holds `limit` bytes. Each frame's
+/// window is read from its header and checked first; a declared checksum is verified.
+fn inflate_zstd(mut input: &[u8], limit: u64, output: &mut Vec<u8>) -> io::Result<()> {
+    let corrupt = || io::Error::from(io::ErrorKind::InvalidData);
+    while !input.is_empty() {
+        let magic = input
+            .get(..4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+            .ok_or_else(corrupt)?;
+        if ZSTD_SKIPPABLE.contains(&magic) {
+            let size = input
+                .get(4..8)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_le_bytes)
+                .ok_or_else(corrupt)?;
+            let end = usize::try_from(size)
+                .ok()
+                .and_then(|size| size.checked_add(8))
+                .ok_or_else(corrupt)?;
+            input = input.get(end..).ok_or_else(corrupt)?;
+            continue;
+        }
+        if magic != ZSTD_MAGIC || zstd_window(input).is_none_or(|window| window > ZSTD_MAX_WINDOW) {
+            return Err(corrupt());
+        }
+        let budget = limit.saturating_sub(u64::try_from(output.len()).unwrap_or(u64::MAX));
+        let mut frame = StreamingDecoder::new(&mut input).map_err(io::Error::other)?;
+        (&mut frame).take(budget).read_to_end(output)?;
+        if u64::try_from(output.len()).unwrap_or(u64::MAX) >= limit {
+            return Ok(());
+        }
+        let decoder = &frame.decoder;
+        let checksum_matches = match (
+            decoder.get_checksum_from_data(),
+            decoder.get_calculated_checksum(),
+        ) {
+            (Some(sent), Some(computed)) => sent == computed,
+            _ => true,
+        };
+        if !decoder.is_finished() || !checksum_matches {
+            return Err(corrupt());
+        }
+    }
+    Ok(())
+}
+
+/// Window size a zstd frame header declares (RFC 8878 3.1.1.1.2): from the window
+/// descriptor, or the frame content size for a single-segment frame. `None` for a header
+/// cut short.
+fn zstd_window(frame: &[u8]) -> Option<u64> {
+    let descriptor = *frame.get(4)?;
+    if descriptor & 0x20 == 0 {
+        let window = *frame.get(5)?;
+        let base = 1u64 << (10 + u32::from(window >> 3));
+        return Some(base + base / 8 * u64::from(window & 0x07));
+    }
+    let dictionary_bytes = [0, 1, 2, 4][usize::from(descriptor & 0x03)];
+    let size_bytes = [1, 2, 4, 8][usize::from(descriptor >> 6)];
+    let start = 5 + dictionary_bytes;
+    let field = frame.get(start..start + size_bytes)?;
+    let size = field
+        .iter()
+        .enumerate()
+        .fold(0u64, |size, (i, byte)| size | u64::from(*byte) << (8 * i));
+    Some(if size_bytes == 2 { size + 256 } else { size })
 }
 
 fn is_zlib_header(input: &[u8]) -> bool {
@@ -1780,15 +1977,15 @@ mod tests {
             ("access-control-allow-origin", "*"),
             ("access-control-allow-credentials", "true"),
         ];
-        let zstd = inspect_with(
+        let compress = inspect_with(
             "GET",
             "/api/items",
             200,
-            &[cors[0], cors[1], ("content-encoding", "zstd")],
-            b"\x28\xb5\x2f\xfd at x (/a.js:1:2)",
+            &[cors[0], cors[1], ("content-encoding", "compress")],
+            b"\x1f\x9d at x (/a.js:1:2)",
         );
         assert_eq!(
-            kinds(&zstd),
+            kinds(&compress),
             [(TrafficFindingKind::HeaderMisconfiguration, Severity::Warn)]
         );
         let corrupt = inspect_with(
@@ -1895,6 +2092,194 @@ mod tests {
         headers(&[("content-encoding", "br")])
     }
 
+    fn zstd(bytes: &[u8]) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(bytes, ruzstd::encoding::CompressionLevel::Fastest)
+    }
+
+    #[test]
+    fn zstd_bodies_are_inflated_under_the_same_cap() {
+        let trace = b"TypeError: Cannot read properties of null (reading 'trim')\n    at normalizeSku (/srv/app/checkout.js:42:17)";
+        let found = inspect_with(
+            "POST",
+            "/checkout",
+            500,
+            &[("content-type", "text/plain"), ("content-encoding", "zstd")],
+            &zstd(trace),
+        );
+        assert_eq!(
+            kinds(&found),
+            [(TrafficFindingKind::PassiveDisclosure, Severity::Fault)]
+        );
+        // `zstd, gzip`: zstd applied first, so gzip is undone first.
+        let stacked = gzip(&zstd(b"{\"items\":[]}"));
+        let layered = headers(&[("content-encoding", "ZSTD, gzip")]);
+        assert_eq!(
+            decode(&layered, &stacked).bytes(),
+            Some(&b"{\"items\":[]}"[..])
+        );
+
+        // Two frames with a skippable frame between them are one stream.
+        let zstd_only = headers(&[("content-encoding", "zstd")]);
+        let mut frames = zstd(b"[1,");
+        frames.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, b'x', b'y', b'z']);
+        frames.extend(zstd(b"2]"));
+        assert_eq!(decode(&zstd_only, &frames).bytes(), Some(&b"[1,2]"[..]));
+
+        let bomb = zstd(&vec![b' '; 2 * MAX_DECODED_BYTES]);
+        assert!(bomb.len() < 64 * 1024, "{} compressed bytes", bomb.len());
+        assert!(matches!(decode(&zstd_only, &bomb), Decoded::OverLimit));
+        let exact = zstd(&vec![b' '; MAX_DECODED_BYTES]);
+        assert_eq!(
+            decode(&zstd_only, &exact).bytes().map(<[u8]>::len),
+            Some(MAX_DECODED_BYTES)
+        );
+
+        // Cut short, followed by stray bytes, a wrong checksum, or a header asking for a
+        // 1 GiB window (exponent 20, past RFC 9659's 8 MiB): none is a stream a client takes.
+        let whole = zstd(trace);
+        let truncated = whole[..whole.len() / 2].to_vec();
+        let mut trailing = whole.clone();
+        trailing.extend_from_slice(b"tail");
+        let mut checksum = whole.clone();
+        if let Some(last) = checksum.last_mut() {
+            *last ^= 0xFF;
+        }
+        let wide = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0xA0, 0x01, 0x00, 0x00];
+        assert_eq!(zstd_window(&wide), Some(1 << 30));
+        for body in [truncated, trailing, checksum, wide] {
+            let found = inspect_with(
+                "GET",
+                "/api/items",
+                200,
+                &[("content-encoding", "zstd")],
+                &body,
+            );
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(
+                found[0].detail,
+                "Content-Encoding: zstd on a body that is not a valid zstd stream; clients fail to decode it"
+            );
+        }
+        // Single-segment headers declare their window through the content size.
+        assert_eq!(zstd_window(&[0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x09]), Some(9));
+        assert_eq!(
+            zstd_window(&[0x28, 0xB5, 0x2F, 0xFD, 0x60, 0x00, 0x01]),
+            Some(256 + 256)
+        );
+        assert_eq!(zstd_window(&[0x28, 0xB5, 0x2F, 0xFD, 0xA0]), None);
+    }
+
+    #[test]
+    fn retries_inside_retry_after_break_the_advertised_interval() {
+        let linter = TrafficLinter::default();
+        let base = Instant::now();
+        let retry_after = Some(Duration::from_secs(2));
+        // A client with a fixed 500 ms pause: past the 100 ms window, inside Retry-After.
+        let paced = |linter: &TrafficLinter, start: u64, pause: u64| {
+            (0..6u64)
+                .filter_map(|n| {
+                    let arrived = at(base, start + n * (pause + 5));
+                    linter
+                        .throttled_retry(
+                            arrived,
+                            arrived + Duration::from_millis(5),
+                            "POST",
+                            "/api/v1/quotes",
+                            Some(429),
+                            retry_after,
+                        )
+                        .map(|f| (n, f))
+                })
+                .collect::<Vec<_>>()
+        };
+        let found = paced(&linter, 0, 500);
+        assert_eq!(found.len(), 1, "one finding per storm");
+        let (n, finding) = &found[0];
+        assert_eq!(*n, THROTTLE_RETRY_THRESHOLD as u64);
+        assert_eq!(
+            finding.detail,
+            "retry storm after 429/503 ignoring Retry-After: 4 retries in a row, each sent at most 500 ms after a 429 answer that set Retry-After: 2 s; wait the advertised interval before retrying"
+        );
+        // Waiting out the advertised interval is compliant, however many retries it takes.
+        assert!(paced(&TrafficLinter::default(), 0, 2_000).is_empty());
+        // `Retry-After: 0` allows an immediate retry; the 500 ms pause is then a backoff.
+        let zero = TrafficLinter::default();
+        let quiet = (0..6u64).all(|n| {
+            let arrived = at(base, n * 505);
+            zero.throttled_retry(
+                arrived,
+                arrived + Duration::from_millis(5),
+                "POST",
+                "/api/v1/quotes",
+                Some(429),
+                Some(Duration::ZERO),
+            )
+            .is_none()
+        });
+        assert!(quiet);
+
+        assert_eq!(
+            retry_after_of(&[("retry-after", "120")]),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            retry_after_of(&[("retry-after", "99999999999")]),
+            Some(Duration::from_secs(MAX_RETRY_AFTER_SECS))
+        );
+        assert_eq!(
+            retry_after_of(&[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")]),
+            None
+        );
+        assert_eq!(retry_after_of(&[("retry-after", "-1")]), None);
+        assert_eq!(retry_after_of(&[]), None);
+    }
+
+    fn retry_after_of(pairs: &[(&'static str, &'static str)]) -> Option<Duration> {
+        retry_after(&headers(pairs))
+    }
+
+    #[test]
+    fn loopback_regressions_below_the_general_floor() {
+        let us = |n: u64| n * 100;
+        // A query-backed route: 2.8 to 3.4 ms.
+        let linter = TrafficLinter::default();
+        for n in 0..15u64 {
+            assert!(linter
+                .latency("GET", &format!("/api/orders/{n}"), 200, us(28 + n % 7))
+                .is_none());
+        }
+        let found = linter
+            .latency("GET", "/api/orders/78", 200, us(420))
+            .expect("loopback regression");
+        assert_eq!(found.kind, TrafficFindingKind::LatencyRegression);
+        assert_eq!(
+            found.detail,
+            "GET /api/orders/{id} answered in 42.0 ms, 13.5x its rolling median of 3.1 ms over 15 responses (p95 3.4 ms); past the loopback threshold of 8x and 35 ms"
+        );
+        // 30 ms is 9x the median but inside two ticks of the Windows timer.
+        assert!(linter
+            .latency("GET", "/api/orders/77", 200, us(300))
+            .is_none());
+
+        // An in-memory route whose median is jitter is held to the general rule.
+        let trivial = TrafficLinter::default();
+        for _ in 0..16 {
+            assert!(trivial.latency("GET", "/api/health", 200, us(4)).is_none());
+        }
+        assert!(trivial
+            .latency("GET", "/api/health", 200, us(400))
+            .is_none());
+        // A route whose normal tail already reaches 40 ms is not reported at 45 ms.
+        let bimodal = TrafficLinter::default();
+        for n in 0..16u64 {
+            let sample = if n % 4 == 0 { us(400) } else { us(30) };
+            assert!(bimodal.latency("GET", "/api/search", 200, sample).is_none());
+        }
+        assert!(bimodal
+            .latency("GET", "/api/search", 200, us(450))
+            .is_none());
+    }
+
     #[test]
     fn retries_that_ignore_a_throttled_answer() {
         let linter = TrafficLinter::default();
@@ -1911,6 +2296,7 @@ mod tests {
                             "POST",
                             path,
                             Some(status),
+                            None,
                         )
                         .map(|f| (n, f))
                 })
@@ -1939,7 +2325,7 @@ mod tests {
         for pause in [120u64, 240, 480, 960, 1_920] {
             let answered = arrived + Duration::from_millis(5);
             assert!(linter
-                .throttled_retry(arrived, answered, "GET", "/api/v1/cart", Some(429))
+                .throttled_retry(arrived, answered, "GET", "/api/v1/cart", Some(429), None)
                 .is_none());
             arrived = answered + Duration::from_millis(pause);
         }
@@ -1959,6 +2345,7 @@ mod tests {
                     "PUT",
                     "/api/v1/profile",
                     Some(*status),
+                    None,
                 )
             })
             .collect();
@@ -1968,7 +2355,14 @@ mod tests {
         let burst = TrafficLinter::default();
         let concurrent = (0..8u64)
             .filter_map(|n| {
-                burst.throttled_retry(base, at(base, 50 + n), "POST", "/api/v1/redeem", Some(429))
+                burst.throttled_retry(
+                    base,
+                    at(base, 50 + n),
+                    "POST",
+                    "/api/v1/redeem",
+                    Some(429),
+                    None,
+                )
             })
             .count();
         assert_eq!(concurrent, 0);

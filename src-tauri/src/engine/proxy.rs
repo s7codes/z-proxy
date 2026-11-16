@@ -378,6 +378,7 @@ impl ProxyContext {
     fn finish(&self, mut record: Exchange, reply: Reply) -> Response {
         record.status = Some(reply.status.as_u16());
         record.response_bytes = byte_len(reply.body.len());
+        record.retry_after = linter::retry_after(&reply.headers);
         self.publish(record);
         reply.into_response()
     }
@@ -401,6 +402,7 @@ impl ProxyContext {
         record.fault = Some(FaultKind::PartialBodyDrop);
         record.status = Some(reply.status.as_u16());
         record.response_bytes = byte_len(kept);
+        record.retry_after = linter::retry_after(&reply.headers);
         self.publish(record);
 
         let Reply {
@@ -445,6 +447,7 @@ impl ProxyContext {
             &record.method,
             &record.path,
             record.status,
+            record.retry_after,
         ) {
             record.findings.push(storm);
         }
@@ -497,6 +500,8 @@ struct Exchange {
     method: String,
     path: String,
     status: Option<u16>,
+    /// `Retry-After` the client received with `status`, for the throttled-retry check.
+    retry_after: Option<Duration>,
     injected_delay_us: u64,
     upstream_latency_us: Option<u64>,
     fault: Option<FaultKind>,
@@ -568,6 +573,7 @@ async fn proxy_handler(
             .path_and_query()
             .map_or_else(|| "/".to_owned(), |pq| pq.as_str().to_owned()),
         status: None,
+        retry_after: None,
         injected_delay_us: 0,
         upstream_latency_us: None,
         fault: None,
@@ -1451,6 +1457,54 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(throttle_storms(h.next_exchange().await), 0);
         }
+        h.manager.stop().await;
+    }
+
+    /// An injected 429 carries `Retry-After: 1`. A client pausing 150 ms between attempts
+    /// backs off past the immediate-retry window but still retries inside the advertised
+    /// second, and the finding names the interval it broke.
+    #[tokio::test]
+    async fn retries_inside_an_injected_retry_after_are_reported() {
+        use crate::engine::types::TrafficFindingKind;
+
+        let mut h = Harness::new().await;
+        let proxy = h.start().await;
+        h.arm(FaultProfile {
+            status_mutation: StatusMutation::TooManyRequests,
+            mutation_rate: 100,
+            ..FaultProfile::default()
+        })
+        .await;
+        for _ in 0..5 {
+            let response = h
+                .client
+                .post(format!("http://{proxy}/api/v1/quotes"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let mut storms = Vec::new();
+        for _ in 0..5 {
+            match h.next_exchange().await {
+                TelemetryEvent::ProxyExchange { findings, .. } => storms.extend(
+                    findings
+                        .into_iter()
+                        .filter(|f| f.kind == TrafficFindingKind::RetryStorm)
+                        .map(|f| f.detail),
+                ),
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(storms.len(), 1, "{storms:?}");
+        assert!(
+            storms[0].starts_with("retry storm after 429/503 ignoring Retry-After: 4 retries in a row")
+                && storms[0].ends_with("after a 429 answer that set Retry-After: 1 s; wait the advertised interval before retrying"),
+            "{}",
+            storms[0]
+        );
         h.manager.stop().await;
     }
 
