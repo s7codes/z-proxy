@@ -244,12 +244,12 @@ function ExportMenu({
   );
 }
 
-/** Two offset frames: a request and its perturbed copy. Drawn with currentColor only. */
+/** Same geometry as src-tauri/icons/app-icon.svg without the tile; the break is the injected fault. */
 function Logo() {
   return (
-    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden className="text-fg-bright">
-      <rect x="1.5" y="1.5" width="9" height="9" rx="1" fill="none" stroke="currentColor" strokeWidth="1.5" />
-      <rect x="5.5" y="5.5" width="9" height="9" rx="1" fill="currentColor" fillOpacity="0.25" stroke="currentColor" strokeWidth="1.5" />
+    <svg width="16" height="16" viewBox="280 272 464 480" aria-hidden className="text-fg-bright">
+      <path fill="currentColor" d="M296 288H728V368L603.56 480H491.56L616 368H296Z" />
+      <path fill="currentColor" d="M420.44 544H532.44L408 656H728V736H296V656Z" />
     </svg>
   );
 }

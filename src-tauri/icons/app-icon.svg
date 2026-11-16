@@ -1,11 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-  <rect width="1024" height="1024" rx="112" fill="#090A0D"/>
-  <rect x="40" y="40" width="944" height="944" rx="80" fill="none" stroke="#1F2430" stroke-width="16"/>
-  <g fill="none" stroke-linecap="square" stroke-width="56">
-    <path d="M200 512 H404" stroke="#64748B"/>
-    <path d="M404 512 L476 364 L548 660 L620 512" stroke="#EF4444"/>
-    <path d="M620 512 H824" stroke="#10B981"/>
+  <rect width="1024" height="1024" rx="200" fill="#1C1C1C"/>
+  <rect x="6" y="6" width="1012" height="1012" rx="194" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="12"/>
+  <g fill="#F2F2F2">
+    <path d="M296 288H728V368L603.56 480H491.56L616 368H296Z"/>
+    <path d="M420.44 544H532.44L408 656H728V736H296V656Z"/>
   </g>
-  <rect x="160" y="472" width="80" height="80" fill="#101217" stroke="#64748B" stroke-width="16"/>
-  <rect x="784" y="472" width="80" height="80" fill="#101217" stroke="#10B981" stroke-width="16"/>
 </svg>
