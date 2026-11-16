@@ -2,11 +2,15 @@
 //!
 //! Lexical, like the extractors. Each route gets the source regions of its handler: the
 //! declaration up to the next route or top-level declaration, the bodies of handlers it
-//! names that are defined in the same file and, for JavaScript, the bodies of handlers it
-//! imports from relative modules inside the scan root. Five checks then run over the
-//! comment-masked text of those regions. Every check needs positive evidence (a body read,
-//! a collection query, a dropped call, a second write, an interpolated query), so a
-//! handler the pass cannot resolve yields no risk rather than a guess.
+//! names that are defined in the same file (functions, and methods or arrow properties of
+//! classes, `new` instances and object literals) and, for JavaScript, the bodies of handlers
+//! it imports from modules inside the scan root: relative specifiers, `tsconfig.json` /
+//! `jsconfig.json` `paths` aliases and `baseUrl` specifiers, Next.js re-exports
+//! (`export { POST } from "@/handlers/orders"`) and assigned exports
+//! (`export const POST = withAuth(create)`). Five checks then run over the comment-masked
+//! text of those regions. Every check needs positive evidence (a body read, a collection
+//! query, a dropped call, an unguarded write, an interpolated query), so a handler the pass
+//! cannot resolve yields no risk rather than a guess.
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -16,6 +20,7 @@ use regex::Regex;
 
 use super::lex::{self, Lang, Source};
 use super::routes::{compile, relative, RawRoute, MAX_SOURCE_BYTES};
+use super::tsconfig::PathAliases;
 use crate::engine::types::{RouteMethod, RouteRisk, RouteRiskKind, RouteSource};
 
 /// A handler region never extends past this many lines, so a route at the end of a long
@@ -75,15 +80,72 @@ static WRAPPED_HANDLER: LazyLock<Option<Regex>> = LazyLock::new(|| {
 
 // ---- imports --------------------------------------------------------------------------
 
-/// `import x, { a, b as c } from "./m"`, `import * as ns from "../m"`; relative only.
+/// `import x, { a, b as c } from "m"`, `import * as ns from "m"`. Any specifier: whether it
+/// names a project file (relative, `paths` alias, `baseUrl`) is decided on resolution.
 static ESM_IMPORT: LazyLock<Option<Regex>> = LazyLock::new(|| {
-    compile(r#"(?m)^[ \t]*import[ \t]+([^;'"`]+?)[ \t]+from[ \t]*['"](\.{1,2}/[^'"\n]+)['"]"#)
+    compile(r#"(?m)^[ \t]*import[ \t]+([^;'"`]+?)[ \t]+from[ \t]*['"]([^'"\n]+)['"]"#)
 });
-/// `const x = require("./m")`, `const { a, b: c } = require("./m")`, `require("./m").a`.
+/// `const x = require("m")`, `const { a, b: c } = require("m")`, `require("m").a`.
 static CJS_REQUIRE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     compile(
-        r#"(?m)^[ \t]*(?:const|let|var)[ \t]+(\{[^}]*\}|[A-Za-z_$][\w$]*)[ \t]*=[ \t]*require\(\s*['"](\.{1,2}/[^'"\n]+)['"]\s*\)(?:\.([A-Za-z_$][\w$]*))?"#,
+        r#"(?m)^[ \t]*(?:const|let|var)[ \t]+(\{[^}]*\}|[A-Za-z_$][\w$]*)[ \t]*=[ \t]*require\(\s*['"]([^'"\n]+)['"]\s*\)(?:\.([A-Za-z_$][\w$]*))?"#,
     )
+});
+/// `export { POST, x as PUT } from "m"`; the list may span lines.
+static EXPORT_FROM: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(r#"(?-u:\b)export[ \t]*\{([^}]*)\}[ \t]*from[ \t]*['"]([^'"\n]+)['"]"#)
+});
+static EXPORT_LIST: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile(r"(?-u:\b)export[ \t]*\{([^}]*)\}"));
+/// `[export] const NAME = <expression>` up to the end of the line.
+static ASSIGNMENT: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(
+        r"(?m)^[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+([A-Za-z_$][\w$]*)[ \t]*(?::[^=\n]+)?=[ \t]*([^;\n]+)",
+    )
+});
+/// `wrapper(handler, ...)`: the first argument when it is a plain reference.
+static WRAPPED_REFERENCE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(r"^[A-Za-z_$][\w$.]*\s*\(\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*[,)]")
+});
+
+// ---- classes, instances and object literals --------------------------------------------
+
+/// `class Name ... {`; the match ends at the body's `{`.
+static CLASS_DECL: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(
+        r"(?m)^[ \t]*(?:export[ \t]+)?(?:default[ \t]+)?(?:abstract[ \t]+)?class[ \t]+([A-Za-z_$][\w$]*)[^{\n]*\{",
+    )
+});
+/// `const name = {`; the match ends at the literal's `{`.
+static OBJECT_DECL: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(
+        r"(?m)^[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+([A-Za-z_$][\w$]*)[ \t]*(?::[^=\n]+)?=[ \t]*\{",
+    )
+});
+/// `const name = new Class(`; group 2 may be namespaced (`new controllers.Orders(`).
+static INSTANCE_DECL: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(
+        r"(?m)^[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+([A-Za-z_$][\w$]*)[ \t]*(?::[^=\n]+)?=[ \t]*new[ \t]+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
+    )
+});
+/// The default export as a container: a class (ends at its `{`), a `new` instance (group 1),
+/// an object literal (ends at its `{`), or a name (group 2).
+static DEFAULT_CONTAINER: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(concat!(
+        r"(?m)^(?:export[ \t]+default|module\.exports[ \t]*=)[ \t]*",
+        r"(?:(?:abstract[ \t]+)?class(?-u:\b)[^{\n]*\{|new[ \t]+([A-Za-z_$][\w$]*)|\{|([A-Za-z_$][\w$]*)[ \t]*;?[ \t]*\r?$)",
+    ))
+});
+/// A method (ends at its body's `{`), or a property holding a function or arrow (ends at
+/// `{` or `=>`), at the start of a line inside a class body or object literal. Parameter
+/// lists may span lines.
+static MEMBER_DECL: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(concat!(
+        r"(?m)^[ \t]*(?:(?:public|private|protected|static|readonly|override|async)[ \t]+)*\*?[ \t]*",
+        r"([A-Za-z_$][\w$]*)[ \t]*(?:<[^>\n]*>)?[ \t]*",
+        r"(?:\([^)]*\)[ \t]*(?::[^{\n]+)?\{",
+        r"|[:=][ \t]*(?:async[ \t]+)?(?:function(?-u:\b)[^{\n]*\{|\([^)]*\)[ \t]*(?::[^=\n]+)?=>|[A-Za-z_$][\w$]*[ \t]*=>))",
+    ))
 });
 /// A default export defined in place, or naming a declaration (group 1).
 static DEFAULT_EXPORT: LazyLock<Option<Regex>> = LazyLock::new(|| {
@@ -94,16 +156,20 @@ static DEFAULT_EXPORT: LazyLock<Option<Regex>> = LazyLock::new(|| {
 
 // ---- unvalidated mutation -------------------------------------------------------------
 
+/// Express / Koa / Next body reads, and Hono's `c.req` readers. `c.req.valid(...)` returns
+/// what a validator middleware already checked; it counts as a read and as validation.
 static JS_BODY_READ: LazyLock<Option<Regex>> = LazyLock::new(|| {
-    compile(
-        r"(?-u:\b)(?:req|request|ctx\.request)\.body(?-u:\b)|\.(?:json|formData)\(\s*\)|(?-u:\b)c\.req\.parseBody\(",
-    )
+    compile(concat!(
+        r"(?-u:\b)(?:req|request|ctx\.request)\.body(?-u:\b)|\.(?:json|formData)\(\s*\)",
+        r"|(?-u:\b)(?:c|ctx|context)\.req\.(?:parseBody|valid|text|arrayBuffer)\(",
+    ))
 });
 static JS_VALIDATOR: LazyLock<Option<Regex>> = LazyLock::new(|| {
     compile(concat!(
         r"(?-u:\b)z\.[a-z]+\(|(?-u:\b)(?:zod|valibot|yup|ajv|Ajv|superstruct|class-validator)(?-u:\b)",
         r"|(?-u:\b)(?:Joi|v)\.(?:object|parse)\(|(?-u:\b)Type\.Object\(|(?-u:\b)schema\s*:",
         r"|(?-u:\b)(?:validate|validator|validation|validationResult)|[a-z]Validat(?:e|or|ion)",
+        r"|\.req\.valid\(",
     ))
 });
 /// `Schema.parse(` and friends; the receiver decides whether it is a schema.
@@ -163,9 +229,11 @@ static SQL_BOUND: LazyLock<Option<Regex>> = LazyLock::new(|| {
 
 // ---- floating async -------------------------------------------------------------------
 
+/// A statement-level call; the receiver chain may break across lines (`prisma.order` /
+/// `  .create(`), so group 1 can hold whitespace.
 static JS_FLOATING: LazyLock<Option<Regex>> = LazyLock::new(|| {
     compile(concat!(
-        r"(?m)^[ \t]*((?:this\.)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)[ \t]*\.[ \t]*",
+        r"(?m)^[ \t]*((?:this\.)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*",
         r"(save|create|createMany|update|updateMany|upsert|delete|deleteMany|insert|insertOne|insertMany|updateOne|deleteOne|destroy|execute|query|publish|sendMail|enqueue|commit)[ \t]*\(",
         r"|(?m)^[ \t]*()(fetch)[ \t]*\(",
     ))
@@ -211,28 +279,63 @@ const ASYNC_WRAPPERS: [&str; 5] = [
 // ---- non-atomic multi-write -----------------------------------------------------------
 
 /// A write call on a receiver chain, optionally through one call (`db.collection("o")`);
-/// group 1 is the receiver, group 2 the method, and the match ends at the method's `(`.
+/// group 1 is the receiver, group 2 the method, and the match ends at the method's `(`. The
+/// chain may break across lines (`prisma.order` / `  .create(`), so group 1 can hold
+/// whitespace.
 static WRITE_CALL: LazyLock<Option<Regex>> = LazyLock::new(|| {
     compile(concat!(
-        r"((?:this\.)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)(?:\([^()\n]*\))?[ \t]*\.[ \t]*",
+        r"((?:this\.)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)(?:\s*\([^()\n]*\))?\s*\.\s*",
         r"(create|createMany|update|updateMany|upsert|delete|deleteMany|insert|insertOne|insertMany|updateOne|deleteOne|replaceOne|save|destroy|execute|Exec|ExecContext|Create|Save|Delete|Update|Updates|UpdateColumn|UpdateColumns)[ \t]*\(",
     ))
 });
 static SQL_WRITE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     compile(r#"(?i)(?-u:\b)(?:insert\s+into|delete\s+from|update\s+[\w."`\[\]]+\s+set)(?-u:\b)"#)
 });
-/// Code that opens or joins a transaction: Prisma, Knex, Sequelize, TypeORM, Drizzle,
-/// Mongoose sessions, GORM, database/sql, sqlx, Diesel, SeaORM, or a `tx` handle in use.
-static TX_MARKER: LazyLock<Option<Regex>> = LazyLock::new(|| {
+/// A call whose arguments run inside a transaction: Prisma `$transaction`, Knex, Sequelize,
+/// TypeORM, Drizzle and Mongoose `transaction` / `withTransaction`, GORM `Transaction`,
+/// Diesel and SeaORM `transaction::<..>`. Without arguments it returns a handle instead.
+static TX_CALL: LazyLock<Option<Regex>> = LazyLock::new(|| {
     compile(concat!(
-        r"\$transaction|@Transactional",
-        r"|(?-u:\b)(?:transaction|withTransaction|startTransaction|Transaction|BeginTx)\s*(?:::\s*<[^>\n]*>\s*)?\(",
-        r"|(?-u:\b)(?:Begin|begin)\s*\(\s*\)",
-        r"|(?-u:\b)(?:tx|trx|txn)\s*\.",
+        r"\$transaction\s*\(",
+        r"|(?-u:\b)(?:transaction|withTransaction|runInTransaction|Transaction)\s*(?:::\s*<[^>\n]*>\s*)?\(",
     ))
 });
+/// A handle-style begin; writes after it in the same region are taken to use the handle.
+static TX_BEGIN: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(
+        r"(?-u:\b)(?:begin|Begin|BeginTx|beginTransaction|startTransaction|start_transaction)\s*\(",
+    )
+});
+/// A transaction handle among a write's arguments: `.execute(&mut *tx)`,
+/// `Model.create(row, { transaction: t })`.
+static TX_HANDLE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile(r"(?-u:\b)(?:tx|trx|txn)(?-u:\b)|(?-u:\b)transaction\s*:"));
+/// The call a SQL string is passed to runs on a handle: `tx.query(`.
+static TX_RECEIVER: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(r"(?-u:\b)(?:tx|trx|txn|transaction)\s*\.\s*[A-Za-z_$][\w$]*\s*\(\s*$")
+});
+/// Receiver roots that are transaction handles (`tx.order.create(`). A model that happens to
+/// be called `transaction` (`prisma.transaction.create(`) has another root.
+const TX_ROOTS: [&str; 4] = ["tx", "trx", "txn", "transaction"];
+/// A decorator or attribute that wraps the whole handler in a transaction.
+static TX_DECORATOR: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile(r"@Transactional|#\[\s*transactional"));
 static SQL_TX: LazyLock<Option<Regex>> =
     LazyLock::new(|| compile(r"(?-u:\b)(?:BEGIN|START TRANSACTION)(?-u:\b)"));
+/// Loop headers; the match ends at the `(` of the condition or callback, or at the body's
+/// `{`. The first group that took part names the loop.
+static JS_LOOP: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(
+        r"(?-u:\b)(for(?:[ \t]+await)?)[ \t]*\(|(?-u:\b)(while)[ \t]*\(|(?-u:\b)(do)[ \t]*\{|\.\s*(forEach|map|flatMap)\s*\(",
+    )
+});
+static RUST_LOOP: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile(
+        r"(?-u:\b)(for)[ \t]+[^{};]+?[ \t]+in[ \t]+[^{;]+\{|(?-u:\b)(while)[ \t]+[^{;]+\{|(?-u:\b)(loop)[ \t]*\{|\.\s*(for_each|try_for_each)\s*\(",
+    )
+});
+static GO_LOOP: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile(r"(?m)(?-u:\b)(for)(?:[ \t]+[^{\n]*)?[ \t]*\{"));
 /// Receiver segments that hold request, response or in-memory state, never a database.
 const NON_DB_SEGMENTS: [&str; 18] = [
     "searchParams",
@@ -305,14 +408,28 @@ pub struct Project<'p> {
     /// The nearest `package.json` declares Express 5, which forwards a rejected handler
     /// promise to the error middleware by itself.
     pub express_native_async: bool,
+    /// `paths` / `baseUrl` of the nearest `tsconfig.json` or `jsconfig.json`.
+    pub aliases: Option<&'p PathAliases>,
 }
 
 impl Project<'_> {
-    /// The file a relative specifier names: as written, with each JavaScript extension, or
-    /// as a directory index. A `.js` specifier also tries the TypeScript source beside it
-    /// (`./orders.js` compiled from `./orders.ts`). `None` outside the scan root.
+    /// The file a specifier names: relative to the audited file, else through the config's
+    /// `paths` and `baseUrl`. A package name that no alias covers resolves to nothing.
     fn resolve(&self, spec: &str) -> Option<PathBuf> {
-        let base = self.dir.join(spec);
+        if spec.starts_with('.') {
+            return self.probe(&self.dir.join(spec));
+        }
+        self.aliases?
+            .candidates(spec)
+            .iter()
+            .find_map(|base| self.probe(base))
+    }
+
+    /// `base` as written, with each JavaScript extension, or as a directory index. A `.js`
+    /// path also tries the TypeScript source beside it (`./orders.js` compiled from
+    /// `./orders.ts`). `None` outside the scan root.
+    fn probe(&self, base: &Path) -> Option<PathBuf> {
+        let base = base.to_path_buf();
         let extension = base
             .extension()
             .and_then(|ext| ext.to_str())
@@ -368,6 +485,21 @@ enum Export {
 enum Target {
     Default,
     Named(String),
+    /// `member` of the class, `new` instance or object literal the module declares as
+    /// `container`, or of its default export when `None`.
+    Member {
+        container: Option<String>,
+        member: String,
+    },
+}
+
+/// A handler a route names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reference {
+    /// As written in this file: a declaration, a member (`controller.create`) or an import.
+    Name(String),
+    /// A re-export: module specifier and the export there.
+    Module { spec: String, target: Target },
 }
 
 #[derive(Debug)]
@@ -486,14 +618,27 @@ fn esm_bindings(clause: &str, module: &str, out: &mut Vec<Binding>) {
 }
 
 /// Module specifier and export a handler reference (`create`, `orders.create`) points at.
+/// A member of a whole-module import is that module's named export; a member of a default
+/// or named import belongs to the class instance or object literal exported under it.
 fn import_target<'b>(bindings: &'b [Binding], reference: &str) -> Option<(&'b str, Target)> {
-    match reference.split_once('.') {
-        Some((head, tail)) => {
-            let binding = bindings.iter().find(|b| b.local == head)?;
-            Some((
-                binding.module.as_str(),
-                Target::Named(last_segment(tail, ".").to_owned()),
-            ))
+    match reference.rsplit_once('.') {
+        Some((head, member)) => {
+            let root = head.split('.').next().unwrap_or(head);
+            let binding = bindings.iter().find(|b| b.local == root)?;
+            let member = member.to_owned();
+            let target = match &binding.export {
+                _ if head.contains('.') => Target::Named(member),
+                Export::Module => Target::Named(member),
+                Export::Default => Target::Member {
+                    container: None,
+                    member,
+                },
+                Export::Named(name) => Target::Member {
+                    container: Some(name.clone()),
+                    member,
+                },
+            };
+            Some((binding.module.as_str(), target))
         }
         None => {
             let binding = bindings.iter().find(|b| b.local == reference)?;
@@ -506,6 +651,65 @@ fn import_target<'b>(bindings: &'b [Binding], reference: &str) -> Option<(&'b st
     }
 }
 
+/// Module and container of a class a file imports, for the members of its `new` instances:
+/// `Orders` from `import { Orders }` is the named export, from `import Orders` the default
+/// one, and `ns.Orders` from `import * as ns` the named export of that module.
+fn class_import<'b>(bindings: &'b [Binding], class: &str) -> Option<(&'b str, Option<String>)> {
+    match class.split_once('.') {
+        Some((namespace, name)) => {
+            let binding = bindings
+                .iter()
+                .find(|b| b.local == namespace && b.export == Export::Module)?;
+            Some((binding.module.as_str(), Some(name.to_owned())))
+        }
+        None => {
+            let binding = bindings.iter().find(|b| b.local == class)?;
+            let container = match &binding.export {
+                Export::Named(name) => Some(name.clone()),
+                Export::Default | Export::Module => None,
+            };
+            Some((binding.module.as_str(), container))
+        }
+    }
+}
+
+/// The name an export list (`GET, create as POST, type T`) binds to `exported`.
+fn exported_as<'l>(list: &'l str, exported: &str) -> Option<&'l str> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty() && !item.starts_with("type "))
+        .find_map(|item| {
+            let (local, name) = item
+                .split_once(" as ")
+                .map_or((item, item), |(local, name)| (local.trim(), name.trim()));
+            (name == exported).then_some(local)
+        })
+}
+
+/// The handler an assigned expression stands for: a plain reference (`create`,
+/// `orders.create`) or the first argument of a wrapper call (`withAuth(create)`). `None`
+/// for a function written in place.
+fn wrapped_reference(expression: &str) -> Option<String> {
+    let expression = expression.trim();
+    if expression.starts_with("async")
+        || expression.starts_with("function")
+        || expression.contains("=>")
+    {
+        return None;
+    }
+    if expression
+        .split('.')
+        .all(|segment| is_js_identifier(segment.trim()))
+    {
+        return Some(expression.replace(char::is_whitespace, ""));
+    }
+    WRAPPED_REFERENCE
+        .as_ref()?
+        .captures(expression)?
+        .get(1)
+        .map(|m| m.as_str().to_owned())
+}
+
 fn is_js_identifier(text: &str) -> bool {
     let mut chars = text.chars();
     chars
@@ -515,8 +719,8 @@ fn is_js_identifier(text: &str) -> bool {
 }
 
 /// Annotates `routes` with the risks found in their handlers. With a `project`, handlers a
-/// JavaScript file imports from relative modules are read and audited as well; their
-/// evidence carries the module's path.
+/// JavaScript file imports or re-exports from modules inside the scan root are read and
+/// audited as well; their evidence carries the module's path.
 pub fn annotate(
     source: &Source,
     lang: Lang,
@@ -528,40 +732,32 @@ pub fn annotate(
     }
     let native_async = project.is_some_and(|p| p.express_native_async);
     let home = FileContext::new(source, lang, routes, None, native_async);
+    let bindings = match lang {
+        Lang::Js => import_bindings(source),
+        Lang::Rust | Lang::Go => Vec::new(),
+    };
 
     // Every route's imported handlers are resolved first, so a module shared by several
     // routes is read once.
     let mut wanted: Vec<Vec<(usize, Target)>> = vec![Vec::new(); routes.len()];
     let mut paths: Vec<PathBuf> = Vec::new();
     if let (Some(project), Lang::Js) = (project, lang) {
-        let bindings = import_bindings(source);
-        if !bindings.is_empty() {
-            for (index, route) in routes.iter().enumerate() {
-                let line = usize::try_from(route.line).unwrap_or(0);
-                for reference in home.named_handlers(route, line) {
-                    let member_of_import = reference
-                        .split_once('.')
-                        .is_some_and(|(head, _)| bindings.iter().any(|b| b.local == head));
-                    if !member_of_import && home.defined(&reference, line).is_some() {
-                        continue;
+        for (index, route) in routes.iter().enumerate() {
+            let line = usize::try_from(route.line).unwrap_or(0);
+            for (spec, target) in home.imported_targets(route, line, &bindings) {
+                let Some(path) = project.resolve(&spec) else {
+                    continue;
+                };
+                let module = match paths.iter().position(|known| *known == path) {
+                    Some(module) => module,
+                    None if paths.len() < MAX_IMPORTED_MODULES => {
+                        paths.push(path);
+                        paths.len() - 1
                     }
-                    let Some((spec, target)) = import_target(&bindings, &reference) else {
-                        continue;
-                    };
-                    let Some(path) = project.resolve(spec) else {
-                        continue;
-                    };
-                    let module = match paths.iter().position(|known| *known == path) {
-                        Some(module) => module,
-                        None if paths.len() < MAX_IMPORTED_MODULES => {
-                            paths.push(path);
-                            paths.len() - 1
-                        }
-                        None => continue,
-                    };
-                    if let Some(slot) = wanted.get_mut(index) {
-                        slot.push((module, target));
-                    }
+                    None => continue,
+                };
+                if let Some(slot) = wanted.get_mut(index) {
+                    slot.push((module, target));
                 }
             }
         }
@@ -580,13 +776,12 @@ pub fn annotate(
         .collect();
 
     for (index, route) in routes.iter_mut().enumerate() {
-        let mut regions = home.handler_regions(route);
+        let mut regions = home.handler_regions(route, &bindings);
         for (module, target) in wanted.get(index).into_iter().flatten() {
             let Some(Some(ctx)) = contexts.get(*module) else {
                 continue;
             };
-            if let Some(line) = ctx.export_line(target) {
-                let range = ctx.region(line);
+            if let Some(range) = ctx.export_region(target) {
                 let known = regions
                     .iter()
                     .any(|r| std::ptr::eq(r.ctx, ctx) && r.range == range);
@@ -597,6 +792,43 @@ pub fn annotate(
         }
         route.risks = audit(&home, route, &regions);
     }
+}
+
+/// Where a class body or object literal sits, for member lookups.
+enum Container {
+    Body(Range<usize>),
+    Name(String),
+}
+
+/// The transactions that cover writes in one region.
+#[derive(Default)]
+struct TxScope {
+    /// A transactional decorator or attribute wraps the whole handler.
+    whole: bool,
+    /// Argument spans of transaction calls (`$transaction(...)`, `db.transaction(cb)`).
+    calls: Vec<Range<usize>>,
+    /// Earliest handle-style begin; writes after it are taken to run on the handle.
+    begun: Option<usize>,
+}
+
+impl TxScope {
+    fn begin(&mut self, at: usize) {
+        self.begun = Some(self.begun.map_or(at, |begun| begun.min(at)));
+    }
+}
+
+/// A database write, labelled for the risk detail.
+struct WriteSite {
+    at: usize,
+    label: String,
+    /// Runs on a transaction handle: its receiver, or the call it is passed to, is one, or
+    /// one is among its arguments.
+    handle: bool,
+}
+
+struct Loop {
+    body: Range<usize>,
+    kind: &'static str,
 }
 
 struct FileContext<'a> {
@@ -610,6 +842,14 @@ struct FileContext<'a> {
     declarations: Vec<(String, usize)>,
     /// Line of the module's default export, when it is a function or names one.
     default_export: Option<usize>,
+    /// JavaScript class bodies (between the braces) by class name.
+    classes: Vec<(String, Range<usize>)>,
+    /// JavaScript object literal bodies by the binding that holds them.
+    objects: Vec<(String, Range<usize>)>,
+    /// `const name = new Class(...)`: binding and class as written.
+    instances: Vec<(String, String)>,
+    /// The default export, when it is a class, an instance or an object literal.
+    default_container: Option<Container>,
     /// Rejected handler promises reach Express's error middleware without a try/catch:
     /// `express-async-errors` patches Express 4, Express 5 does it natively.
     native_async: bool,
@@ -674,16 +914,77 @@ impl<'a> FileContext<'a> {
                 }),
             _ => None,
         };
-        Self {
+        let mut context = Self {
             source,
             lang,
             starts,
             boundaries,
             declarations,
             default_export,
+            classes: Vec::new(),
+            objects: Vec::new(),
+            instances: Vec::new(),
+            default_container: None,
             native_async: express_native_async || text.contains("express-async-errors"),
             origin,
+        };
+        if lang == Lang::Js {
+            context.classes = context.bodies(CLASS_DECL.as_ref());
+            context.objects = context.bodies(OBJECT_DECL.as_ref());
+            context.instances = INSTANCE_DECL.as_ref().map_or_else(Vec::new, |re| {
+                re.captures_iter(text)
+                    .filter(|caps| caps.get(0).is_some_and(|m| !source.in_string(m.start())))
+                    .filter_map(|caps| {
+                        Some((
+                            caps.get(1)?.as_str().to_owned(),
+                            caps.get(2)?.as_str().to_owned(),
+                        ))
+                    })
+                    .collect()
+            });
+            context.default_container = context.find_default_container();
         }
+        context
+    }
+
+    /// Name and brace-delimited body of each match of `re`, which ends at the body's `{`.
+    fn bodies(&self, re: Option<&Regex>) -> Vec<(String, Range<usize>)> {
+        let Some(re) = re else {
+            return Vec::new();
+        };
+        let text = self.text();
+        re.captures_iter(text)
+            .filter_map(|caps| {
+                let (whole, name) = (caps.get(0)?, caps.get(1)?);
+                if self.source.in_string(whole.start()) {
+                    return None;
+                }
+                let open = whole.end() - 1;
+                let close = lex::matching_bracket(text, open, self.lang)?;
+                Some((name.as_str().to_owned(), open + 1..close))
+            })
+            .collect()
+    }
+
+    fn find_default_container(&self) -> Option<Container> {
+        let text = self.text();
+        let caps = DEFAULT_CONTAINER
+            .as_ref()?
+            .captures_iter(text)
+            .find(|caps| {
+                caps.get(0)
+                    .is_some_and(|m| !self.source.in_string(m.start()))
+            })?;
+        if let Some(class) = caps.get(1) {
+            return Some(Container::Name(class.as_str().to_owned()));
+        }
+        if let Some(name) = caps.get(2) {
+            return Some(Container::Name(name.as_str().to_owned()));
+        }
+        let whole = caps.get(0)?;
+        let open = whole.end() - 1;
+        let close = lex::matching_bracket(text, open, self.lang)?;
+        Some(Container::Body(open + 1..close))
     }
 
     fn text(&self) -> &'a str {
@@ -733,43 +1034,273 @@ impl<'a> FileContext<'a> {
         self.text().get(start..end).unwrap_or_default()
     }
 
-    /// Line of the declaration a same-file reference names, other than `line` itself.
-    fn defined(&self, reference: &str, line: usize) -> Option<usize> {
-        let name = last_segment(reference, ".");
+    /// Line of the declaration named `name`, other than `line` itself.
+    fn defined(&self, name: &str, line: usize) -> Option<usize> {
         self.declarations
             .iter()
             .find(|(declared, at)| declared == name && *at != line)
             .map(|(_, at)| *at)
     }
 
-    fn export_line(&self, target: &Target) -> Option<usize> {
-        match target {
-            Target::Named(name) => self
-                .declarations
+    /// Region of a handler this file defines: a declaration named `reference`, or a member
+    /// of a class, `new` instance or object literal this file declares (`controller.create`).
+    /// A member of an import, or of an instance of an imported class, belongs to that
+    /// module whatever this file declares.
+    fn local_region(
+        &self,
+        reference: &str,
+        line: usize,
+        bindings: &[Binding],
+    ) -> Option<Range<usize>> {
+        let Some((head, member)) = reference.rsplit_once('.') else {
+            return self.defined(reference, line).map(|at| self.region(at));
+        };
+        if let Some(range) = self
+            .container_body(head)
+            .and_then(|body| self.member_range(body, member))
+        {
+            return Some(range);
+        }
+        let root = head.split('.').next().unwrap_or(head);
+        if bindings.iter().any(|b| b.local == root) || self.instance_class(head).is_some() {
+            return None;
+        }
+        self.defined(member, line).map(|at| self.region(at))
+    }
+
+    /// Module and export of each handler a route takes from another file: imported names,
+    /// members of instances of imported classes, and Next.js re-exports.
+    fn imported_targets(
+        &self,
+        route: &RawRoute,
+        line: usize,
+        bindings: &[Binding],
+    ) -> Vec<(String, Target)> {
+        let mut out = Vec::new();
+        for reference in self.references(route, line) {
+            match reference {
+                Reference::Module { spec, target } => out.push((spec, target)),
+                Reference::Name(name) => {
+                    if self.local_region(&name, line, bindings).is_some() {
+                        continue;
+                    }
+                    let class_member = name.rsplit_once('.').and_then(|(head, member)| {
+                        let (module, container) =
+                            class_import(bindings, self.instance_class(head)?)?;
+                        Some((
+                            module.to_owned(),
+                            Target::Member {
+                                container,
+                                member: member.to_owned(),
+                            },
+                        ))
+                    });
+                    if let Some(found) = class_member.or_else(|| {
+                        import_target(bindings, &name)
+                            .map(|(module, target)| (module.to_owned(), target))
+                    }) {
+                        out.push(found);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Region an import of `target` lands on in this module.
+    fn export_region(&self, target: &Target) -> Option<Range<usize>> {
+        let declared = |name: &str| {
+            self.declarations
                 .iter()
                 .find(|(declared, _)| declared == name)
-                .map(|(_, line)| *line),
-            Target::Default => self.default_export,
+                .map(|(_, line)| self.region(*line))
+        };
+        match target {
+            Target::Default => self.default_export.map(|line| self.region(line)),
+            // `module.exports = { create: async (req, res) => ... }` names no declaration.
+            Target::Named(name) => declared(name).or_else(|| self.member_of(None, name)),
+            Target::Member { container, member } => self
+                .member_of(container.as_deref(), member)
+                .or_else(|| declared(member)),
         }
     }
 
+    /// Region of `member` in the container this module declares as `container`, or in its
+    /// default export.
+    fn member_of(&self, container: Option<&str>, member: &str) -> Option<Range<usize>> {
+        let body = match container {
+            Some(name) => self.container_body(name)?,
+            None => match self.default_container.as_ref()? {
+                Container::Body(body) => body.clone(),
+                Container::Name(name) => self.container_body(name)?,
+            },
+        };
+        self.member_range(body, member)
+    }
+
+    /// Body of the class or object literal `name` declares, or of the class a `new`
+    /// instance bound to `name` was built from.
+    fn container_body(&self, name: &str) -> Option<Range<usize>> {
+        let find = |list: &[(String, Range<usize>)], wanted: &str| {
+            list.iter()
+                .find(|(declared, _)| declared == wanted)
+                .map(|(_, body)| body.clone())
+        };
+        find(&self.classes, name)
+            .or_else(|| find(&self.objects, name))
+            .or_else(|| find(&self.classes, self.instance_class(name)?))
+    }
+
+    fn instance_class(&self, name: &str) -> Option<&str> {
+        self.instances
+            .iter()
+            .find(|(instance, _)| instance == name)
+            .map(|(_, class)| class.as_str())
+    }
+
+    /// From the start of the member's line to the end of its function body, or of its
+    /// expression for an arrow without braces. Only direct members of `body` count.
+    fn member_range(&self, body: Range<usize>, member: &str) -> Option<Range<usize>> {
+        let re = MEMBER_DECL.as_ref()?;
+        let text = self.text();
+        let slice = text.get(body.clone())?;
+        for caps in re.captures_iter(slice) {
+            let (Some(whole), Some(name)) = (caps.get(0), caps.get(1)) else {
+                continue;
+            };
+            let at = body.start + name.start();
+            if name.as_str() != member
+                || self.source.in_string(at)
+                || self.depth_between(body.start, at) != 0
+            {
+                continue;
+            }
+            let end = body.start + whole.end();
+            let open = if text.as_bytes().get(end - 1) == Some(&b'{') {
+                Some(end - 1)
+            } else {
+                let next = lex::skip_ws(text, end);
+                (text.as_bytes().get(next) == Some(&b'{')).then_some(next)
+            };
+            let close = match open {
+                Some(open) => lex::matching_bracket(text, open, self.lang)? + 1,
+                None => statement_end(text, end, CHAIN_WINDOW),
+            };
+            return Some(self.line_start(at)..close.min(text.len()));
+        }
+        None
+    }
+
+    /// Bracket nesting at `to`, counted from `from`, with string literals skipped.
+    fn depth_between(&self, from: usize, to: usize) -> usize {
+        let bytes = self.text().as_bytes();
+        let mut depth = 0usize;
+        let mut at = from;
+        while at < to {
+            let Some(&byte) = bytes.get(at) else {
+                break;
+            };
+            match byte {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                _ => {
+                    if let Some(end) = lex::literal_end(bytes, at, self.lang) {
+                        at = end;
+                        continue;
+                    }
+                }
+            }
+            at += 1;
+        }
+        depth
+    }
+
     /// The declaration region plus the regions of handlers it names that this file
-    /// defines (`post(create)`, `app.post("/x", validate(schema), create)`).
-    fn handler_regions(&self, route: &RawRoute) -> Vec<Region<'_>> {
+    /// defines (`post(create)`, `app.post("/x", validate(schema), create)`,
+    /// `router.post("/x", controller.create)`, `export const POST = withAuth(create)`).
+    fn handler_regions(&self, route: &RawRoute, bindings: &[Binding]) -> Vec<Region<'_>> {
         let line = usize::try_from(route.line).unwrap_or(0);
         let mut regions = vec![Region {
             ctx: self,
             range: self.region(line),
         }];
-        for name in self.named_handlers(route, line) {
-            if let Some(at) = self.defined(&name, line) {
-                let range = self.region(at);
+        for reference in self.references(route, line) {
+            let Reference::Name(name) = reference else {
+                continue;
+            };
+            if let Some(range) = self.local_region(&name, line, bindings) {
                 if !regions.iter().any(|region| region.range == range) {
                     regions.push(Region { ctx: self, range });
                 }
             }
         }
         regions
+    }
+
+    fn references(&self, route: &RawRoute, line: usize) -> Vec<Reference> {
+        let mut references: Vec<Reference> = self
+            .named_handlers(route, line)
+            .into_iter()
+            .map(Reference::Name)
+            .collect();
+        if route.source == RouteSource::NextAppRouter {
+            references.extend(self.next_reference(route.method));
+        }
+        references
+    }
+
+    /// The handler a Next.js App Router method export stands for when it is not written in
+    /// place: a re-export (`export { POST } from "m"`), an export-list entry
+    /// (`export { create as POST }`), or an assigned binding (`export const POST = handler`).
+    fn next_reference(&self, method: RouteMethod) -> Option<Reference> {
+        let exported = method_token(method).to_ascii_uppercase();
+        let text = self.text();
+        let in_code = |found: &regex::Match<'_>| !self.source.in_string(found.start());
+        if let Some(re) = EXPORT_FROM.as_ref() {
+            for caps in re.captures_iter(text) {
+                let (Some(whole), Some(list), Some(spec)) = (caps.get(0), caps.get(1), caps.get(2))
+                else {
+                    continue;
+                };
+                if !in_code(&whole) {
+                    continue;
+                }
+                if let Some(imported) = exported_as(list.as_str(), &exported) {
+                    let target = match imported {
+                        "default" => Target::Default,
+                        name => Target::Named(name.to_owned()),
+                    };
+                    return Some(Reference::Module {
+                        spec: spec.as_str().to_owned(),
+                        target,
+                    });
+                }
+            }
+        }
+        let listed = EXPORT_LIST.as_ref().and_then(|re| {
+            re.captures_iter(text).find_map(|caps| {
+                let (whole, list) = (caps.get(0)?, caps.get(1)?);
+                let reexport = text
+                    .get(whole.end()..)
+                    .is_some_and(|rest| rest.trim_start().starts_with("from"));
+                if !in_code(&whole) || reexport {
+                    return None;
+                }
+                exported_as(list.as_str(), &exported).map(str::to_owned)
+            })
+        });
+        let assigned = |name: &str| {
+            ASSIGNMENT.as_ref().and_then(|re| {
+                re.captures_iter(text)
+                    .filter(|caps| caps.get(0).is_some_and(|m| in_code(&m)))
+                    .find(|caps| caps.get(1).is_some_and(|m| m.as_str() == name))
+                    .and_then(|caps| wrapped_reference(caps.get(2)?.as_str()))
+            })
+        };
+        match listed {
+            Some(local) => Some(Reference::Name(assigned(&local).unwrap_or(local))),
+            None => assigned(&exported).map(Reference::Name),
+        }
     }
 
     /// Handler references on the declaration line, as written (`create`, `orders.create`).
@@ -876,14 +1407,14 @@ impl<'a> FileContext<'a> {
     /// Database writes in `range`, one per statement, in source order, labelled for the
     /// risk detail. A SQL string inside a write call's arguments, or in the same statement
     /// (`query("UPDATE ...").execute(db)`), is that call's write, not a second one.
-    fn write_sites(&self, range: Range<usize>) -> Vec<(usize, String)> {
+    fn write_sites(&self, range: Range<usize>) -> Vec<WriteSite> {
         let text = self.text();
         let Some(slice) = text.get(range.clone()) else {
             return Vec::new();
         };
         // (start, closing paren, statement end)
         let mut calls: Vec<(usize, usize, usize)> = Vec::new();
-        let mut sites: Vec<(usize, String)> = Vec::new();
+        let mut sites: Vec<WriteSite> = Vec::new();
         if let Some(re) = WRITE_CALL.as_ref() {
             for caps in re.captures_iter(slice) {
                 let (Some(whole), Some(receiver), Some(method)) =
@@ -896,13 +1427,14 @@ impl<'a> FileContext<'a> {
                     continue;
                 }
                 let end = self.statement_end(at);
-                let (receiver, method) = (receiver.as_str(), method.as_str());
+                let receiver = compact(receiver.as_str());
+                let method = method.as_str();
                 let write = match method {
                     "execute" | "Exec" | "ExecContext" => !self.statement_reads(at, end),
                     _ if method.starts_with(|c: char| c.is_ascii_uppercase()) => {
-                        !GO_NON_DB.contains(&root_segment(receiver))
+                        !GO_NON_DB.contains(&root_segment(&receiver))
                     }
-                    _ => is_db_receiver(receiver, self.awaited(at)),
+                    _ => is_db_receiver(&receiver, self.awaited(at)),
                 };
                 if !write {
                     continue;
@@ -910,7 +1442,17 @@ impl<'a> FileContext<'a> {
                 let open = range.start + whole.end() - 1;
                 let close = lex::matching_paren(text, open, self.lang).unwrap_or(open);
                 calls.push((at, close, end));
-                sites.push((at, format!("{receiver}.{method}")));
+                // A generic executor is named by the statement it runs.
+                let label = match method {
+                    "execute" | "Exec" | "ExecContext" => self.sql_label(at, end),
+                    _ => None,
+                }
+                .unwrap_or_else(|| format!("{receiver}.{method}"));
+                let handle = TX_ROOTS.contains(&root_segment(&receiver))
+                    || TX_HANDLE.as_ref().is_some_and(|re| {
+                        re.is_match(text.get(open + 1..close).unwrap_or_default())
+                    });
+                sites.push(WriteSite { at, label, handle });
             }
         }
         if let Some(sql) = SQL_WRITE.as_ref() {
@@ -923,18 +1465,27 @@ impl<'a> FileContext<'a> {
                     .iter()
                     .any(|&(at, close, end)| (at < start && start < close) || end == statement);
                 if !merged {
-                    let label = found
-                        .as_str()
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .to_ascii_uppercase();
-                    sites.push((start, label));
+                    let before = text.get(self.line_start(start)..start).unwrap_or_default();
+                    let after = text.get(end..statement).unwrap_or_default();
+                    let handle = TX_RECEIVER.as_ref().is_some_and(|re| re.is_match(before))
+                        || TX_HANDLE.as_ref().is_some_and(|re| re.is_match(after));
+                    sites.push(WriteSite {
+                        at: start,
+                        label: sql_keywords(found.as_str()),
+                        handle,
+                    });
                 }
             }
         }
-        sites.sort_by_key(|(at, _)| *at);
+        sites.sort_by_key(|site| site.at);
         sites
+    }
+
+    /// The SQL write the statement around `at` runs, as `UPDATE STOCK SET`.
+    fn sql_label(&self, at: usize, end: usize) -> Option<String> {
+        let statement = self.text().get(self.line_start(at)..end)?;
+        let found = SQL_WRITE.as_ref()?.find(statement)?;
+        Some(sql_keywords(found.as_str()))
     }
 
     /// The statement around a call names a SELECT: `conn.execute("SELECT ...")` reads.
@@ -946,21 +1497,126 @@ impl<'a> FileContext<'a> {
         SQL_SELECT.as_ref().is_some_and(|re| re.is_match(statement))
     }
 
-    fn transactional(&self, range: Range<usize>) -> bool {
+    /// Transactions in `range`: transaction calls cover their arguments, a handle-style begin
+    /// covers what follows it, and a decorator on the handler (up to three lines above the
+    /// region) covers everything.
+    fn tx_scope(&self, range: Range<usize>) -> TxScope {
         let text = self.text();
-        let Some(slice) = text.get(range.clone()) else {
-            return false;
-        };
-        let in_code = TX_MARKER.as_ref().is_some_and(|re| {
-            re.find_iter(slice)
-                .any(|found| !self.source.in_string(range.start + found.start()))
+        let mut scope = TxScope::default();
+        let above = self
+            .starts
+            .get(self.line_of(range.start).saturating_sub(4))
+            .copied()
+            .unwrap_or(0);
+        scope.whole = TX_DECORATOR.as_ref().is_some_and(|re| {
+            re.find_iter(text.get(above..range.end).unwrap_or_default())
+                .any(|found| !self.source.in_string(above + found.start()))
         });
-        in_code
-            || SQL_TX.as_ref().is_some_and(|re| {
-                self.source
-                    .strings_in(range)
-                    .any(|(start, end)| text.get(start..end).is_some_and(|lit| re.is_match(lit)))
-            })
+        let Some(slice) = text.get(range.clone()) else {
+            return scope;
+        };
+        if let Some(re) = TX_CALL.as_ref() {
+            for found in re.find_iter(slice) {
+                let at = range.start + found.start();
+                if self.source.in_string(at) {
+                    continue;
+                }
+                let open = range.start + found.end() - 1;
+                let Some(close) = lex::matching_paren(text, open, self.lang) else {
+                    continue;
+                };
+                if text
+                    .get(open + 1..close)
+                    .is_some_and(|args| args.trim().is_empty())
+                {
+                    // `sequelize.transaction()` returns a handle for the writes after it.
+                    scope.begin(at);
+                } else {
+                    scope.calls.push(open..close);
+                }
+            }
+        }
+        if let Some(re) = TX_BEGIN.as_ref() {
+            for found in re.find_iter(slice) {
+                let at = range.start + found.start();
+                if !self.source.in_string(at) {
+                    scope.begin(at);
+                }
+            }
+        }
+        if let Some(re) = SQL_TX.as_ref() {
+            for (start, end) in self.source.strings_in(range) {
+                if text.get(start..end).is_some_and(|lit| re.is_match(lit)) {
+                    scope.begin(start);
+                }
+            }
+        }
+        scope
+    }
+
+    /// The write runs inside a transaction call, after a handle-style begin, on a
+    /// transaction handle, or under a transactional decorator.
+    fn covered(scope: &TxScope, site: &WriteSite) -> bool {
+        scope.whole
+            || site.handle
+            || scope.calls.iter().any(|call| call.contains(&site.at))
+            || scope.begun.is_some_and(|begun| begun < site.at)
+    }
+
+    /// Loop bodies in `range`: `for` / `while` / `do` blocks (or single statements) and the
+    /// callbacks of `forEach` / `map` / `flatMap` / `for_each`.
+    fn loops(&self, range: Range<usize>) -> Vec<Loop> {
+        let re = match self.lang {
+            Lang::Js => JS_LOOP.as_ref(),
+            Lang::Rust => RUST_LOOP.as_ref(),
+            Lang::Go => GO_LOOP.as_ref(),
+        };
+        let (Some(re), Some(slice)) = (re, self.text().get(range.clone())) else {
+            return Vec::new();
+        };
+        let text = self.text();
+        let mut loops = Vec::new();
+        for caps in re.captures_iter(slice) {
+            let (Some(whole), Some(keyword)) = (caps.get(0), caps.iter().skip(1).flatten().next())
+            else {
+                continue;
+            };
+            let at = range.start + whole.start();
+            if self.source.in_string(at) {
+                continue;
+            }
+            let last = range.start + whole.end() - 1;
+            let body = match text.as_bytes().get(last) {
+                Some(b'{') => {
+                    lex::matching_bracket(text, last, self.lang).map(|close| last + 1..close)
+                }
+                // A callback loop runs its argument; a condition loop runs what follows it.
+                Some(b'(') => lex::matching_paren(text, last, self.lang).and_then(|close| {
+                    if matches!(
+                        keyword.as_str(),
+                        "forEach" | "map" | "flatMap" | "for_each" | "try_for_each"
+                    ) {
+                        return Some(last + 1..close);
+                    }
+                    let next = lex::skip_ws(text, close + 1);
+                    match text.as_bytes().get(next) {
+                        Some(b'{') => {
+                            lex::matching_bracket(text, next, self.lang).map(|end| next + 1..end)
+                        }
+                        Some(_) => Some(next..statement_end(text, next, CHAIN_WINDOW)),
+                        None => None,
+                    }
+                }),
+                _ => None,
+            };
+            if let Some(body) = body {
+                loops.push(Loop {
+                    body,
+                    kind: loop_kind(keyword.as_str()),
+                });
+            }
+        }
+        loops
     }
 
     /// First string literal in `range` that holds a SQL statement built from values.
@@ -1052,6 +1708,16 @@ impl<'c> Region<'c> {
             .map(|found| self.range.start + found.start())
             .find(|at| !self.ctx.source.in_string(*at))
     }
+
+    /// First match of `re` in code, counting the `${...}` expressions of JavaScript template
+    /// literals as code: `` `order ${req.body.id}` `` reads the body as much as a statement.
+    fn first_expression_match(&self, re: &Regex) -> Option<usize> {
+        let source = self.ctx.source;
+        let templates = self.ctx.lang == Lang::Js;
+        re.find_iter(self.text())
+            .map(|found| self.range.start + found.start())
+            .find(|at| !source.in_string(*at) || (templates && source.in_interpolation(*at)))
+    }
 }
 
 fn audit(home: &FileContext<'_>, route: &RawRoute, regions: &[Region<'_>]) -> Vec<RouteRisk> {
@@ -1077,7 +1743,9 @@ fn unvalidated_mutation(route: &RawRoute, regions: &[Region<'_>]) -> Option<Rout
             Lang::Rust => RUST_BODY_READ.as_ref(),
             Lang::Go => GO_BODY_READ.as_ref(),
         }?;
-        region.first_code_match(pattern).map(|at| (region, at))
+        region
+            .first_expression_match(pattern)
+            .map(|at| (region, at))
     })?;
     if validated(regions) {
         return None;
@@ -1225,15 +1893,16 @@ fn floating_promise(regions: &[Region<'_>]) -> Option<RouteRisk> {
             if ctx.source.in_string(at) {
                 continue;
             }
-            let receiver = caps
-                .get(1)
-                .or_else(|| caps.get(3))
-                .map_or("", |m| m.as_str());
+            let receiver = compact(
+                caps.get(1)
+                    .or_else(|| caps.get(3))
+                    .map_or("", |m| m.as_str()),
+            );
             let method = caps
                 .get(2)
                 .or_else(|| caps.get(4))
                 .map_or("", |m| m.as_str());
-            let io = method == "save" || method == "fetch" || is_db_receiver(receiver, false);
+            let io = method == "save" || method == "fetch" || is_db_receiver(&receiver, false);
             if !io {
                 continue;
             }
@@ -1288,46 +1957,89 @@ fn unguarded_express(
     })
 }
 
+/// A write found in one of a route's regions, with what guards it.
+struct Write<'r> {
+    region: &'r Region<'r>,
+    site: WriteSite,
+    covered: bool,
+    in_loop: Option<&'static str>,
+}
+
+/// Writes that a failure or a concurrent request can leave half-applied: one write repeated
+/// by a loop, or two or more writes of which at least one runs outside every transaction.
+/// A transaction counts only for the writes it covers, not for the whole handler.
 fn non_atomic_writes(regions: &[Region<'_>]) -> Option<RouteRisk> {
-    if regions
-        .iter()
-        .any(|region| region.ctx.transactional(region.range.clone()))
-    {
-        return None;
+    let mut writes: Vec<Write<'_>> = Vec::new();
+    for region in regions {
+        let ctx = region.ctx;
+        let scope = ctx.tx_scope(region.range.clone());
+        let loops = ctx.loops(region.range.clone());
+        for site in ctx.write_sites(region.range.clone()) {
+            let duplicate = writes
+                .iter()
+                .any(|w| std::ptr::eq(w.region.ctx, ctx) && w.site.at == site.at);
+            if duplicate {
+                continue;
+            }
+            writes.push(Write {
+                region,
+                covered: FileContext::covered(&scope, &site),
+                in_loop: loops
+                    .iter()
+                    .find(|l| l.body.contains(&site.at))
+                    .map(|l| l.kind),
+                site,
+            });
+        }
     }
-    let writes: Vec<(&Region<'_>, usize, String)> = regions
-        .iter()
-        .flat_map(|region| {
-            region
-                .ctx
-                .write_sites(region.range.clone())
-                .into_iter()
-                .map(move |(at, label)| (region, at, label))
-        })
-        .collect();
+    let uncovered: Vec<&Write<'_>> = writes.iter().filter(|w| !w.covered).collect();
+    if let Some(write) = uncovered.iter().find(|w| w.in_loop.is_some()) {
+        return Some(write.region.ctx.risk(
+            RouteRiskKind::NonAtomicMultiWrite,
+            write.site.at,
+            format!(
+                "`{}` runs once per iteration of a `{}` loop with no transaction around it; a failure or a concurrent request mid-loop leaves partial state",
+                write.site.label,
+                write.in_loop.unwrap_or("for")
+            ),
+        ));
+    }
+    let first = uncovered.first()?;
     if writes.len() < 2 {
         return None;
     }
-    let listed: Vec<String> = writes
-        .iter()
-        .take(LISTED_WRITES)
-        .map(|(_, _, label)| format!("`{label}`"))
-        .collect();
-    let more = if writes.len() > LISTED_WRITES {
-        ", ..."
-    } else {
-        ""
+    let listed = |set: &[&Write<'_>]| {
+        let mut labels: Vec<String> = set
+            .iter()
+            .take(LISTED_WRITES)
+            .map(|w| format!("`{}`", w.site.label))
+            .collect();
+        if set.len() > LISTED_WRITES {
+            labels.push("...".to_owned());
+        }
+        labels.join(", ")
     };
-    let (region, at, _) = writes.first()?;
-    Some(region.ctx.risk(
-        RouteRiskKind::NonAtomicMultiWrite,
-        *at,
+    let detail = if uncovered.len() == writes.len() {
+        let all: Vec<&Write<'_>> = writes.iter().collect();
         format!(
-            "{} writes ({}{more}) with no transaction around them; a failure or a concurrent request between them leaves partial state",
+            "{} writes ({}) with no transaction around them; a failure or a concurrent request between them leaves partial state",
             writes.len(),
-            listed.join(", ")
-        ),
-    ))
+            listed(&all)
+        )
+    } else {
+        format!(
+            "{} writes, {} of them outside the transaction ({}); a failure after it commits leaves partial state",
+            writes.len(),
+            uncovered.len(),
+            listed(&uncovered)
+        )
+    };
+    Some(
+        first
+            .region
+            .ctx
+            .risk(RouteRiskKind::NonAtomicMultiWrite, first.site.at, detail),
+    )
 }
 
 fn unsafe_sql(regions: &[Region<'_>]) -> Option<RouteRisk> {
@@ -1361,6 +2073,35 @@ fn is_db_receiver(receiver: &str, awaited: bool) -> bool {
     let model =
         root.starts_with(|c: char| c.is_ascii_uppercase()) && !GLOBAL_OBJECTS.contains(&root);
     segments.len() >= 2 || model || awaited
+}
+
+/// A receiver chain written across lines (`prisma.order` / `  .create`) as one chain.
+fn compact(receiver: &str) -> String {
+    receiver.split_whitespace().collect()
+}
+
+/// `update  stock\n set` as `UPDATE STOCK SET`.
+fn sql_keywords(found: &str) -> String {
+    found
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase()
+}
+
+fn loop_kind(keyword: &str) -> &'static str {
+    match keyword {
+        "while" => "while",
+        "do" => "do",
+        "loop" => "loop",
+        "forEach" => "forEach",
+        "map" => "map",
+        "flatMap" => "flatMap",
+        "for_each" => "for_each",
+        "try_for_each" => "try_for_each",
+        keyword if keyword.ends_with("await") => "for await",
+        _ => "for",
+    }
 }
 
 fn root_segment(receiver: &str) -> &str {
@@ -1438,9 +2179,25 @@ mod tests {
             &ERROR_PATH,
             &WRITE_CALL,
             &SQL_WRITE,
-            &TX_MARKER,
+            &TX_CALL,
+            &TX_BEGIN,
+            &TX_HANDLE,
+            &TX_RECEIVER,
+            &TX_DECORATOR,
             &SQL_TX,
+            &JS_LOOP,
+            &RUST_LOOP,
+            &GO_LOOP,
             &SQL_SHAPE,
+            &EXPORT_FROM,
+            &EXPORT_LIST,
+            &ASSIGNMENT,
+            &WRAPPED_REFERENCE,
+            &CLASS_DECL,
+            &OBJECT_DECL,
+            &INSTANCE_DECL,
+            &DEFAULT_CONTAINER,
+            &MEMBER_DECL,
         ]
         .iter()
         .all(|re| re.is_some())
@@ -1753,6 +2510,271 @@ async fn refund(State(db): State<Db>, Json(body): Json<Refund>) -> StatusCode {
         );
     }
 
+    fn details(lang: Lang, src: &str, components: &[&str]) -> Vec<(String, String)> {
+        let source = Source::new(src, lang);
+        let mut routes = extracted(lang, &source, components);
+        annotate(&source, lang, &mut routes, None);
+        routes.sort_by_key(|route| route.line);
+        routes
+            .iter()
+            .flat_map(|route| {
+                route
+                    .risks
+                    .iter()
+                    .filter(|risk| risk.kind == RouteRiskKind::NonAtomicMultiWrite)
+                    .map(move |risk| (route.path.clone(), risk.detail.clone()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chained_and_repeated_writes_outside_transactions() {
+        let src = r#"app.post("/orders", validate(Order), async (req, res, next) => {
+  try {
+    const order = await prisma.order
+      .create({ data: req.body });
+    await prisma.coupon
+      .update({ where: { code: req.body.code }, data: { used: { increment: 1 } } });
+    res.status(201).json(order);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/restock", validate(Restock), async (req, res, next) => {
+  try {
+    for (const line of req.body.lines) {
+      await prisma.stock.update({ where: { sku: line.sku }, data: { qty: line.qty } });
+    }
+    res.sendStatus(204);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete("/carts/:id", validate(Cart), async (req, res, next) => {
+  try {
+    req.body.items.forEach(async (item) => {
+      await db.cartItem.delete({ where: { id: item.id } });
+    });
+    res.sendStatus(204);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/import", validate(Import), async (req, res, next) => {
+  try {
+    await prisma.$transaction(async (tx) => {
+      for (const row of req.body.rows) {
+        await tx.product.upsert({ where: { sku: row.sku }, create: row, update: row });
+      }
+    });
+    res.sendStatus(204);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/checkout", validate(Checkout), async (req, res, next) => {
+  try {
+    const order = await prisma.$transaction([prisma.order.create({ data: req.body })]);
+    await prisma.cart.delete({ where: { id: req.body.cartId } });
+    res.status(201).json(order);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/batch", validate(Batch), async (req, res, next) => {
+  try {
+    let page = 0;
+    while (page < req.body.pages) {
+      await knex("events").insert({ page: page++ });
+    }
+    res.sendStatus(202);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/payments", validate(Payment), async (req, res, next) => {
+  try {
+    await prisma.transaction.create({ data: { cents: req.body.cents } });
+    await prisma.account.update({ where: { id: req.body.account }, data: { cents: { decrement: req.body.cents } } });
+    res.sendStatus(201);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/ledger", validate(Entry), async (req, res, next) => {
+  try {
+    const t = await sequelize.transaction();
+    await Entry.create(req.body, { transaction: t });
+    await Balance.update({ cents: req.body.cents }, { where: { id: req.body.account }, transaction: t });
+    await t.commit();
+    res.sendStatus(201);
+  } catch (err) {
+    next(err);
+  }
+});
+"#;
+        assert_eq!(
+            audited(Lang::Js, src, &["server.js"]),
+            [
+                "POST /orders: NonAtomicMultiWrite@3",
+                "POST /restock: NonAtomicMultiWrite@16",
+                "DELETE /carts/:id: NonAtomicMultiWrite@27",
+                "POST /checkout: NonAtomicMultiWrite@51",
+                "POST /batch: NonAtomicMultiWrite@62",
+                "POST /payments: NonAtomicMultiWrite@72",
+            ]
+        );
+        let tail = "a failure or a concurrent request mid-loop leaves partial state";
+        assert_eq!(
+            details(Lang::Js, src, &["server.js"]),
+            [
+                ("/orders".to_owned(), "2 writes (`prisma.order.create`, `prisma.coupon.update`) with no transaction around them; a failure or a concurrent request between them leaves partial state".to_owned()),
+                ("/restock".to_owned(), format!("`prisma.stock.update` runs once per iteration of a `for` loop with no transaction around it; {tail}")),
+                ("/carts/:id".to_owned(), format!("`db.cartItem.delete` runs once per iteration of a `forEach` loop with no transaction around it; {tail}")),
+                ("/checkout".to_owned(), "2 writes, 1 of them outside the transaction (`prisma.cart.delete`); a failure after it commits leaves partial state".to_owned()),
+                ("/batch".to_owned(), format!("`knex.insert` runs once per iteration of a `while` loop with no transaction around it; {tail}")),
+                ("/payments".to_owned(), "2 writes (`prisma.transaction.create`, `prisma.account.update`) with no transaction around them; a failure or a concurrent request between them leaves partial state".to_owned()),
+            ]
+        );
+
+        let rust = r#"pub fn router() -> Router<Db> {
+    Router::new()
+        .route("/restock", post(restock))
+        .route("/archive", post(archive))
+}
+
+async fn restock(State(db): State<Db>, Json(body): Json<Restock>) -> StatusCode {
+    for line in &body.lines {
+        sqlx::query("UPDATE stock SET qty = $1 WHERE sku = $2").bind(line.qty).bind(&line.sku).execute(&db).await.ok();
+    }
+    StatusCode::OK
+}
+
+async fn archive(State(db): State<Db>, Json(body): Json<Archive>) -> StatusCode {
+    let mut tx = db.begin().await.unwrap();
+    for id in &body.ids {
+        sqlx::query("DELETE FROM orders WHERE id = $1").bind(id).execute(&mut *tx).await.ok();
+    }
+    tx.commit().await.ok();
+    StatusCode::OK
+}
+"#;
+        assert_eq!(
+            details(Lang::Rust, rust, &[]),
+            [(
+                "/restock".to_owned(),
+                format!("`UPDATE STOCK SET` runs once per iteration of a `for` loop with no transaction around it; {tail}")
+            )]
+        );
+        assert_eq!(
+            audited(Lang::Rust, rust, &[]),
+            ["POST /restock: NonAtomicMultiWrite@9"]
+        );
+
+        let go = "package main\n\nfunc routes(mux *http.ServeMux) {\n\tmux.HandleFunc(\"POST /sync\", syncItems)\n}\n\nfunc syncItems(w http.ResponseWriter, r *http.Request) {\n\tvar in []Item\n\tif err := json.NewDecoder(r.Body).Decode(&in); err != nil {\n\t\treturn\n\t}\n\tfor _, item := range in {\n\t\tif _, err := db.Exec(\"UPDATE items SET qty = $1 WHERE id = $2\", item.Qty, item.ID); err != nil {\n\t\t\treturn\n\t\t}\n\t}\n}\n";
+        assert_eq!(
+            audited(Lang::Go, go, &[]),
+            ["POST /sync: NonAtomicMultiWrite@13"]
+        );
+    }
+
+    #[test]
+    fn body_reads_inside_template_expressions() {
+        let src = r#"app.post("/notes", async (req, res, next) => {
+  try {
+    logger.info(`note for ${req.body.orderId} received`);
+    res.sendStatus(202);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/docs", async (req, res, next) => {
+  try {
+    res.send("send the payload as req.body with a JSON content type");
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/typed", zValidator("json", Note), async (c) => {
+  const note = `${c.req.valid("json").text}`;
+  return c.json({ note });
+});
+"#;
+        assert_eq!(
+            audited(Lang::Js, src, &["server.js"]),
+            ["POST /notes: UnvalidatedMutation@3"]
+        );
+        // The validated accessor is evidence of validation wherever the validator sits.
+        let elsewhere = src.replace("zValidator(\"json\", Note), ", "");
+        assert_eq!(
+            audited(Lang::Js, &elsewhere, &["server.js"]),
+            ["POST /notes: UnvalidatedMutation@3"]
+        );
+    }
+
+    #[test]
+    fn class_and_object_members_in_the_same_file() {
+        let src = r#"class OrdersController {
+  constructor(service) {
+    this.service = service;
+  }
+
+  create = async (req, res, next) => {
+    try {
+      await db.order.create({ data: req.body });
+      await db.audit.create({ data: { action: "create" } });
+      res.sendStatus(201);
+    } catch (err) {
+      next(err);
+    }
+  };
+
+  async list(req, res, next) {
+    try {
+      res.json(await db.order.findMany());
+    } catch (err) {
+      next(err);
+    }
+  }
+}
+
+const handlers = {
+  remove: async (req, res, next) => {
+    try {
+      const { reason } = req.body;
+      await db.order.delete({ where: { id: req.params.id }, data: { reason } });
+      res.sendStatus(204);
+    } catch (err) {
+      next(err);
+    }
+  },
+};
+
+const controller = new OrdersController(service);
+router.post("/orders", controller.create);
+router.get("/orders", controller.list);
+router.delete("/orders/:id", handlers.remove);
+"#;
+        assert_eq!(
+            audited(Lang::Js, src, &["routes.js"]),
+            [
+                "POST /orders: UnvalidatedMutation@8",
+                "POST /orders: NonAtomicMultiWrite@8",
+                "GET /orders: UnboundedQuery@18",
+                "DELETE /orders/:id: UnvalidatedMutation@28",
+            ]
+        );
+    }
+
     #[test]
     fn interpolated_sql() {
         let src = r#"app.get("/users", async (req, res, next) => {
@@ -1833,6 +2855,7 @@ const notify = require("./notify").send;
                 (s("Orders"), s("./orders"), Export::Default),
                 (s("createOrder"), s("./orders"), named("create")),
                 (s("users"), s("../controllers/users.js"), Export::Module),
+                (s("express"), s("express"), Export::Default),
                 (s("list"), s("./items"), named("list")),
                 (s("remove"), s("./items"), named("remove")),
                 (s("refund"), s("./payments"), named("refund")),
@@ -1850,6 +2873,50 @@ const notify = require("./notify").send;
             import_target(&bindings, "audit"),
             Some(("./audit", Target::Default))
         );
-        assert_eq!(import_target(&bindings, "express"), None);
+        // A package is bound like any module; resolution, not binding, rules it out.
+        assert_eq!(
+            import_target(&bindings, "express"),
+            Some(("express", Target::Default))
+        );
+        assert_eq!(import_target(&bindings, "missing"), None);
+        // Members of default and named imports belong to the exported container.
+        assert_eq!(
+            import_target(&bindings, "Orders.create"),
+            Some((
+                "./orders",
+                Target::Member {
+                    container: None,
+                    member: s("create")
+                }
+            ))
+        );
+        assert_eq!(
+            import_target(&bindings, "list.run"),
+            Some((
+                "./items",
+                Target::Member {
+                    container: Some(s("list")),
+                    member: s("run")
+                }
+            ))
+        );
+        assert_eq!(
+            class_import(&bindings, "users.OrdersController"),
+            Some(("../controllers/users.js", Some(s("OrdersController"))))
+        );
+        assert_eq!(
+            exported_as("GET, create as POST, type T", "POST"),
+            Some("create")
+        );
+        assert_eq!(exported_as("GET", "GET"), Some("GET"));
+        assert_eq!(
+            wrapped_reference("withAuth(createOrder, { role })").as_deref(),
+            Some("createOrder")
+        );
+        assert_eq!(
+            wrapped_reference("orders.create").as_deref(),
+            Some("orders.create")
+        );
+        assert_eq!(wrapped_reference("async (req) => ok(req)"), None);
     }
 }

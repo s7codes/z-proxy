@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use regex::Regex;
@@ -17,6 +17,7 @@ use walkdir::{DirEntry, WalkDir};
 
 use super::audit::{self, Project};
 use super::lex::{Lang, Source};
+use super::tsconfig::{self, PathAliases};
 use super::{axum, go, next, node, openapi};
 use crate::engine::error::{EngineError, EngineResult};
 use crate::engine::types::{
@@ -196,6 +197,10 @@ struct Scan {
     issues: Vec<ScanIssue>,
     /// Express major version by source directory, from the nearest `package.json`.
     express: HashMap<PathBuf, Option<u32>>,
+    /// Path aliases by source directory, from the nearest `tsconfig.json` / `jsconfig.json`.
+    aliases: HashMap<PathBuf, Option<Arc<PathAliases>>>,
+    /// Each config parsed once, however many directories it governs.
+    configs: HashMap<PathBuf, Option<Arc<PathAliases>>>,
 }
 
 impl Scan {
@@ -251,10 +256,15 @@ impl Scan {
             && self
                 .express_major(root, dir)
                 .is_some_and(|major| major >= 5);
+        let aliases = match kind {
+            FileKind::Js => self.aliases(root, dir),
+            _ => None,
+        };
         let project = Project {
             root,
             dir,
             express_native_async,
+            aliases: aliases.as_deref(),
         };
 
         match extract(kind, &components, src, Some(&project)) {
@@ -288,6 +298,22 @@ impl Scan {
             }
         }
         self.express.insert(dir.to_path_buf(), found);
+        found
+    }
+
+    /// `paths` / `baseUrl` aliases of the nearest TypeScript or JavaScript config at or above
+    /// `dir`, inside the scan root.
+    fn aliases(&mut self, root: &Path, dir: &Path) -> Option<Arc<PathAliases>> {
+        if let Some(known) = self.aliases.get(dir) {
+            return known.clone();
+        }
+        let found = tsconfig::nearest_config(root, dir).and_then(|config| {
+            self.configs
+                .entry(config)
+                .or_insert_with_key(|config| tsconfig::load(root, config).map(Arc::new))
+                .clone()
+        });
+        self.aliases.insert(dir.to_path_buf(), found.clone());
         found
     }
 }
@@ -701,6 +727,84 @@ mod tests {
                 "POST /y: UnvalidatedMutation@handlers.js:3",
                 "POST /y: NonAtomicMultiWrite@handlers.js:3",
             ]
+        );
+    }
+
+    #[test]
+    fn aliases_reexports_and_class_controllers_resolve_across_files() {
+        let fx = Fixture::new();
+        fx.write(
+            "tsconfig.base.json",
+            "{\n  // shared by every package\n  \"compilerOptions\": {\n    \"baseUrl\": \".\",\n    \"paths\": {\n      \"@/*\": [\"src/*\"],\n      \"~/*\": [\"./*\"],\n    },\n  },\n}\n",
+        )
+        .write(
+            "tsconfig.json",
+            "{\n  \"extends\": \"./tsconfig.base\",\n  /* the app itself */\n  \"compilerOptions\": { \"strict\": true },\n}\n",
+        )
+        .write(
+            "src/app/api/orders/route.ts",
+            "export { POST } from \"@/handlers/orders\";\n",
+        )
+        .write(
+            "src/app/api/carts/route.ts",
+            "import { removeCart } from \"~/src/handlers/carts\";\n\nexport { removeCart as DELETE };\n",
+        )
+        .write(
+            "src/app/api/quotes/route.ts",
+            "import { quote } from \"src/handlers/quotes\";\n\nexport const PUT = withAuth(quote);\n",
+        )
+        .write(
+            "src/handlers/orders.ts",
+            "export async function POST(request: Request) {\n  const body = await request.json();\n  await db.order.create({ data: body });\n  await db.ledger.create({ data: { order: body.id } });\n  return Response.json(body, { status: 201 });\n}\n",
+        )
+        .write(
+            "src/handlers/carts.ts",
+            "export async function removeCart(request: Request) {\n  const { items } = await request.json();\n  for (const item of items) {\n    await db.cartItem.delete({ where: { id: item.id } });\n  }\n  return new Response(null, { status: 204 });\n}\n",
+        )
+        .write(
+            "src/handlers/quotes.ts",
+            "export const quote = async (request: Request) => {\n  const input = await request.json();\n  return Response.json(await sql.query(`SELECT * FROM quotes WHERE sku = '${input.sku}' LIMIT 1`));\n};\n",
+        )
+        .write(
+            "src/routes/orders.ts",
+            "import { Router } from \"express\";\nimport { OrdersController } from \"@/controllers/orders.controller\";\n\nconst router = Router();\nconst controller = new OrdersController();\nrouter.post(\"/v2/orders\", controller.create);\n\nexport default router;\n",
+        )
+        .write(
+            "src/controllers/orders.controller.ts",
+            "export class OrdersController {\n  create = async (req: Request, res: Response, next: NextFunction) => {\n    try {\n      await prisma.order\n        .create({ data: req.body });\n      await prisma.coupon\n        .update({ where: { code: req.body.code }, data: { used: 1 } });\n      res.sendStatus(201);\n    } catch (err) {\n      next(err);\n    }\n  };\n}\n",
+        )
+        .write(
+            "src/routes/users.ts",
+            "import usersController from \"@/controllers/users.controller\";\n\nrouter.put(\"/v2/users/:id\", usersController.update);\n",
+        )
+        .write(
+            "src/controllers/users.controller.ts",
+            "class UsersController {\n  async update(req, res, next) {\n    try {\n      const { name } = req.body;\n      await pool.query(`UPDATE users SET name = '${name}' WHERE id = ${req.params.id}`);\n      res.sendStatus(204);\n    } catch (err) {\n      next(err);\n    }\n  }\n}\n\nexport default new UsersController();\n",
+        );
+        assert_eq!(
+            risks(&fx.scan()),
+            [
+                "DELETE /api/carts: UnvalidatedMutation@src/handlers/carts.ts:2",
+                "DELETE /api/carts: NonAtomicMultiWrite@src/handlers/carts.ts:4",
+                "POST /api/orders: UnvalidatedMutation@src/handlers/orders.ts:2",
+                "POST /api/orders: NonAtomicMultiWrite@src/handlers/orders.ts:3",
+                "PUT /api/quotes: UnvalidatedMutation@src/handlers/quotes.ts:2",
+                "PUT /api/quotes: UnsafeSqlInterpolation@src/handlers/quotes.ts:3",
+                "POST /v2/orders: UnvalidatedMutation@src/controllers/orders.controller.ts:5",
+                "POST /v2/orders: NonAtomicMultiWrite@src/controllers/orders.controller.ts:4",
+                "PUT /v2/users/{id}: UnvalidatedMutation@src/controllers/users.controller.ts:4",
+                "PUT /v2/users/{id}: UnsafeSqlInterpolation@src/controllers/users.controller.ts:5",
+            ]
+        );
+
+        // Without the config the aliases resolve to nothing; relative imports still work.
+        fs::remove_file(fx.root.join("tsconfig.json")).unwrap();
+        let unresolved = risks(&fx.scan());
+        assert!(
+            unresolved
+                .iter()
+                .all(|risk| !risk.contains("@src/handlers/orders.ts")),
+            "{unresolved:?}"
         );
     }
 

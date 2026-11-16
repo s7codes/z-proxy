@@ -74,6 +74,47 @@ impl Source {
         (at < span.1).then_some(span)
     }
 
+    /// True when `at` lies inside a `${...}` expression of a JavaScript template literal:
+    /// code, although the template is recorded as one string span. Only meaningful for a
+    /// JavaScript source; a Go raw string also opens with a backtick.
+    pub fn in_interpolation(&self, at: usize) -> bool {
+        let Some((start, end)) = self.string_span(at) else {
+            return false;
+        };
+        let bytes = self.text.as_bytes();
+        if bytes.get(start) != Some(&b'`') {
+            return false;
+        }
+        // 0: template text; above 0: brace depth inside an expression.
+        let mut depth = 0usize;
+        let mut cursor = start + 1;
+        while cursor < at.min(end) {
+            let Some(&byte) = bytes.get(cursor) else {
+                break;
+            };
+            match byte {
+                b'\\' if depth == 0 => {
+                    cursor += 2;
+                    continue;
+                }
+                b'$' if depth == 0 && bytes.get(cursor + 1) == Some(&b'{') => {
+                    depth = 1;
+                    cursor += 2;
+                    continue;
+                }
+                b'{' if depth > 0 => depth += 1,
+                b'}' if depth > 0 => depth -= 1,
+                b'\'' | b'"' if depth > 0 => {
+                    cursor = literal_end(bytes, cursor, Lang::Js).unwrap_or(at);
+                    continue;
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+        depth > 0
+    }
+
     /// Spans of the string literals that open inside `range`, in source order.
     pub fn strings_in(
         &self,
@@ -364,6 +405,25 @@ mod tests {
         assert!(!source.in_string(1));
         assert!(!source.in_string(18));
         assert_eq!(matching_bracket("{ f(\"}\") }", 0, Lang::Js), Some(9));
+    }
+
+    #[test]
+    fn template_expressions_are_code() {
+        let src = "log(`order ${req.body.id} for ${user.name} {plain} \\${not}`)";
+        let source = Source::new(src, Lang::Js);
+        let at = |needle: &str| src.find(needle).unwrap();
+        assert!(source.in_string(at("req.body")));
+        assert!(source.in_interpolation(at("req.body")));
+        assert!(source.in_interpolation(at("user.name")));
+        assert!(!source.in_interpolation(at("order")));
+        assert!(!source.in_interpolation(at("plain")));
+        assert!(!source.in_interpolation(at("not}")));
+        let nested = "f(`a ${g({ k: \"}\" }) + req.body.x} b`)";
+        let source = Source::new(nested, Lang::Js);
+        assert!(source.in_interpolation(nested.find("req.body").unwrap()));
+        assert!(!source.in_interpolation(nested.find(" b").unwrap() + 1));
+        let quoted = Source::new("x(\"${req.body}\")", Lang::Js);
+        assert!(!quoted.in_interpolation(4));
     }
 
     #[test]
